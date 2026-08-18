@@ -1,0 +1,15 @@
+[package]
+name = "cleandl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+rand = "0.10"
+rand_distr = "0.6"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+singe-cuda = "0.1.0-alpha.9"
+singe-cudnn = "0.1.0-alpha.7"
+skytens-core = { path = "../../skykern/crates/skytens-core" }
+rayon = "1"
