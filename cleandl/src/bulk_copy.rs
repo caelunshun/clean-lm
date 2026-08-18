@@ -44,9 +44,7 @@ impl BulkCopyEngine {
             .collect::<Result<Vec<_>, _>>()?;
 
         let completion_events = (0..NUM_STREAMS)
-            .map(|_| {
-                cx.create_event_with_flags(EventFlags::DISABLE_TIMING | EventFlags::BLOCKING_SYNC)
-            })
+            .map(|_| cx.create_event_with_flags(EventFlags::DISABLE_TIMING))
             .collect::<Result<Vec<_>, _>>()?;
         let memory_chunks = vec![Chunk::alloc(cx, INITIAL_CHUNK_SIZE)?];
 
