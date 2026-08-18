@@ -1,8 +1,4 @@
-#include <cuda_bf16.h>
-#include <cuda_tile.h>
-
-namespace ct = cuda::tiles;
-using namespace ct::literals;
+#include "utils.cuh"
 
 extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
     const int *__restrict__ indices, const float *__restrict__ embeddings,
