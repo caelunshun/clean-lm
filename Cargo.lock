@@ -603,6 +603,9 @@ dependencies = [
 [[package]]
 name = "sky-1"
 version = "0.1.0"
+dependencies = [
+ "cleandl",
+]
 
 [[package]]
 name = "skytens-core"

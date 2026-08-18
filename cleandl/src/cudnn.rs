@@ -37,7 +37,7 @@ impl CudnnGraphBuilder {
         }
     }
 
-    pub fn input_tensor(&mut self, tensor_view: &VirtTensorView) -> TensorId {
+    pub fn bind_tensor(&mut self, tensor_view: &VirtTensorView) -> TensorId {
         self.graph.tensor(TensorSpec {
             data_type: match tensor_view.element_type() {
                 ElementType::Float(float_type) => match float_type {
