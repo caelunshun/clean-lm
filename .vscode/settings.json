@@ -1,0 +1,8 @@
+{
+  "files.associations": {
+    "*.cu": "cuda-cpp",
+    "*.cuh": "cuda-cpp",
+    "cuda_tile.h": "cuda-cpp"
+  },
+  "C_Cpp.errorSquiggles": "enabled"
+}

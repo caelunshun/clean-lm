@@ -31,7 +31,7 @@ impl CudnnGraphBuilder {
         Self {
             cx: cx.clone(),
             graph: Graph::with_config(GraphConfig {
-                override_shape_enabled: true,
+                override_shape_enabled: false,
                 ..Default::default()
             }),
         }
@@ -139,34 +139,18 @@ impl ExecutableCudnnGraph {
         assert!(ptr::eq(&*self.cx, stream.context()));
 
         let mut bindings = self.graph.bindings();
-        let mut runtime_overrides = self.graph.runtime_overrides();
         for (tensor_id, tensor_view) in operands {
             unsafe {
                 bindings.set_ptr(tensor_id, tensor_view.data_ptr())?;
             }
-            runtime_overrides.set(
-                tensor_id,
-                tensor_view
-                    .shape()
-                    .dims()
-                    .map(|x| x as i64)
-                    .collect::<Vec<_>>(),
-                tensor_view
-                    .strides()
-                    .dims()
-                    .map(|x| x as i64)
-                    .collect::<Vec<_>>(),
-            )?;
         }
-        let runtime_overrides = runtime_overrides.build();
-
+   
         self.cudnn_cx.set_stream(Some(stream))?;
-        self.graph.execute_at_with_runtime_overrides(
+        self.graph.execute_at(
             &self.cudnn_cx,
             &bindings,
             Some(&mut self.workspace),
             self.plan_index,
-            &runtime_overrides,
         )?;
 
         Ok(())

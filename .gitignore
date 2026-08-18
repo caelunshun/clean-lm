@@ -4,3 +4,6 @@ __pycache__
 *.pyc
 *.ncu-rep
 *.ncu-repz
+*.tilebc
+*.sass
+*.cubin

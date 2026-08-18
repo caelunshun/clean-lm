@@ -1,0 +1,58 @@
+#include <cuda_bf16.h>
+#include <cuda_tile.h>
+
+namespace ct = cuda::tiles;
+using namespace ct::literals;
+
+extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
+    const int *__restrict__ indices, const float *__restrict__ embeddings,
+    __nv_bfloat16 *__restrict__ out, int vocab_size, int num_tokens,
+    int embed_dim) {
+  indices = ct::assume_aligned(indices, 16_ic);
+  embeddings = ct::assume_aligned(embeddings, 16_ic);
+  out = ct::assume_aligned(out, 16_ic);
+  embed_dim = ct::assume_divisible(embed_dim, 128_ic);
+
+  auto indices_view = ct::partition_view{
+      ct::tensor_span{indices, ct::shape{num_tokens, 1}}, ct::shape<32, 1>{}};
+  auto out_view =
+      ct::partition_view{ct::tensor_span{out, ct::shape{num_tokens, embed_dim}},
+                         ct::shape<32, 128>{}};
+
+  auto indices_tile = indices_view.load_masked(ct::bid().y, 0);
+
+  auto offsets_tile = indices_tile * embed_dim +
+                      ct::iota<ct::tile<int32_t, ct::shape<1, 128>>>();
+  auto mask = indices_tile < num_tokens;
+
+  ct::tile<float, ct::shape<32, 128>> embeddings_tile =
+      ct::load_masked(embeddings + offsets_tile, mask);
+
+  out_view.store_masked(ct::element_cast<__nv_bfloat16>(embeddings_tile),
+                        ct::bid().y, ct::bid().x);
+}
+
+extern "C" __tile_global__ void embedding_scatter_add_bf16in_f32out_32x128(
+    const int *__restrict__ indices, const __nv_bfloat16 *__restrict__ dL_dout,
+    float *__restrict__ dL_din, int vocab_size, int num_tokens, int embed_dim) {
+  indices = ct::assume_aligned(indices, 16_ic);
+  dL_dout = ct::assume_aligned(dL_dout, 16_ic);
+  dL_din = ct::assume_aligned(dL_din, 16_ic);
+  embed_dim = ct::assume_divisible(embed_dim, 128_ic);
+
+  auto indices_view = ct::partition_view{
+      ct::tensor_span{indices, ct::shape{num_tokens, 1}}, ct::shape<32, 1>{}};
+  auto dL_dout_view = ct::partition_view{
+      ct::tensor_span{dL_dout, ct::shape{num_tokens, embed_dim}},
+      ct::shape<32, 128>{}};
+
+  auto indices_tile = indices_view.load_masked(ct::bid().y, 0);
+  auto dL_dout_tile = dL_dout_view.load_masked(ct::bid().y, ct::bid().x);
+
+  auto offsets_tile =
+      indices_tile * embed_dim + ct::iota<ct::tile<int, ct::shape<1, 128>>>();
+  auto ptrs_tile = dL_din + offsets_tile;
+
+  ct::atomic_add(ptrs_tile, ct::element_cast<float>(dL_dout_tile),
+                 ct::memory_order_relaxed_t{}, ct::thread_scope_device_t{});
+}
