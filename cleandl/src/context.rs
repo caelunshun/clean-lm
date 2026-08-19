@@ -41,14 +41,13 @@ impl Context {
     pub fn get_or_create_resource<K: ResourceKey>(
         &self,
         key: K,
-        create: impl FnOnce() -> anyhow::Result<K::Resource>,
     ) -> anyhow::Result<Arc<K::Resource>> {
         let mut cache = self.0.resource_cache.lock().unwrap();
-        let key = (TypeId::of::<K>(), postcard::to_allocvec(&key)?);
-        match cache.entry(key) {
+        let encoded_key = (TypeId::of::<K>(), postcard::to_allocvec(&key)?);
+        match cache.entry(encoded_key) {
             Entry::Occupied(e) => Ok(Arc::downcast(e.get().clone()).unwrap()),
             Entry::Vacant(e) => {
-                let resource = Arc::new(create()?);
+                let resource = Arc::new(key.create(self)?);
                 e.insert(resource.clone());
                 Ok(resource)
             }
@@ -72,6 +71,8 @@ struct Inner {
 
 pub trait ResourceKey: Serialize + 'static {
     type Resource: Send + Sync + 'static;
+
+    fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource>;
 }
 
 #[derive(Debug, Clone)]
