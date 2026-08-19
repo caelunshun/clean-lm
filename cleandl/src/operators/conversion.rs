@@ -43,8 +43,8 @@ impl ConversionExecutor {
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
-                .push(&bf16.data_view())
-                .push(&f32.data_view())
+                .push(bf16.data_view())
+                .push(f32.data_view())
                 .push(i32::try_from(bf16.total_elements_including_padding())?),
             stream.get(),
         )?;
@@ -79,8 +79,8 @@ impl ConversionExecutor {
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
-                .push(&f32.data_view())
-                .push(&bf16.data_view())
+                .push(f32.data_view())
+                .push(bf16.data_view())
                 .push(i32::try_from(bf16.total_elements_including_padding())?),
             stream.get(),
         )?;

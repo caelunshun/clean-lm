@@ -4,5 +4,6 @@
     "*.cuh": "cuda-cpp",
     "cuda_tile.h": "cuda-cpp"
   },
-  "C_Cpp.errorSquiggles": "enabled"
+  "C_Cpp.errorSquiggles": "enabled",
+  "makefile.configureOnOpen": true
 }

@@ -18,17 +18,17 @@ fn main() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
     let a = TensorView::new_zeroed(
-        Shape::new([1, 256, 256]),
+        Shape::new([1, 8192, 4096]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let b = TensorView::new_zeroed(
-        Shape::new([1, 256, 256]),
+        Shape::new([1, 4096, 16384]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let c = TensorView::new_zeroed(
-        Shape::new([1, 256, 256]),
+        Shape::new([1, 8192, 16384]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;

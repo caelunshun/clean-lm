@@ -5,6 +5,7 @@ use skytens_core::{
 };
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Parameter {
     InferenceOnly(TensorView),
     InferenceAndTraining(TrainParameter),

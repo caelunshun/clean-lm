@@ -73,11 +73,14 @@ impl Context {
     }
 }
 
+type Resource = Arc<dyn Any + Send + Sync>;
+type ResourceKeyEncoded = (TypeId, Vec<u8>);
+
 #[derive(Debug)]
 struct Inner {
     cuda: CudaContext,
     default_cudnn_contexts: ThreadLocal<CudnnContext>,
-    resource_cache: ReentrantMutex<RefCell<HashMap<(TypeId, Vec<u8>), Arc<dyn Any + Send + Sync>>>>,
+    resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
 }
 
 pub trait ResourceKey: Serialize + 'static {
@@ -157,5 +160,11 @@ impl<T> PerStreamResource<T> {
                 Ok(resource)
             }
         }
+    }
+}
+
+impl<T> Default for PerStreamResource<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
