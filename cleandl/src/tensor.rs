@@ -53,13 +53,6 @@ impl TensorView {
         self.allocation_size
     }
 
-    pub fn total_elements_including_padding(&self) -> usize {
-        self.shape()
-            .last_coord()
-            .flatten_with_strides(self.strides())
-            + 1
-    }
-
     pub fn data_ptr(&self) -> DevicePtr {
         let ptr = self.storage.as_device_ptr().as_raw();
         // TODO: This is unsound because the pointer has no provenance on the host.

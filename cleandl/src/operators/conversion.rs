@@ -33,23 +33,21 @@ impl ConversionExecutor {
         assert_eq!(bf16.strides(), f32.strides());
         assert_eq!(bf16.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(f32.element_type(), ElementType::Float(FloatType::F32));
-        assert!(bf16.total_elements_including_padding().is_multiple_of(16));
+        assert!(bf16.is_contiguous());
+        let n = bf16.shape().element_count();
+        assert!(n.is_multiple_of(16));
 
         let kernel = self.module.function("bf16_to_f32_16384")?;
         kernel.launch_on(
             &LaunchConfig::new(
-                Dim3::new(
-                    bf16.total_elements_including_padding().div_ceil(16384) as u32,
-                    1,
-                    1,
-                ),
+                Dim3::new(n.div_ceil(16384) as u32, 1, 1),
                 Dim3::new(1, 1, 1), // block dim overriden by TileIR
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
                 .push(bf16.data_view())
                 .push(f32.data_view())
-                .push(i32::try_from(bf16.total_elements_including_padding())?),
+                .push(i32::try_from(n)?),
             stream.get(),
         )?;
 
@@ -69,23 +67,21 @@ impl ConversionExecutor {
         assert_eq!(bf16.strides(), f32.strides());
         assert_eq!(bf16.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(f32.element_type(), ElementType::Float(FloatType::F32));
-        assert!(bf16.total_elements_including_padding().is_multiple_of(16));
+        assert!(bf16.is_contiguous());
+        let n = bf16.shape().element_count();
+        assert!(n.is_multiple_of(16));
 
         let kernel = self.module.function("f32_to_bf16_16384")?;
         kernel.launch_on(
             &LaunchConfig::new(
-                Dim3::new(
-                    bf16.total_elements_including_padding().div_ceil(16384) as u32,
-                    1,
-                    1,
-                ),
+                Dim3::new(n.div_ceil(16384) as u32, 1, 1),
                 Dim3::new(1, 1, 1), // block dim overriden by TileIR
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
                 .push(f32.data_view())
                 .push(bf16.data_view())
-                .push(i32::try_from(bf16.total_elements_including_padding())?),
+                .push(i32::try_from(n)?),
             stream.get(),
         )?;
 
