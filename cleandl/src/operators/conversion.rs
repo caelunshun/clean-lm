@@ -7,7 +7,7 @@ use singe_cuda::{
 use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
-    context::{CudaStream, ResourceKey},
+    context::{Context, CudaStream, ResourceKey},
     cutile::CutileKernelKey,
     tensor::TensorView,
 };
@@ -17,6 +17,10 @@ pub struct ConversionExecutor {
 }
 
 impl ConversionExecutor {
+    pub fn get(cx: &Context) -> anyhow::Result<Arc<Self>> {
+        cx.get_or_create_resource(ConversionExecutorKey)
+    }
+
     /// Converts bf16 to f32 tensor. Shapes and strides
     /// must match.
     pub fn bf16_to_f32(
@@ -90,7 +94,7 @@ impl ConversionExecutor {
 }
 
 #[derive(Debug, serde::Serialize)]
-pub struct ConversionExecutorKey;
+struct ConversionExecutorKey;
 
 impl ResourceKey for ConversionExecutorKey {
     type Resource = ConversionExecutor;

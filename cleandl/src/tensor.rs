@@ -3,13 +3,14 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::ensure;
 use singe_cuda::{memory::DeviceMemory, types::DevicePtr, view::DeviceView};
 use skytens_core::{
     data_type::ElementType,
     shape::{Shape, Strides},
 };
 
-use crate::context::Context;
+use crate::context::{Context, CudaStream};
 
 /// View into a tensor stored on some device.
 ///
@@ -53,7 +54,10 @@ impl TensorView {
     }
 
     pub fn total_elements_including_padding(&self) -> usize {
-        self.allocation_size * 8 / self.element_type().bits_per_element()
+        self.shape()
+            .last_coord()
+            .flatten_with_strides(self.strides())
+            + 1
     }
 
     pub fn data_ptr(&self) -> DevicePtr {
@@ -88,6 +92,42 @@ impl TensorView {
         &self.virt
     }
 
+    pub fn is_contiguous(&self) -> bool {
+        let mut packed_dims = Vec::new();
+        for dim in 0..self.shape().num_dims() {
+            packed_dims.push((dim, self.shape()[dim], self.strides()[dim]));
+        }
+
+        packed_dims.sort_unstable_by_key(|(_, _, stride)| *stride);
+
+        let mut expected_stride = 1;
+        for (_, size, stride) in packed_dims {
+            if stride != expected_stride {
+                return false;
+            }
+            expected_stride *= size;
+        }
+
+        true
+    }
+
+    pub fn memset_u8(&self, x: u8, stream: &CudaStream) -> anyhow::Result<()> {
+        ensure!(
+            self.is_contiguous(),
+            "memset unimplemented for non-contiguous tensors"
+        );
+        unsafe {
+            DeviceMemory::set_async(
+                self.data_ptr().as_raw().cast::<u8>(),
+                x,
+                self.allocation_size,
+                stream.get(),
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Attempts to reshape the logical contents without changing their order.
     #[must_use]
     pub fn try_reshaped(&self, target_shape: Shape) -> Option<Self> {
@@ -108,8 +148,11 @@ impl TensorView {
     /// Returns a contiguous slice view along a dimension.
     #[must_use]
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> Self {
+        let virt = self.virt.sliced(dim, bounds);
+        let allocation_size = virt.offset - self.virt.offset;
         Self {
-            virt: self.virt.sliced(dim, bounds),
+            virt,
+            allocation_size,
             ..self.clone()
         }
     }

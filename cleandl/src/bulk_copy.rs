@@ -5,6 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use anyhow::ensure;
 use singe_cuda::{
     event::{Event, EventFlags, EventRecordFlags},
     memory::{DeviceMemory, HostAllocationFlags, MemoryCopyKind},
@@ -162,6 +163,10 @@ impl<'a> BulkCopyBatch<'a> {
         tensor: &TensorView,
         callback: impl FnOnce(&mut [u8]),
     ) -> anyhow::Result<()> {
+        ensure!(
+            tensor.is_contiguous(),
+            "transfers for non-contiguous tensors are unimplemented"
+        );
         let num_bytes = tensor.allocation_size();
 
         let (_, chunk) = self.engine.chunk_with_space_for(num_bytes)?;
@@ -189,6 +194,10 @@ impl<'a> BulkCopyBatch<'a> {
     /// which can later be used to access the data after
     /// completion of the copy.
     pub fn copy_to_host(&mut self, tensor: &TensorView) -> anyhow::Result<CopyToken> {
+        ensure!(
+            tensor.is_contiguous(),
+            "transfers for non-contiguous tensors are unimplemented"
+        );
         let num_bytes = tensor.allocation_size();
 
         let stream = self.engine.streams[self.num_ops % NUM_STREAMS].clone();
