@@ -61,6 +61,7 @@ impl TensorView {
             ptr.cast::<u8>()
                 .add(self.virt.offset() * self.virt.element_type().bits_per_element() / 8)
         };
+        assert!((ptr as usize).is_multiple_of(16));
         unsafe { DevicePtr::from_raw(ptr.cast()) }
     }
 
@@ -102,6 +103,14 @@ impl TensorView {
         }
 
         true
+    }
+
+    pub fn is_packed_row_major(&self) -> bool {
+        self.strides()
+            == row_major_strides(
+                self.shape(),
+                8 / self.element_type().bits_per_element().min(8),
+            )
     }
 
     pub fn memset_u8(&self, x: u8, stream: &CudaStream) -> anyhow::Result<()> {
@@ -316,6 +325,7 @@ impl VirtTensorView {
         assert!(end <= self.shape[dim], "slice bounds out of range");
 
         let offset = self.offset + start * self.strides[dim];
+        assert!(offset.is_multiple_of(16));
         assert!(
             offset.is_multiple_of(8 / self.element_type.bits_per_element().min(8)),
             "slice starts at a partial byte"

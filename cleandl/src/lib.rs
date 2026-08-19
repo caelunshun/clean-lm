@@ -1,3 +1,9 @@
+//! # GPU-side UB
+//! GPU-side UB is not considered Rust UB,
+//! and is instead seen as a logic bug from the Rust
+//! language perspective. Thus many operations which might
+//! require `unsafe` if executing on the CPU are not `unsafe`.
+
 pub mod bulk_copy;
 pub mod cudnn;
 pub mod tensor;

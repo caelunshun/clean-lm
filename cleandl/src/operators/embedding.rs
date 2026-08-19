@@ -45,9 +45,14 @@ impl EmbeddingExecutor {
             ElementType::Float(FloatType::Bf16)
         );
 
+        assert!(embedding_table.is_packed_row_major());
+        assert!(token_indices.is_packed_row_major());
+        assert!(out_embeddings.is_packed_row_major());
+
         let &[vocab_size, embed_dim] = embedding_table.shape().dims_slice() else {
             panic!("wrong shape for embedding table");
         };
+        assert!(embed_dim.is_multiple_of(128));
         let &[num_tokens] = token_indices.shape().dims_slice() else {
             panic!("wrong shape for token indices")
         };
@@ -93,9 +98,14 @@ impl EmbeddingExecutor {
         assert_eq!(dl_dout.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(dl_din.element_type(), ElementType::Float(FloatType::F32));
 
+        assert!(dl_dout.is_packed_row_major());
+        assert!(token_indices.is_packed_row_major());
+        assert!(dl_din.is_packed_row_major());
+
         let &[vocab_size, embed_dim] = dl_din.shape().dims_slice() else {
             panic!("wrong shape for gradient embedding table");
         };
+        assert!(embed_dim.is_multiple_of(128));
         let &[num_tokens] = token_indices.shape().dims_slice() else {
             panic!("wrong shape for token indices")
         };
