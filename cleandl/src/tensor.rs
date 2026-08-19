@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use singe_cuda::{memory::DeviceMemory, types::DevicePtr};
+use singe_cuda::{memory::DeviceMemory, types::DevicePtr, view::DeviceView};
 use skytens_core::{
     data_type::ElementType,
     shape::{Shape, Strides},
@@ -52,6 +52,10 @@ impl TensorView {
         self.allocation_size
     }
 
+    pub fn total_elements_including_padding(&self) -> usize {
+        self.allocation_size * 8 / self.element_type().bits_per_element()
+    }
+
     pub fn data_ptr(&self) -> DevicePtr {
         let ptr = self.storage.as_device_ptr().as_raw();
         // TODO: This is unsound because the pointer has no provenance on the host.
@@ -61,6 +65,11 @@ impl TensorView {
                 .add(self.virt.offset() * self.virt.element_type().bits_per_element() / 8)
         };
         unsafe { DevicePtr::from_raw(ptr.cast()) }
+    }
+
+    pub fn data_view(&self) -> DeviceView<'_, u8> {
+        let ptr = self.data_ptr();
+        unsafe { DeviceView::from_raw_parts(ptr.as_const_ptr().cast(), self.allocation_size) }
     }
 
     pub fn element_type(&self) -> ElementType {

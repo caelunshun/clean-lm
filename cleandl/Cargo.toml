@@ -16,3 +16,4 @@ rayon = "1"
 thread_local = "1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
+parking_lot = "0.12"

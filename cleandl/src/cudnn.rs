@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use singe_cuda::memory::DeviceMemory;
 use singe_cudnn::{
@@ -13,7 +13,7 @@ use singe_cudnn::{
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
 use crate::{
-    context::{Context, CudaStream},
+    context::{Context, CudaStream, PerStreamResource},
     tensor::{TensorView, VirtTensorView},
 };
 
@@ -90,13 +90,13 @@ impl CudnnGraphBuilder {
         let plan_index = compiled.default_plan_index();
         let workspace_bytes = compiled.workspace_size_at(plan_index)?;
         self.cx.cuda().bind()?;
-        let workspace = DeviceMemory::<u8>::zeroes(workspace_bytes)?;
 
         Ok(ExecutableCudnnGraph {
             cx: self.cx.clone(),
             graph: compiled,
             plan_index,
-            workspace,
+            workspace_bytes,
+            workspace: PerStreamResource::new(),
         })
     }
 }
@@ -106,20 +106,25 @@ pub struct ExecutableCudnnGraph {
     cx: Context,
     graph: CompiledGraph,
     plan_index: usize,
-    workspace: DeviceMemory<u8>,
+    workspace_bytes: usize,
+    workspace: PerStreamResource<Mutex<DeviceMemory<u8>>>,
 }
 
 impl ExecutableCudnnGraph {
     /// Executes the graph with the given tensor inputs, on the given stream.
-    ///
-    /// Note that if the same ExecutableCudnnGraph executes in parallel on a device,
-    /// the GPU-side behavior becomes undefined.
     pub fn execute<'a>(
         &mut self,
         operands: impl IntoIterator<Item = (TensorId, &'a TensorView)>,
         stream: &CudaStream,
     ) -> anyhow::Result<()> {
         assert!(Arc::ptr_eq(stream.cuda(), self.cx.cuda()));
+
+        let workspace = self.workspace.get_or_create(stream, || {
+            DeviceMemory::<u8>::zeroes(self.workspace_bytes)
+                .map_err(From::from)
+                .map(Mutex::new)
+        })?;
+        let mut workspace = workspace.lock().unwrap();
 
         let mut bindings = self.graph.bindings();
         for (tensor_id, tensor_view) in operands {
@@ -131,7 +136,7 @@ impl ExecutableCudnnGraph {
         self.graph.execute_at(
             stream.cudnn_cx()?,
             &bindings,
-            Some(&mut self.workspace),
+            Some(&mut *workspace),
             self.plan_index,
         )?;
 
