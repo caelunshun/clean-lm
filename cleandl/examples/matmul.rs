@@ -1,5 +1,8 @@
-use cleandl::{cudnn::CudnnGraphBuilder, tensor::TensorView};
-use singe_cuda::context::Context;
+use cleandl::{
+    context::{Context, CudaStream},
+    cudnn::CudnnGraphBuilder,
+    tensor::TensorView,
+};
 use singe_cudnn::{
     backend::pointwise::PointwiseMode,
     data_type::DataType,
@@ -12,20 +15,20 @@ use skytens_core::{
 };
 
 fn main() -> anyhow::Result<()> {
-    let cx = Context::create()?;
+    let cx = Context::new(0)?;
 
     let a = TensorView::new_zeroed(
-        Shape::new([1, 16384, 4096]),
+        Shape::new([1, 256, 256]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let b = TensorView::new_zeroed(
-        Shape::new([1, 4096, 8192]),
+        Shape::new([1, 256, 256]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let c = TensorView::new_zeroed(
-        Shape::new([1, 16384, 8192]),
+        Shape::new([1, 256, 256]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
@@ -51,9 +54,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut graph = graph.build()?;
 
-    graph.execute([(a_id, &a), (b_id, &b), (c_id, &c)], &cx.create_stream()?)?;
+    graph.execute([(a_id, &a), (b_id, &b), (c_id, &c)], &CudaStream::new(&cx)?)?;
 
-    cx.synchronize()?;
+    cx.cuda().synchronize()?;
 
     Ok(())
 }

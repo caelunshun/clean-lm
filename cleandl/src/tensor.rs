@@ -3,11 +3,13 @@ use std::{
     sync::Arc,
 };
 
-use singe_cuda::{context::Context, memory::DeviceMemory, types::DevicePtr};
+use singe_cuda::{memory::DeviceMemory, types::DevicePtr};
 use skytens_core::{
     data_type::ElementType,
     shape::{Shape, Strides},
 };
+
+use crate::context::Context;
 
 /// View into a tensor stored on some device.
 ///
@@ -15,7 +17,7 @@ use skytens_core::{
 #[derive(Debug, Clone)]
 pub struct TensorView {
     virt: VirtTensorView,
-    cx: Arc<Context>,
+    cx: Context,
     storage: Arc<DeviceMemory<u8>>,
     allocation_size: usize,
 }
@@ -25,13 +27,13 @@ impl TensorView {
     pub fn new_zeroed(
         shape: Shape,
         element_type: ElementType,
-        cx: &Arc<Context>,
+        cx: &Context,
     ) -> anyhow::Result<Self> {
         let virt = VirtTensorView::new(shape, element_type);
         let allocation_elements = shape.last_coord().flatten_with_strides(virt.strides()) + 1;
         let allocation_bytes = (allocation_elements * element_type.bits_per_element()).div_ceil(8);
 
-        cx.bind()?;
+        cx.cuda().bind()?;
         let storage = Arc::new(DeviceMemory::create(allocation_bytes)?);
 
         Ok(Self {
@@ -42,7 +44,7 @@ impl TensorView {
         })
     }
 
-    pub fn cx(&self) -> &Arc<Context> {
+    pub fn cx(&self) -> &Context {
         &self.cx
     }
 

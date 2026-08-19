@@ -13,3 +13,6 @@ singe-cuda = "0.1.0-alpha.9"
 singe-cudnn = "0.1.0-alpha.7"
 skytens-core = { path = "../../skykern/crates/skytens-core" }
 rayon = "1"
+thread_local = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }

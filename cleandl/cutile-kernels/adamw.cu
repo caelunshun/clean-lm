@@ -5,6 +5,7 @@ extern "C" __tile_global__ void gradient_l2_norm_reduction_bf16_16384(
     int n) {
   gradient = ct::assume_aligned(gradient, 16_ic);
   global_sum = ct::assume_aligned(global_sum, 16_ic);
+  n = ct::assume_divisible(n, 16_ic);
 
   auto gradient_view = ct::partition_view{
       ct::tensor_span{gradient, ct::extents{n}}, ct::shape<16384>{}};
@@ -19,7 +20,7 @@ extern "C" __tile_global__ void gradient_l2_norm_reduction_bf16_16384(
 }
 
 extern "C" __tile_global__ void
-adamw_weight_update_fused_clipping_bf16grad_f32master_bf16replica_4096_persistent(
+adamw_weight_update_clipped_bf16grad_f32master_bf16replica_4096_persistent(
     const __nv_bfloat16 *__restrict__ gradient,
     const float *__restrict__ gradient_l2_global_sum,
     float *__restrict__ weight, __nv_bfloat16 *__restrict__ weight_bf16_replica,
@@ -30,6 +31,8 @@ adamw_weight_update_fused_clipping_bf16grad_f32master_bf16replica_4096_persisten
   float gradient_l2_global_sum_val = *gradient_l2_global_sum;
   float gradient_norm = ct::sqrt(gradient_l2_global_sum_val);
   float clip_scale = ct::min(1.0f, max_gradient_norm / (gradient_norm + 1e-6f));
+
+  n = ct::assume_divisible(n, 16_ic);
 
   gradient = ct::assume_aligned(gradient, 16_ic);
   auto gradient_view = ct::partition_view{

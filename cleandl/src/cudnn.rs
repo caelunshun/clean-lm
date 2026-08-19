@@ -1,11 +1,6 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
-    ptr,
-    sync::Arc,
-};
+use std::sync::Arc;
 
-use singe_cuda::{context::Context, memory::DeviceMemory, stream::Stream};
+use singe_cuda::memory::DeviceMemory;
 use singe_cudnn::{
     backend::tensor::{Shape, TensorId, TensorSpec},
     data_type::DataType,
@@ -17,17 +12,20 @@ use singe_cudnn::{
 };
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
-use crate::tensor::{TensorView, VirtTensorView};
+use crate::{
+    context::{Context, CudaStream},
+    tensor::{TensorView, VirtTensorView},
+};
 
 /// Helper for building cuDNN graph.
 #[derive(Debug)]
 pub struct CudnnGraphBuilder {
-    cx: Arc<Context>,
+    cx: Context,
     graph: Graph,
 }
 
 impl CudnnGraphBuilder {
-    pub fn new(cx: &Arc<Context>) -> Self {
+    pub fn new(cx: &Context) -> Self {
         Self {
             cx: cx.clone(),
             graph: Graph::with_config(GraphConfig {
@@ -86,30 +84,16 @@ impl CudnnGraphBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<ExecutableCudnnGraph> {
-        thread_local! {
-            static CUDNN_CONTEXT_MAP: RefCell<HashMap<*const Context, Arc<singe_cudnn::context::Context>>> = RefCell::new(HashMap::new());
-        }
-
-        let cudnn_context = CUDNN_CONTEXT_MAP.with(|map| {
-            let mut map = map.borrow_mut();
-            Ok::<_, anyhow::Error>(match map.entry(Arc::as_ptr(&self.cx)) {
-                Entry::Occupied(e) => e.get().clone(),
-                Entry::Vacant(e) => e
-                    .insert(Arc::new(singe_cudnn::context::Context::create(&self.cx)?))
-                    .clone(),
-            })
-        })?;
-
-        let compiled = self.graph.compile(&cudnn_context, &[HeuristicMode::B])?;
+        let cudnn_context = self.cx.cudnn()?;
+        let compiled = self.graph.compile(cudnn_context, &[HeuristicMode::B])?;
 
         let plan_index = compiled.default_plan_index();
         let workspace_bytes = compiled.workspace_size_at(plan_index)?;
-        self.cx.bind()?;
+        self.cx.cuda().bind()?;
         let workspace = DeviceMemory::<u8>::zeroes(workspace_bytes)?;
 
         Ok(ExecutableCudnnGraph {
             cx: self.cx.clone(),
-            cudnn_cx: cudnn_context.clone(),
             graph: compiled,
             plan_index,
             workspace,
@@ -119,8 +103,7 @@ impl CudnnGraphBuilder {
 
 #[derive(Debug)]
 pub struct ExecutableCudnnGraph {
-    cx: Arc<Context>,
-    cudnn_cx: Arc<singe_cudnn::context::Context>,
+    cx: Context,
     graph: CompiledGraph,
     plan_index: usize,
     workspace: DeviceMemory<u8>,
@@ -134,9 +117,9 @@ impl ExecutableCudnnGraph {
     pub fn execute<'a>(
         &mut self,
         operands: impl IntoIterator<Item = (TensorId, &'a TensorView)>,
-        stream: &Stream,
+        stream: &CudaStream,
     ) -> anyhow::Result<()> {
-        assert!(ptr::eq(&*self.cx, stream.context()));
+        assert!(Arc::ptr_eq(stream.cuda(), self.cx.cuda()));
 
         let mut bindings = self.graph.bindings();
         for (tensor_id, tensor_view) in operands {
@@ -144,10 +127,9 @@ impl ExecutableCudnnGraph {
                 bindings.set_ptr(tensor_id, tensor_view.data_ptr())?;
             }
         }
-   
-        self.cudnn_cx.set_stream(Some(stream))?;
+
         self.graph.execute_at(
-            &self.cudnn_cx,
+            stream.cudnn_cx()?,
             &bindings,
             Some(&mut self.workspace),
             self.plan_index,

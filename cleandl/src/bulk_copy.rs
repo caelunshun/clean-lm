@@ -2,28 +2,26 @@ use std::{
     cell::Cell,
     mem::MaybeUninit,
     slice,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use singe_cuda::{
-    context::Context,
     event::{Event, EventFlags, EventRecordFlags},
     memory::{DeviceMemory, HostAllocationFlags, MemoryCopyKind},
-    stream::{Stream, StreamFlags},
 };
 
-use crate::tensor::TensorView;
+use crate::{
+    context::{Context, CudaStream},
+    tensor::TensorView,
+};
 
 /// Utility for performing speed-of-light batched copies
 /// between CPU and GPU memory, using a bump allocator
 /// of page-locked memory.
 #[derive(Debug)]
 pub struct BulkCopyEngine {
-    cx: Arc<Context>,
-    streams: Vec<Stream>,
+    cx: Context,
+    streams: Vec<CudaStream>,
     completion_events: Vec<Event>,
     did_record_batch: bool,
     did_observe_completion: Cell<bool>,
@@ -37,14 +35,17 @@ const CHUNK_GROWTH_FACTOR: usize = 2;
 const NUM_STREAMS: usize = 2;
 
 impl BulkCopyEngine {
-    pub fn new(cx: &Arc<Context>) -> anyhow::Result<Self> {
-        cx.bind()?;
+    pub fn new(cx: &Context) -> anyhow::Result<Self> {
+        cx.cuda().bind()?;
         let streams = (0..NUM_STREAMS)
-            .map(|_| cx.create_stream_with_flags(StreamFlags::NON_BLOCKING))
+            .map(|_| CudaStream::new(cx))
             .collect::<Result<Vec<_>, _>>()?;
 
         let completion_events = (0..NUM_STREAMS)
-            .map(|_| cx.create_event_with_flags(EventFlags::DISABLE_TIMING))
+            .map(|_| {
+                cx.cuda()
+                    .create_event_with_flags(EventFlags::DISABLE_TIMING)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let memory_chunks = vec![Chunk::alloc(cx, INITIAL_CHUNK_SIZE)?];
 
@@ -66,7 +67,7 @@ impl BulkCopyEngine {
         assert!(self.did_record_batch, "must call BulkCopyBatch::commit()");
 
         if !self.did_observe_completion.get() {
-            self.cx.bind()?;
+            self.cx.cuda().bind()?;
             for event in &self.completion_events {
                 event.synchronize()?;
             }
@@ -175,7 +176,7 @@ impl<'a> BulkCopyBatch<'a> {
                 slice.as_ptr(),
                 num_bytes,
                 MemoryCopyKind::HostToDevice,
-                &self.engine.streams[self.num_ops % NUM_STREAMS],
+                self.engine.streams[self.num_ops % NUM_STREAMS].get(),
             )?;
         }
 
@@ -203,7 +204,7 @@ impl<'a> BulkCopyBatch<'a> {
                 tensor.data_ptr().as_raw().cast::<u8>(),
                 num_bytes,
                 MemoryCopyKind::DeviceToHost,
-                &stream,
+                stream.get(),
             )?;
         }
 
@@ -225,7 +226,7 @@ impl<'a> BulkCopyBatch<'a> {
             .iter()
             .zip(&self.engine.completion_events)
         {
-            event.record(stream, EventRecordFlags::DEFAULT)?;
+            event.record(stream.get(), EventRecordFlags::DEFAULT)?;
         }
 
         self.engine.did_record_batch = true;
@@ -256,14 +257,14 @@ pub struct CopyToken {
 
 #[derive(Debug)]
 struct Chunk {
-    cx: Arc<Context>,
+    cx: Context,
     ptr: *mut u8,
     capacity: usize,
     used: usize,
 }
 
 impl Chunk {
-    fn alloc(cx: &Arc<Context>, capacity: usize) -> anyhow::Result<Self> {
+    fn alloc(cx: &Context, capacity: usize) -> anyhow::Result<Self> {
         let ptr =
             unsafe { DeviceMemory::<u8>::alloc_pinned(capacity, HostAllocationFlags::DEFAULT)? };
         unsafe {
@@ -282,7 +283,7 @@ impl Chunk {
 impl Drop for Chunk {
     fn drop(&mut self) {
         unsafe {
-            self.cx.bind().ok();
+            self.cx.cuda().bind().ok();
             DeviceMemory::<u8>::free_host(self.ptr.cast()).ok();
         }
     }
