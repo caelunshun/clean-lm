@@ -29,6 +29,7 @@ impl ConversionExecutor {
         assert_eq!(bf16.strides(), f32.strides());
         assert_eq!(bf16.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(f32.element_type(), ElementType::Float(FloatType::F32));
+        assert!(bf16.total_elements_including_padding().is_multiple_of(16));
 
         let kernel = self.module.function("bf16_to_f32_16384")?;
         kernel.launch_on(
@@ -42,9 +43,9 @@ impl ConversionExecutor {
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
-                .arg(&bf16.data_view())
-                .arg(&f32.data_view())
-                .arg(&i32::try_from(bf16.total_elements_including_padding())?),
+                .push(&bf16.data_view())
+                .push(&f32.data_view())
+                .push(i32::try_from(bf16.total_elements_including_padding())?),
             stream.get(),
         )?;
 
@@ -64,6 +65,7 @@ impl ConversionExecutor {
         assert_eq!(bf16.strides(), f32.strides());
         assert_eq!(bf16.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(f32.element_type(), ElementType::Float(FloatType::F32));
+        assert!(bf16.total_elements_including_padding().is_multiple_of(16));
 
         let kernel = self.module.function("f32_to_bf16_16384")?;
         kernel.launch_on(
@@ -77,9 +79,9 @@ impl ConversionExecutor {
                 0,                  // smem overriden by TileIR
             )?,
             KernelParameters::new()
-                .arg(&f32.data_view())
-                .arg(&bf16.data_view())
-                .arg(&i32::try_from(bf16.total_elements_including_padding())?),
+                .push(&f32.data_view())
+                .push(&bf16.data_view())
+                .push(i32::try_from(bf16.total_elements_including_padding())?),
             stream.get(),
         )?;
 

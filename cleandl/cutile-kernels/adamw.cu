@@ -65,20 +65,20 @@ adamw_weight_update_clipped_bf16grad_f32master_bf16replica_4096_persistent(
     auto m_tile = adam_m_view.load_masked(i);
     m_tile = beta1 * m_tile + (1.0f - beta1) * gradient_tile;
     auto m_hat = ct::div(m_tile, (1.0f - ct::pow(beta1, train_step)),
-                         ct::round_approximate_t{});
+                         ct::round_approximate_t{}, ct::round_subnormals_to_zero_t{});
 
     auto v_tile = adam_v_view.load_masked(i);
     v_tile = beta2 * v_tile + (1.0f - beta2) * (gradient_tile * gradient_tile);
 
     auto v_hat = ct::div(v_tile, (1.0f - ct::pow(beta2, train_step)),
-                         ct::round_approximate_t{});
+                         ct::round_approximate_t{}, ct::round_subnormals_to_zero_t{});
 
     weight_tile = weight_tile -
                   lr * (ct::div(m_hat,
                                 (ct::sqrt(v_hat, ct::round_approximate_t{},
                                           ct::round_subnormals_to_zero_t{}) +
                                  1e-6f),
-                                ct::round_approximate_t{}) +
+                                ct::round_approximate_t{}, ct::round_subnormals_to_zero_t{}) +
                         weight_decay * weight_tile);
 
     weight_view.store_masked(weight_tile, i);
