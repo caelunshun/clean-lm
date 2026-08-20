@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    mem, ptr,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use singe_cuda::memory::DeviceMemory;
 use singe_cudnn::{
@@ -18,7 +14,7 @@ use singe_cudnn::{
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
 use crate::{
-    context::{Context, CudaStream, PerStreamResource},
+    context::{Context, CudaStream},
     tensor::{TensorView, VirtTensorView},
 };
 
@@ -96,7 +92,7 @@ impl CudnnGraphBuilder {
             scalar_value: Some(ScalarValue::F32(value)),
             name: None,
             byte_alignment: 16,
-            is_virtual: true,
+            is_virtual: false,
             is_by_value: true,
             vector_count: None,
             vectorized_dimension: None,

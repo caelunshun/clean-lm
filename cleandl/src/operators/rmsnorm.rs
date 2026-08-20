@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use singe_cudnn::{
-    backend::tensor::{TensorId, TensorSpec},
-    data_type::DataType,
+    backend::tensor::TensorId,
     frontend::{
         graph::{RmsNormalizationBackwardOutputs, RmsNormalizationOutputs},
         operation::{RmsNormalizationBackwardConfig, RmsNormalizationConfig},
@@ -21,7 +20,6 @@ use crate::{
 
 #[derive(Debug)]
 pub struct RmsNormExecutor {
-    config: RmsNormConfig,
     forward_graph: ExecutableCudnnGraph,
     forward_x: TensorId,
     forward_scale: TensorId,
@@ -150,7 +148,6 @@ impl ResourceKey for RmsNormConfig {
         let backward_graph = backward_graph.build()?;
 
         Ok(RmsNormExecutor {
-            config: self.clone(),
             forward_graph,
             forward_x,
             forward_scale,

@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         axis: None,
     });
 
-    let mut graph = graph.build()?;
+    let graph = graph.build()?;
 
     graph.execute([(a_id, &a), (b_id, &b), (c_id, &c)], &CudaStream::new(&cx)?)?;
 
