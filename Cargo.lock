@@ -652,8 +652,6 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "singe-core"
 version = "0.1.0-alpha.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c928ec56af6015ecb510cf29e84b52a75b9e11861dc313baf816bc9d49f842f5"
 dependencies = [
  "serde",
 ]
@@ -661,8 +659,6 @@ dependencies = [
 [[package]]
 name = "singe-cuda"
 version = "0.1.0-alpha.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063a17f8e184c7317ea62652b2951b6b93fc72fd5ba27a92a58c6e66272c0ab2"
 dependencies = [
  "bitflags",
  "half",
@@ -677,8 +673,6 @@ dependencies = [
 [[package]]
 name = "singe-cuda-find"
 version = "0.1.0-alpha.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8dfb30436f5737012cd7d2669b5a22188e7badd578e273b23a1406c0cdf3576"
 dependencies = [
  "anyhow",
  "glob",
@@ -688,8 +682,6 @@ dependencies = [
 [[package]]
 name = "singe-cuda-macros"
 version = "0.1.0-alpha.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219e5cab4d8cc8538ddfb66adf8154a09d30ad8b22cb2ff3b67f0ee451e81d60"
 dependencies = [
  "hex",
  "proc-macro2",
@@ -704,8 +696,6 @@ dependencies = [
 [[package]]
 name = "singe-cuda-sys"
 version = "0.1.0-alpha.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82039d735b42c2922d00e03458f3173aa7402e9ae0282a6d33db3cfc973f11d9"
 dependencies = [
  "num_enum",
  "singe-cuda-find",
@@ -714,8 +704,6 @@ dependencies = [
 [[package]]
 name = "singe-cudnn"
 version = "0.1.0-alpha.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbc8a71b438bec5b2bce950a0859ba72c0eee0a78df44311549990f514105ac"
 dependencies = [
  "bitflags",
  "bomboni_serde",
@@ -735,8 +723,6 @@ dependencies = [
 [[package]]
 name = "singe-cudnn-sys"
 version = "0.1.0-alpha.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f4834e8e1d977a361caff20464e914d738ff9b8d3272531437d8785b65e6078"
 dependencies = [
  "anyhow",
  "num_enum",
@@ -748,7 +734,9 @@ dependencies = [
 name = "sky-1"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cleandl",
+ "serde",
  "singe-cuda",
  "singe-cudnn",
  "skytens-core",

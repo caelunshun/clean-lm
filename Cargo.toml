@@ -1,3 +1,7 @@
 [workspace]
 members = ["cleandl", "sky-1"]
 resolver = "3"
+
+[patch.crates-io]
+singe-cuda = { path = "../singe/singe-cuda" }
+singe-cudnn = { path = "../singe/singe-cudnn" }

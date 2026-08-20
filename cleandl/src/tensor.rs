@@ -26,10 +26,12 @@ pub struct TensorView {
 impl TensorView {
     /// Returns a zeroed, row-major tensor allocation.
     pub fn new_zeroed(
-        shape: Shape,
-        element_type: ElementType,
+        shape: impl Into<Shape>,
+        element_type: impl Into<ElementType>,
         cx: &Context,
     ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let element_type = element_type.into();
         let virt = VirtTensorView::new(shape, element_type);
         let allocation_elements = shape.last_coord().flatten_with_strides(virt.strides()) + 1;
         let allocation_bytes = (allocation_elements * element_type.bits_per_element()).div_ceil(8);
@@ -172,7 +174,7 @@ fn row_major_strides(shape: Shape, align: usize) -> Strides {
 }
 
 /// Tensor view shape and stride tracking without backing physical storage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VirtTensorView {
     element_type: ElementType,
     /// Offset from the start of storage, in elements.
@@ -182,17 +184,39 @@ pub struct VirtTensorView {
 }
 
 impl VirtTensorView {
-    /// Creates a row-major virtual tensor view. Strides are aligned so that
-    /// every row of a sub-byte element type starts at a byte boundary.
-    pub fn new(shape: Shape, element_type: ElementType) -> Self {
-        assert!(element_type.bits_per_element().is_power_of_two());
+    pub fn new(shape: impl Into<Shape>, element_type: impl Into<ElementType>) -> Self {
+        let element_type = element_type.into();
+        let shape = shape.into();
         let stride_alignment = 8 / element_type.bits_per_element().min(8);
+        let strides = row_major_strides(shape, stride_alignment);
+        Self::with_strides(shape, strides, element_type)
+    }
+
+    pub fn with_strides(
+        shape: impl Into<Shape>,
+        strides: impl Into<Strides>,
+        element_type: impl Into<ElementType>,
+    ) -> Self {
+        let element_type = element_type.into();
+        let shape = shape.into();
+        let strides = strides.into();
+
+        assert_eq!(shape.num_dims(), strides.num_dims());
+
+        assert!(element_type.bits_per_element().is_power_of_two());
+
         Self {
             element_type,
             offset: 0,
             shape,
-            strides: row_major_strides(shape, stride_alignment),
+            strides,
         }
+    }
+
+    pub fn same_layout_as(&self, other: &Self) -> bool {
+        self.shape == other.shape
+            && self.strides == other.strides
+            && self.element_type == other.element_type
     }
 
     pub fn element_type(&self) -> ElementType {

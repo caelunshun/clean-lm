@@ -40,12 +40,11 @@ impl Parameter {
 pub struct TrainParameter {
     pub master_weights: TensorView,
     pub bf16_weights_replica: TensorView,
-    pub adam_m: TensorView,
-    pub adam_v: TensorView,
+    pub optimizer_states: OptimizerStates,
 }
 
 impl TrainParameter {
-    pub fn new(shape: Shape, cx: &Context) -> anyhow::Result<Self> {
+    pub fn new_adamw(shape: Shape, cx: &Context) -> anyhow::Result<Self> {
         Ok(Self {
             master_weights: TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?,
             bf16_weights_replica: TensorView::new_zeroed(
@@ -53,8 +52,21 @@ impl TrainParameter {
                 ElementType::Float(FloatType::Bf16),
                 cx,
             )?,
-            adam_m: TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?,
-            adam_v: TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?,
+            optimizer_states: OptimizerStates::AdamW(AdamWStates {
+                adam_m: TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?,
+                adam_v: TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?,
+            }),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum OptimizerStates {
+    AdamW(AdamWStates),
+}
+
+#[derive(Debug, Clone)]
+pub struct AdamWStates {
+    pub adam_m: TensorView,
+    pub adam_v: TensorView,
 }

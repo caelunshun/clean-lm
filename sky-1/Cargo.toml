@@ -8,3 +8,5 @@ cleandl = { path = "../cleandl" }
 singe-cuda = "0.1.0-alpha.9"
 singe-cudnn = "0.1.0-alpha.7"
 skytens-core = { path = "../../skykern/crates/skytens-core" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

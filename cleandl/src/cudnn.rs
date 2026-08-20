@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    mem, ptr,
+    sync::{Arc, Mutex},
+};
 
 use singe_cuda::memory::DeviceMemory;
 use singe_cudnn::{
@@ -9,6 +13,7 @@ use singe_cudnn::{
         operation::HeuristicMode,
         plan::CompiledGraph,
     },
+    scalar::ScalarValue,
 };
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
@@ -83,9 +88,53 @@ impl CudnnGraphBuilder {
         &mut self.graph
     }
 
+    pub fn scalar(&mut self, value: f32) -> TensorId {
+        self.graph.tensor(TensorSpec {
+            data_type: DataType::F32,
+            shape: Shape::contiguous([1]).unwrap(),
+            id: None,
+            scalar_value: Some(ScalarValue::F32(value)),
+            name: None,
+            byte_alignment: 16,
+            is_virtual: true,
+            is_by_value: true,
+            vector_count: None,
+            vectorized_dimension: None,
+            reordering: None,
+            ragged_offset: None,
+        })
+    }
+
     pub fn build(self) -> anyhow::Result<ExecutableCudnnGraph> {
+        let mut tensor_virt_descs = HashMap::new();
+
         let cudnn_context = self.cx.cudnn()?;
         let compiled = self.graph.compile(cudnn_context, &[HeuristicMode::B])?;
+
+        for (tensor_id, tensor) in self.graph.tensors() {
+            tensor_virt_descs.insert(
+                tensor_id,
+                VirtTensorView::with_strides(
+                    skytens_core::shape::Shape::new(
+                        tensor
+                            .shape
+                            .dimensions()
+                            .iter()
+                            .copied()
+                            .map(|x| x as usize),
+                    ),
+                    skytens_core::shape::Strides::new(
+                        tensor.shape.strides().iter().copied().map(|x| x as usize),
+                    ),
+                    match tensor.data_type {
+                        DataType::F32 => ElementType::Float(FloatType::F32),
+                        DataType::BF16 => ElementType::Float(FloatType::Bf16),
+                        DataType::U32 => ElementType::UInt(UIntType::U32),
+                        _ => todo!("{:?}", tensor.data_type),
+                    },
+                ),
+            );
+        }
 
         let plan_index = compiled.default_plan_index();
         let workspace_bytes = compiled.workspace_size_at(plan_index)?;
@@ -96,7 +145,7 @@ impl CudnnGraphBuilder {
             graph: compiled,
             plan_index,
             workspace_bytes,
-            workspace: PerStreamResource::new(),
+            tensor_virt_descs,
         })
     }
 }
@@ -105,29 +154,40 @@ impl CudnnGraphBuilder {
 pub struct ExecutableCudnnGraph {
     cx: Context,
     graph: CompiledGraph,
+    tensor_virt_descs: HashMap<TensorId, VirtTensorView>,
     plan_index: usize,
     workspace_bytes: usize,
-    workspace: PerStreamResource<Mutex<DeviceMemory<u8>>>,
 }
 
 impl ExecutableCudnnGraph {
     /// Executes the graph with the given tensor inputs, on the given stream.
     pub fn execute<'a>(
-        &mut self,
+        &self,
         operands: impl IntoIterator<Item = (TensorId, &'a TensorView)>,
         stream: &CudaStream,
     ) -> anyhow::Result<()> {
         assert!(Arc::ptr_eq(stream.cuda(), self.cx.cuda()));
+        let operands = operands.into_iter().collect::<Vec<_>>();
 
-        let workspace = self.workspace.get_or_create(stream, || {
-            DeviceMemory::<u8>::zeroes(self.workspace_bytes)
-                .map_err(From::from)
-                .map(Mutex::new)
-        })?;
-        let mut workspace = workspace.lock().unwrap();
+        let workspace_ptr = if self.workspace_bytes > 0 {
+            Some(unsafe { DeviceMemory::<u8>::alloc_async(self.workspace_bytes, stream.get())? })
+        } else {
+            None
+        };
+        let mut workspace = workspace_ptr.map(|workspace_ptr| unsafe {
+            DeviceMemory::<u8>::from_raw_parts(workspace_ptr, self.workspace_bytes)
+        });
 
         let mut bindings = self.graph.bindings();
         for (tensor_id, tensor_view) in operands {
+            assert!(
+                tensor_view
+                    .virt()
+                    .same_layout_as(&self.tensor_virt_descs[&tensor_id]),
+                "expected layout of {:?}, found {:?}",
+                self.tensor_virt_descs[&tensor_id],
+                tensor_view.virt()
+            );
             unsafe {
                 bindings.set_ptr(tensor_id, tensor_view.data_ptr())?;
             }
@@ -136,9 +196,16 @@ impl ExecutableCudnnGraph {
         self.graph.execute_at(
             stream.cudnn_cx()?,
             &bindings,
-            Some(&mut *workspace),
+            workspace.as_mut(),
             self.plan_index,
         )?;
+
+        mem::forget(workspace);
+        if let Some(workspace_ptr) = workspace_ptr {
+            unsafe {
+                DeviceMemory::<u8>::free_async(workspace_ptr, stream.get())?;
+            }
+        }
 
         Ok(())
     }
