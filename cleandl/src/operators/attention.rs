@@ -3,8 +3,8 @@ use std::sync::Arc;
 use singe_cudnn::{
     backend::tensor::TensorId,
     frontend::graph::{
-        SdpaForwardConfig, SdpaForwardRaggedConfig, SdpaInputs, SdpaMask, SdpaRaggedOffset,
-        SdpaSequenceLengths,
+        SdpaBackwardConfig, SdpaBackwardInputs, SdpaBackwardRaggedConfig, SdpaForwardConfig,
+        SdpaForwardRaggedConfig, SdpaInputs, SdpaMask, SdpaRaggedOffset, SdpaSequenceLengths,
     },
 };
 use skytens_core::data_type::{ElementType, FloatType, SIntType};
@@ -27,18 +27,20 @@ pub struct AttentionExecutor {
     forward_input_v: TensorId,
     forward_output_o: TensorId,
     forward_output_stats: TensorId,
-    // backward_graph: ExecutableCudnnGraph,
-    // backward_input_q: TensorId,
-    // backward_input_k: TensorId,
-    // backward_input_v: TensorId,
-    // backward_input_cu_seqlen_q: TensorId,
-    // backward_input_cu_seqlen_kv: TensorId,
-    // backward_input_o: TensorId,
-    // backward_input_do: TensorId,
-    // backward_input_stats: TensorId,
-    // backward_output_dq: TensorId,
-    // backward_output_dk: TensorId,
-    // backward_output_dv: TensorId,
+    backward_graph: ExecutableCudnnGraph,
+    backward_input_q: TensorId,
+    backward_input_k: TensorId,
+    backward_input_v: TensorId,
+    backward_input_cu_seqlen_q: TensorId,
+    backward_input_cu_seqlen_kv: TensorId,
+    backward_input_seqlen_q: TensorId,
+    backward_input_seqlen_kv: TensorId,
+    backward_input_o: TensorId,
+    backward_input_do: TensorId,
+    backward_input_stats: TensorId,
+    backward_output_dq: TensorId,
+    backward_output_dk: TensorId,
+    backward_output_dv: TensorId,
 }
 
 impl AttentionExecutor {
@@ -73,6 +75,47 @@ impl AttentionExecutor {
                 (self.forward_input_seqlen_kv, seqlen_kv),
                 (self.forward_output_o, out),
                 (self.forward_output_stats, out_stats),
+            ],
+            stream,
+        )?;
+        Ok(())
+    }
+
+    /// Q, K, V, O, dO, dQ, dK, dV expected as row-major bf16 [T, H, D].
+    /// Stats expected as row-major f32 [T, H].
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_attn(
+        &self,
+        q: &TensorView,
+        k: &TensorView,
+        v: &TensorView,
+        cu_seqlen_q: &TensorView,
+        cu_seqlen_kv: &TensorView,
+        seqlen_q: &TensorView,
+        seqlen_kv: &TensorView,
+        out: &TensorView,
+        out_grad: &TensorView,
+        stats: &TensorView,
+        grad_q: &TensorView,
+        grad_k: &TensorView,
+        grad_v: &TensorView,
+        stream: &CudaStream,
+    ) -> anyhow::Result<()> {
+        self.backward_graph.execute(
+            [
+                (self.backward_input_q, q),
+                (self.backward_input_k, k),
+                (self.backward_input_v, v),
+                (self.backward_input_cu_seqlen_q, cu_seqlen_q),
+                (self.backward_input_cu_seqlen_kv, cu_seqlen_kv),
+                (self.backward_input_seqlen_q, seqlen_q),
+                (self.backward_input_seqlen_kv, seqlen_kv),
+                (self.backward_input_o, out),
+                (self.backward_input_do, out_grad),
+                (self.backward_input_stats, stats),
+                (self.backward_output_dq, grad_q),
+                (self.backward_output_dk, grad_k),
+                (self.backward_output_dv, grad_v),
             ],
             stream,
         )?;
@@ -189,6 +232,103 @@ impl ResourceKey for AttentionConfig {
         )?;
         let forward_graph = forward_graph.build()?;
 
+        let mut backward_graph = CudnnGraphBuilder::new(cx);
+
+        let backward_cu_seqlen_q = backward_graph.bind_tensor(&VirtTensorView::new(
+            [self.max_num_sequences + 1],
+            ElementType::SInt(SIntType::S64),
+        ));
+        let backward_seqlen_q = backward_graph.bind_tensor(&VirtTensorView::new(
+            [self.max_num_sequences],
+            ElementType::SInt(SIntType::S32),
+        ));
+        let backward_cu_seqlen_kv = backward_graph.bind_tensor(&VirtTensorView::new(
+            [self.max_num_sequences + 1],
+            ElementType::SInt(SIntType::S64),
+        ));
+        let backward_seqlen_kv = backward_graph.bind_tensor(&VirtTensorView::new(
+            [self.max_num_sequences],
+            ElementType::SInt(SIntType::S32),
+        ));
+
+        let q_layout = VirtTensorView::new(
+            [
+                self.max_num_sequences,
+                self.max_q_seqlen,
+                self.q_heads,
+                self.head_dim,
+            ],
+            ElementType::Float(FloatType::Bf16),
+        )
+        .transposed(1, 2);
+        let kv_layout = VirtTensorView::new(
+            [
+                self.max_num_sequences,
+                self.max_kv_seqlen,
+                self.kv_heads,
+                self.head_dim,
+            ],
+            ElementType::Float(FloatType::Bf16),
+        )
+        .transposed(1, 2);
+        let stats_layout = VirtTensorView::new(
+            [self.max_num_sequences, self.max_q_seqlen, self.q_heads, 1],
+            ElementType::Float(FloatType::F32),
+        )
+        .transposed(1, 2);
+
+        let backward_input_q = backward_graph.bind_tensor(&q_layout);
+        let backward_input_k = backward_graph.bind_tensor(&kv_layout);
+        let backward_input_v = backward_graph.bind_tensor(&kv_layout);
+        let backward_input_o = backward_graph.bind_tensor(&q_layout);
+        let backward_input_do = backward_graph.bind_tensor(&q_layout);
+        let backward_input_stats = backward_graph.bind_tensor(&stats_layout);
+
+        for tensor in [backward_input_q, backward_input_o, backward_input_do] {
+            backward_graph.graph_mut().set_ragged_layout(
+                tensor,
+                backward_cu_seqlen_q,
+                (self.head_dim * self.q_heads) as i64,
+            )?;
+        }
+        backward_graph.graph_mut().set_ragged_layout(
+            backward_input_stats,
+            backward_cu_seqlen_q,
+            self.q_heads as i64,
+        )?;
+        for tensor in [backward_input_k, backward_input_v] {
+            backward_graph.graph_mut().set_ragged_layout(
+                tensor,
+                backward_cu_seqlen_kv,
+                (self.head_dim * self.kv_heads) as i64,
+            )?;
+        }
+
+        let backward_outputs = backward_graph.graph_mut().sdpa_backward_infer(
+            SdpaBackwardInputs {
+                query: backward_input_q,
+                key: backward_input_k,
+                value: backward_input_v,
+                output: backward_input_o,
+                output_gradient: backward_input_do,
+                stats: backward_input_stats,
+            },
+            SdpaBackwardConfig::new(attn_scale)
+                .with_mask(SdpaMask::Causal)
+                .with_ragged(SdpaBackwardRaggedConfig {
+                    sequence_lengths: SdpaSequenceLengths {
+                        query: backward_seqlen_q,
+                        key_value: backward_seqlen_kv,
+                    },
+                    max_total_sequence_length_query: (self.max_num_sequences * self.max_q_seqlen)
+                        as i64,
+                    max_total_sequence_length_key_value: (self.max_num_sequences
+                        * self.max_kv_seqlen)
+                        as i64,
+                }),
+        )?;
+        let backward_graph = backward_graph.build()?;
+
         Ok(AttentionExecutor {
             forward_graph,
             forward_input_cu_seqlen_q: forward_cu_seqlen_q,
@@ -201,6 +341,21 @@ impl ResourceKey for AttentionConfig {
             forward_output_stats: forward_outputs.stats(),
             forward_input_seqlen_q: forward_seqlen_q,
             forward_input_seqlen_kv: forward_seqlen_kv,
+
+            backward_graph,
+            backward_input_q,
+            backward_input_k,
+            backward_input_v,
+            backward_input_cu_seqlen_q: backward_cu_seqlen_q,
+            backward_input_cu_seqlen_kv: backward_cu_seqlen_kv,
+            backward_input_seqlen_q: backward_seqlen_q,
+            backward_input_seqlen_kv: backward_seqlen_kv,
+            backward_input_o,
+            backward_input_do,
+            backward_input_stats,
+            backward_output_dq: backward_outputs.query_gradient(),
+            backward_output_dk: backward_outputs.key_gradient(),
+            backward_output_dv: backward_outputs.value_gradient(),
         })
     }
 }

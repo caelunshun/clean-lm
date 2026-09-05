@@ -5,3 +5,9 @@ resolver = "3"
 [patch.crates-io]
 singe-cuda = { path = "../singe/singe-cuda" }
 singe-cudnn = { path = "../singe/singe-cudnn" }
+
+[profile.dev.package.'*']
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

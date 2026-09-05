@@ -27,7 +27,7 @@ const K: usize = 8192;
 const REL_TOLERANCE: f32 = 2e-2;
 const ABS_TOLERANCE: f32 = 1e-3;
 
-#[test ]
+#[test]
 fn fused_matmul() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
