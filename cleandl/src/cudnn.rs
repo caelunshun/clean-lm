@@ -76,6 +76,7 @@ impl CudnnGraphBuilder {
             vectorized_dimension: None,
             reordering: None,
             ragged_offset: None,
+            ragged_tensor_multiplier: None,
             scalar_value: None,
         })
     }
@@ -98,6 +99,7 @@ impl CudnnGraphBuilder {
             vectorized_dimension: None,
             reordering: None,
             ragged_offset: None,
+            ragged_tensor_multiplier: None,
         })
     }
 
@@ -126,6 +128,8 @@ impl CudnnGraphBuilder {
                         DataType::F32 => ElementType::Float(FloatType::F32),
                         DataType::BF16 => ElementType::Float(FloatType::Bf16),
                         DataType::U32 => ElementType::UInt(UIntType::U32),
+                        DataType::I64 => ElementType::SInt(SIntType::S64),
+                        DataType::I32 => ElementType::SInt(SIntType::S32),
                         _ => todo!("{:?}", tensor.data_type),
                     },
                 ),

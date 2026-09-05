@@ -149,6 +149,14 @@ impl TensorView {
         }
     }
 
+    #[must_use]
+    pub fn transposed(&self, dim_a: usize, dim_b: usize) -> Self {
+        Self {
+            virt: self.virt.transposed(dim_a, dim_b),
+            ..self.clone()
+        }
+    }
+
     /// Returns a contiguous slice view along a dimension.
     #[must_use]
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> Self {
