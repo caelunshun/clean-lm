@@ -27,7 +27,8 @@ const K: usize = 8192;
 const REL_TOLERANCE: f32 = 2e-2;
 const ABS_TOLERANCE: f32 = 1e-3;
 
-fn main() -> anyhow::Result<()> {
+#[test ]
+fn fused_matmul() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
     let a = TensorView::new_zeroed(

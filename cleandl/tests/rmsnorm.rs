@@ -5,7 +5,8 @@ use cleandl::{
 };
 use skytens_core::data_type::{ElementType, FloatType};
 
-fn main() -> anyhow::Result<()> {
+#[test]
+fn rmsnorm() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
     let rmsnorm = RmsNormExecutor::get(

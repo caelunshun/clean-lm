@@ -184,7 +184,7 @@ impl ResourceKey for AttentionConfig {
                     output_ragged_offset: SdpaRaggedOffset::new(forward_cu_seqlen_q)
                         .with_multiplier((self.head_dim * self.q_heads) as i64),
                     stats_ragged_offset: SdpaRaggedOffset::new(forward_cu_seqlen_q)
-                        .with_multiplier(self.head_dim as i64),
+                        .with_multiplier(self.q_heads as i64),
                 }),
         )?;
         let forward_graph = forward_graph.build()?;
