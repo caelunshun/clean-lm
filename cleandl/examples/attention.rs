@@ -6,7 +6,7 @@ use cleandl::{
 fn main() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
-    AttentionExecutor::get(
+    let executor = AttentionExecutor::get(
         AttentionConfig {
             max_q_seqlen: 1024 * 1024,
             max_kv_seqlen: 1024 * 1024,

@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         output: c_id,
         compute_type: DataType::F32,
         alpha1: 1.0,
-        nan_propagation: NanPropagation::NotPropagate,
+        nan_propagation: NanPropagation::Propagate,
         axis: None,
     });
 

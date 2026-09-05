@@ -46,7 +46,8 @@ impl AttentionExecutor {
         cx.get_or_create_resource(config)
     }
 
-    /// Q, K, V expected as row-major [TODO]
+    /// Q, K, V, O expected as row-major bf16 [T, H, D].
+    /// Stats expected as row-major f32 [T, H].
     #[allow(clippy::too_many_arguments)]
     pub fn forward_attn(
         &self,
@@ -61,9 +62,6 @@ impl AttentionExecutor {
         out_stats: &TensorView,
         stream: &CudaStream,
     ) -> anyhow::Result<()> {
-        let q = &q.transposed(1, 2);
-        let k = &k.transposed(1, 2);
-
         self.forward_graph.execute(
             [
                 (self.forward_input_q, q),

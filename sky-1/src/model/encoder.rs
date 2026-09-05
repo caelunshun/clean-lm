@@ -6,7 +6,4 @@ use crate::model::BlocksConfig;
 #[derive(Debug)]
 pub struct EncoderExecutor {
     config: BlocksConfig,
-  
 }
-
-

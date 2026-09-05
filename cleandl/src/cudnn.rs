@@ -110,30 +110,44 @@ impl CudnnGraphBuilder {
         let compiled = self.graph.compile(cudnn_context, &[HeuristicMode::B])?;
 
         for (tensor_id, tensor) in self.graph.tensors() {
-            tensor_virt_descs.insert(
-                tensor_id,
-                VirtTensorView::with_strides(
-                    skytens_core::shape::Shape::new(
-                        tensor
-                            .shape
-                            .dimensions()
-                            .iter()
-                            .copied()
-                            .map(|x| x as usize),
-                    ),
-                    skytens_core::shape::Strides::new(
-                        tensor.shape.strides().iter().copied().map(|x| x as usize),
-                    ),
-                    match tensor.data_type {
-                        DataType::F32 => ElementType::Float(FloatType::F32),
-                        DataType::BF16 => ElementType::Float(FloatType::Bf16),
-                        DataType::U32 => ElementType::UInt(UIntType::U32),
-                        DataType::I64 => ElementType::SInt(SIntType::S64),
-                        DataType::I32 => ElementType::SInt(SIntType::S32),
-                        _ => todo!("{:?}", tensor.data_type),
-                    },
-                ),
-            );
+            let element_type = match tensor.data_type {
+                DataType::F32 => ElementType::Float(FloatType::F32),
+                DataType::BF16 => ElementType::Float(FloatType::Bf16),
+                DataType::U32 => ElementType::UInt(UIntType::U32),
+                DataType::I64 => ElementType::SInt(SIntType::S64),
+                DataType::I32 => ElementType::SInt(SIntType::S32),
+                _ => todo!("{:?}", tensor.data_type),
+            };
+            match tensor.ragged_offset {
+                Some(_) => {
+                    tensor_virt_descs.insert(
+                        tensor_id,
+                        ExpectedVirtDesc::Ragged {
+                            num_dims: tensor.shape.dimensions().len().checked_sub(1).unwrap(),
+                            element_type,
+                        },
+                    );
+                }
+                None => {
+                    tensor_virt_descs.insert(
+                        tensor_id,
+                        ExpectedVirtDesc::Exact(VirtTensorView::with_strides(
+                            skytens_core::shape::Shape::new(
+                                tensor
+                                    .shape
+                                    .dimensions()
+                                    .iter()
+                                    .copied()
+                                    .map(|x| x as usize),
+                            ),
+                            skytens_core::shape::Strides::new(
+                                tensor.shape.strides().iter().copied().map(|x| x as usize),
+                            ),
+                            element_type,
+                        )),
+                    );
+                }
+            }
         }
 
         let plan_index = compiled.default_plan_index();
@@ -154,9 +168,18 @@ impl CudnnGraphBuilder {
 pub struct ExecutableCudnnGraph {
     cx: Context,
     graph: CompiledGraph,
-    tensor_virt_descs: HashMap<TensorId, VirtTensorView>,
+    tensor_virt_descs: HashMap<TensorId, ExpectedVirtDesc>,
     plan_index: usize,
     workspace_bytes: usize,
+}
+
+#[derive(Debug)]
+enum ExpectedVirtDesc {
+    Exact(VirtTensorView),
+    Ragged {
+        num_dims: usize,
+        element_type: ElementType,
+    },
 }
 
 impl ExecutableCudnnGraph {
@@ -180,14 +203,25 @@ impl ExecutableCudnnGraph {
 
         let mut bindings = self.graph.bindings();
         for (tensor_id, tensor_view) in operands {
-            assert!(
-                tensor_view
-                    .virt()
-                    .same_layout_as(&self.tensor_virt_descs[&tensor_id]),
-                "expected layout of {:?}, found {:?}",
-                self.tensor_virt_descs[&tensor_id],
-                tensor_view.virt()
-            );
+            match &self.tensor_virt_descs[&tensor_id] {
+                ExpectedVirtDesc::Exact(virt_tensor_view) => {
+                    assert!(
+                        tensor_view.virt().same_layout_as(virt_tensor_view),
+                        "expected layout of {:?}, found {:?}",
+                        virt_tensor_view,
+                        tensor_view.virt()
+                    );
+                }
+                ExpectedVirtDesc::Ragged {
+                    num_dims,
+                    element_type,
+                } => {
+                    assert_eq!(tensor_view.shape().num_dims(), *num_dims);
+                    assert!(tensor_view.is_packed_row_major());
+                    assert_eq!(tensor_view.element_type(), *element_type);
+                }
+            }
+
             unsafe {
                 bindings.set_ptr(tensor_id, tensor_view.data_ptr())?;
             }
