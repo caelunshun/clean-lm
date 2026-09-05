@@ -1,8 +1,14 @@
 use cleandl::{
+    bulk_copy::BulkCopyEngine,
     context::{Context, CudaStream},
     cudnn::CudnnGraphBuilder,
     tensor::TensorView,
 };
+use faer::Mat;
+use float_cmp::{ApproxEq, F32Margin};
+use half::bf16;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand_distr::StandardNormal;
 use singe_cudnn::{
     backend::pointwise::PointwiseMode,
     data_type::DataType,
@@ -14,24 +20,50 @@ use skytens_core::{
     shape::Shape,
 };
 
+const M: usize = 8192;
+const N: usize = 8192;
+const K: usize = 8192;
+
+const REL_TOLERANCE: f32 = 2e-2;
+const ABS_TOLERANCE: f32 = 1e-3;
+
 fn main() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
     let a = TensorView::new_zeroed(
-        Shape::new([1, 8192, 4096]),
+        Shape::new([1, M, K]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let b = TensorView::new_zeroed(
-        Shape::new([1, 4096, 16384]),
+        Shape::new([1, K, N]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
     let c = TensorView::new_zeroed(
-        Shape::new([1, 8192, 16384]),
+        Shape::new([1, M, N]),
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
+
+    let mut rng = StdRng::seed_from_u64(555);
+    let scale = (K as f32).sqrt().recip();
+    let a_host: Vec<bf16> = (0..M * K)
+        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
+        .collect();
+    let b_host: Vec<bf16> = (0..K * N)
+        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
+        .collect();
+
+    let mut copy_engine = BulkCopyEngine::new(&cx)?;
+    let mut batch = copy_engine.start_batch()?;
+    batch.copy_to_device(&a, |dest| {
+        dest.copy_from_slice(bytemuck::cast_slice(&a_host));
+    })?;
+    batch.copy_to_device(&b, |dest| {
+        dest.copy_from_slice(bytemuck::cast_slice(&b_host));
+    })?;
+    batch.commit()?;
 
     let mut graph = CudnnGraphBuilder::new(&cx);
     let a_id = graph.bind_tensor(a.virt());
@@ -58,5 +90,41 @@ fn main() -> anyhow::Result<()> {
 
     cx.cuda().synchronize()?;
 
+    // Read the result back to the host.
+    let mut batch = copy_engine.start_batch()?;
+    let token = batch.copy_to_host(&c)?;
+    batch.commit()?;
+    let c_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(token)?);
+
+    let a_ref = Mat::from_fn(M, K, |i, j| a_host[i * K + j].to_f32());
+    let b_ref = Mat::from_fn(K, N, |i, j| b_host[i * N + j].to_f32());
+    let c_ref = a_ref * b_ref;
+
+    let mut max_error = 0.0f32;
+    for i in 0..M {
+        for j in 0..N {
+            let expected = swish(c_ref[(i, j)]);
+            let actual = c_host[i * N + j].to_f32();
+
+            max_error = max_error.max((actual - expected).abs());
+
+            let margin = F32Margin {
+                epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
+                ulps: 0,
+            };
+            anyhow::ensure!(
+                actual.approx_eq(expected, margin),
+                "mismatch at ({i}, {j}): expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    println!("results match the reference (max absolute error: {max_error})");
+
     Ok(())
+}
+
+/// Swish (SiLU) activation: `x * sigmoid(x)`.
+fn swish(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
 }

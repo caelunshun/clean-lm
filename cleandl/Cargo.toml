@@ -17,3 +17,7 @@ thread_local = "1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 parking_lot = "0.12"
+
+[dev-dependencies]
+float-cmp = "0.10"
+faer = "0.24"
