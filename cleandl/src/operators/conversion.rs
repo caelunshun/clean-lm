@@ -8,7 +8,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, CudaStream, ResourceKey},
-    cutile::CutileKernelKey,
+    include_cubins,
     tensor::TensorView,
 };
 
@@ -97,9 +97,8 @@ impl ResourceKey for ConversionExecutorKey {
 
     fn create(&self, cx: &crate::context::Context) -> anyhow::Result<Self::Resource> {
         Ok(ConversionExecutor {
-            module: cx.get_or_create_resource(CutileKernelKey {
-                src: include_str!("../../cutile-kernels/conversion.cu"),
-            })?,
+            module: cx
+                .get_or_create_resource(include_cubins!("../../cutile-kernels/conversion"))?,
         })
     }
 }

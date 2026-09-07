@@ -11,7 +11,7 @@ use skytens_core::{
 
 use crate::{
     context::{Context, CudaStream, ResourceKey},
-    cutile::CutileKernelKey,
+    include_cubins,
     tensor::TensorView,
 };
 
@@ -150,9 +150,7 @@ impl ResourceKey for EmbeddingExecutorKey {
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         Ok(EmbeddingExecutor {
-            module: cx.get_or_create_resource(CutileKernelKey {
-                src: include_str!("../../cutile-kernels/embedding.cu"),
-            })?,
+            module: cx.get_or_create_resource(include_cubins!("../../cutile-kernels/embedding"))?,
         })
     }
 }

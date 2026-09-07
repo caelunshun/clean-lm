@@ -11,7 +11,7 @@ use skytens_core::{
 
 use crate::{
     context::{Context, CudaStream, ResourceKey},
-    cutile::CutileKernelKey,
+    include_cubins,
     tensor::TensorView,
 };
 
@@ -80,9 +80,10 @@ impl AdamWExecutor {
         weight_decay: f32,
         max_gradient_norm: f32,
         lr: f32,
-        train_step: f32,
+        train_step: u32,
         stream: &CudaStream,
     ) -> anyhow::Result<()> {
+        assert!(train_step > 0);
         assert_eq!(gradient.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(
             gradient_l2_global_sum.element_type(),
@@ -139,7 +140,7 @@ impl AdamWExecutor {
                 .push(weight_decay)
                 .push(max_gradient_norm)
                 .push(lr)
-                .push(train_step)
+                .push(train_step as f32)
                 .push(i32::try_from(n)?),
             stream.get(),
         )?;
@@ -157,9 +158,7 @@ impl ResourceKey for AdamwExecutorKey {
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         cx.cuda().bind()?;
 
-        let module = cx.get_or_create_resource(CutileKernelKey {
-            src: include_str!("../../cutile-kernels/adamw.cu"),
-        })?;
+        let module = cx.get_or_create_resource(include_cubins!("../../cutile-kernels/adamw"))?;
 
         Ok(AdamWExecutor { module })
     }
