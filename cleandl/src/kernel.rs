@@ -1,10 +1,6 @@
 use anyhow::bail;
 use serde::Serialize;
-use singe_cuda::{
-   
-    module::{Module, ModuleImage},
-  
-};
+use singe_cuda::module::{Module, ModuleImage};
 
 use crate::context::{Context, ResourceKey};
 
