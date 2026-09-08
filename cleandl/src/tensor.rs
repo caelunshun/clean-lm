@@ -134,17 +134,17 @@ impl TensorView {
 
     /// Attempts to reshape the logical contents without changing their order.
     #[must_use]
-    pub fn try_reshaped(&self, target_shape: Shape) -> Option<Self> {
+    pub fn try_reshaped(&self, target_shape: impl Into<Shape>) -> Option<Self> {
         Some(Self {
-            virt: self.virt.try_reshaped(target_shape)?,
+            virt: self.virt.try_reshaped(target_shape.into())?,
             ..self.clone()
         })
     }
 
     #[must_use]
-    pub fn reshaped(&self, target_shape: Shape) -> Self {
+    pub fn reshaped(&self, target_shape: impl Into<Shape>) -> Self {
         Self {
-            virt: self.virt.reshaped(target_shape),
+            virt: self.virt.reshaped(target_shape.into()),
             ..self.clone()
         }
     }

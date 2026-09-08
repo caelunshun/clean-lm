@@ -11,6 +11,8 @@ use crate::model::BlocksConfig;
 #[derive(Debug)]
 pub struct EncoderExecutor {
     config: BlocksConfig,
-    rmsnorm: Arc<RmsNormExecutor>,
+    activation_norm: Arc<RmsNormExecutor>,
+
+    qk_norm: Arc<RmsNormExecutor>,
     attention: Arc<AttentionExecutor>,
 }
