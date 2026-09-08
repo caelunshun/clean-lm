@@ -157,6 +157,11 @@ impl TensorView {
         }
     }
 
+    #[must_use]
+    pub fn unsqueezed(&self) -> Self {
+        self.reshaped(self.shape().prepend(1))
+    }
+
     /// Returns a contiguous slice view along a dimension.
     #[must_use]
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> Self {

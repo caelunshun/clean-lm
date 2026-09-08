@@ -84,11 +84,14 @@ impl SwiGluFfnExecutor {
     ) -> anyhow::Result<()> {
         self.fwd_fused_gate_graph.execute(
             [
-                (self.fwd_fused_gate_data, data),
-                (self.fwd_fused_gate_up, up),
-                (self.fwd_fused_gate_weight, weight),
-                (self.fwd_fused_gate_out_gate, out_gate),
-                (self.fwd_fused_gate_out_activation, out_activation),
+                (self.fwd_fused_gate_data, &data.unsqueezed()),
+                (self.fwd_fused_gate_up, &up.unsqueezed()),
+                (self.fwd_fused_gate_weight, &weight.unsqueezed()),
+                (self.fwd_fused_gate_out_gate, &out_gate.unsqueezed()),
+                (
+                    self.fwd_fused_gate_out_activation,
+                    &out_activation.unsqueezed(),
+                ),
             ],
             stream,
         )
@@ -117,12 +120,15 @@ impl SwiGluFfnExecutor {
     ) -> anyhow::Result<()> {
         self.bwd_down_proj_dgrad_graph.execute(
             [
-                (self.bwd_down_proj_dgrad_weight, &weight.transposed(0, 1)),
-                (self.bwd_down_proj_dgrad_dy, dy),
-                (self.bwd_down_proj_dgrad_gate, gate),
-                (self.bwd_down_proj_dgrad_up, up),
-                (self.bwd_down_proj_dgrad_out_dgate, out_dgate),
-                (self.bwd_down_proj_dgrad_out_dup, out_dup),
+                (
+                    self.bwd_down_proj_dgrad_weight,
+                    &weight.transposed(0, 1).unsqueezed(),
+                ),
+                (self.bwd_down_proj_dgrad_dy, &dy.unsqueezed()),
+                (self.bwd_down_proj_dgrad_gate, &gate.unsqueezed()),
+                (self.bwd_down_proj_dgrad_up, &up.unsqueezed()),
+                (self.bwd_down_proj_dgrad_out_dgate, &out_dgate.unsqueezed()),
+                (self.bwd_down_proj_dgrad_out_dup, &out_dup.unsqueezed()),
             ],
             stream,
         )
@@ -171,10 +177,13 @@ impl SwiGluFfnExecutor {
     ) -> anyhow::Result<()> {
         self.bwd_gate_proj_dgrad_graph.execute(
             [
-                (self.bwd_gate_proj_dgrad_dgate, dout),
-                (self.bwd_gate_proj_dgrad_dup_in, ddata_up),
-                (self.bwd_gate_proj_dgrad_weight, &weight.transposed(0, 1)),
-                (self.bwd_gate_proj_dgrad_out_dffn, out_dffn),
+                (self.bwd_gate_proj_dgrad_dgate, &dout.unsqueezed()),
+                (self.bwd_gate_proj_dgrad_dup_in, &ddata_up.unsqueezed()),
+                (
+                    self.bwd_gate_proj_dgrad_weight,
+                    &weight.transposed(0, 1).unsqueezed(),
+                ),
+                (self.bwd_gate_proj_dgrad_out_dffn, &out_dffn.unsqueezed()),
             ],
             stream,
         )?;
@@ -219,31 +228,31 @@ impl ResourceKey for SwiGluConfig {
 
         let mut fwd_fused_gate_graph = CudnnGraphBuilder::new(cx);
         let fwd_fused_gate_data = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.in_features],
+            [1, self.batch_size, self.in_features],
             ElementType::Float(FloatType::Bf16),
         ));
         let fwd_fused_gate_up = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
         let fwd_fused_gate_weight = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.in_features, self.intermediate_features],
+            [1, self.in_features, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
 
         let fwd_fused_gate_out_gate = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
 
         let tmp = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
         fwd_fused_gate_graph.graph_mut().mark_as_virtual(tmp)?;
 
         let fwd_fused_gate_out_activation = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
 
@@ -316,24 +325,24 @@ impl ResourceKey for SwiGluConfig {
         let mut bwd_gate_proj_dgrad_graph = CudnnGraphBuilder::new(cx);
         let bwd_gate_proj_dgrad_dgate =
             bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [self.batch_size, self.intermediate_features],
+                [1, self.batch_size, self.intermediate_features],
                 ElementType::Float(FloatType::Bf16),
             ));
         let bwd_gate_proj_dgrad_weight = bwd_gate_proj_dgrad_graph.bind_tensor(
             &VirtTensorView::new(
-                [self.in_features, self.intermediate_features],
+                [1, self.in_features, self.intermediate_features],
                 ElementType::Float(FloatType::Bf16),
             )
-            .transposed(0, 1),
+            .transposed(1, 2),
         );
         let bwd_gate_proj_dgrad_dup_in =
             bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [self.batch_size, self.in_features],
+                [1, self.batch_size, self.in_features],
                 ElementType::Float(FloatType::Bf16),
             ));
         let bwd_gate_proj_dgrad_out_dffn =
             bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [self.batch_size, self.in_features],
+                [1, self.batch_size, self.in_features],
                 ElementType::Float(FloatType::Bf16),
             ));
 
@@ -362,31 +371,31 @@ impl ResourceKey for SwiGluConfig {
 
         let bwd_down_proj_dgrad_weight = bwd_down_proj_dgrad_graph.bind_tensor(
             &VirtTensorView::new(
-                [self.intermediate_features, self.out_features],
+                [1, self.intermediate_features, self.out_features],
                 ElementType::Float(FloatType::Bf16),
             )
-            .transposed(0, 1),
+            .transposed(1, 2),
         );
         let bwd_down_proj_dgrad_dy = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.out_features],
+            [1, self.batch_size, self.out_features],
             ElementType::Float(FloatType::Bf16),
         ));
         let bwd_down_proj_dgrad_gate = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
         let bwd_down_proj_dgrad_up = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
         let bwd_down_proj_dgrad_out_dgate =
             bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [self.batch_size, self.intermediate_features],
+                [1, self.batch_size, self.intermediate_features],
                 ElementType::Float(FloatType::Bf16),
             ));
         let bwd_down_proj_dgrad_out_dup =
             bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [self.batch_size, self.intermediate_features],
+                [1, self.batch_size, self.intermediate_features],
                 ElementType::Float(FloatType::Bf16),
             ));
 
@@ -403,7 +412,7 @@ impl ResourceKey for SwiGluConfig {
 
         // Recompute swish forward
         let tmp_gate_swish = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [self.batch_size, self.intermediate_features],
+            [1, self.batch_size, self.intermediate_features],
             ElementType::Float(FloatType::Bf16),
         ));
         bwd_down_proj_dgrad_graph
@@ -432,7 +441,7 @@ impl ResourceKey for SwiGluConfig {
                 alpha1: 1.0,
                 alpha2: 1.0,
             });
-        // (2) dgate, requiring extra dswish operation
+        // (2) dgate, requiring dswish operation
         let tmp_dswish = bwd_down_proj_dgrad_graph
             .graph_mut()
             .pointwise_binary_infer(
@@ -443,14 +452,15 @@ impl ResourceKey for SwiGluConfig {
             )?;
         bwd_down_proj_dgrad_graph
             .graph_mut()
-            .pointwise(PointwiseOperation::Unary {
+            .pointwise(PointwiseOperation::Binary {
                 mode: PointwiseMode::SwishBwd,
-                input: tmp_dswish,
                 output: bwd_down_proj_dgrad_out_dgate,
                 compute_type: DataType::F32,
                 nan_propagation: NanPropagation::Propagate,
                 alpha1: 1.0,
-                axis: None,
+                lhs: tmp_dswish,
+                rhs: bwd_down_proj_dgrad_gate,
+                alpha2: 1.0,
             });
         let bwd_down_proj_dgrad_graph = bwd_down_proj_dgrad_graph.build()?;
 

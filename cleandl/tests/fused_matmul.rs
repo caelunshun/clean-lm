@@ -31,21 +31,9 @@ const ABS_TOLERANCE: f32 = 1e-3;
 fn fused_matmul() -> anyhow::Result<()> {
     let cx = Context::new(0)?;
 
-    let a = TensorView::new_zeroed(
-        Shape::new([1, M, K]),
-        ElementType::Float(FloatType::Bf16),
-        &cx,
-    )?;
-    let b = TensorView::new_zeroed(
-        Shape::new([1, K, N]),
-        ElementType::Float(FloatType::Bf16),
-        &cx,
-    )?;
-    let c = TensorView::new_zeroed(
-        Shape::new([1, M, N]),
-        ElementType::Float(FloatType::Bf16),
-        &cx,
-    )?;
+    let a = TensorView::new_zeroed(Shape::new([M, K]), ElementType::Float(FloatType::Bf16), &cx)?;
+    let b = TensorView::new_zeroed(Shape::new([K, N]), ElementType::Float(FloatType::Bf16), &cx)?;
+    let c = TensorView::new_zeroed(Shape::new([M, N]), ElementType::Float(FloatType::Bf16), &cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (K as f32).sqrt().recip();

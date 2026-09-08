@@ -16,6 +16,7 @@ use crate::{
 /// Unfused matmul executor.
 #[derive(Debug)]
 pub struct MatmulExecutor {
+    config: MatmulConfig,
     graph: ExecutableCudnnGraph,
     a: TensorId,
     b: TensorId,
@@ -34,8 +35,17 @@ impl MatmulExecutor {
         out: &TensorView,
         stream: &CudaStream,
     ) -> anyhow::Result<()> {
-        self.graph
-            .execute([(self.a, a), (self.b, b), (self.out, out)], stream)?;
+        assert_eq!(a.shape().dims_slice(), &[self.config.m, self.config.k]);
+        assert_eq!(b.shape().dims_slice(), &[self.config.k, self.config.n]);
+        assert_eq!(out.shape().dims_slice(), &[self.config.m, self.config.n]);
+        self.graph.execute(
+            [
+                (self.a, &a.reshaped([1, self.config.m, self.config.k])),
+                (self.b, &b.reshaped([1, self.config.k, self.config.n])),
+                (self.out, &out.reshaped([1, self.config.m, self.config.n])),
+            ],
+            stream,
+        )?;
         Ok(())
     }
 }
@@ -81,6 +91,7 @@ impl ResourceKey for MatmulConfig {
         graph.graph_mut().matmul(a, b, out, DataType::F32)?;
 
         Ok(MatmulExecutor {
+            config: self.clone(),
             graph: graph.build()?,
             a,
             b,
