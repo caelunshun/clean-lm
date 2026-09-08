@@ -32,6 +32,7 @@ fn attention() -> anyhow::Result<()> {
 
     let executor = AttentionExecutor::get(
         AttentionConfig {
+            is_causal: true,
             max_q_seqlen: max_seqlen,
             max_kv_seqlen: max_seqlen,
             max_num_sequences: num_sequences,

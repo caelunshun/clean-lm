@@ -125,6 +125,7 @@ impl AttentionExecutor {
 
 #[derive(Debug, serde::Serialize)]
 pub struct AttentionConfig {
+    pub is_causal: bool,
     pub max_q_seqlen: usize,
     pub max_kv_seqlen: usize,
     pub max_num_sequences: usize,
@@ -218,7 +219,11 @@ impl ResourceKey for AttentionConfig {
                 value: forward_input_v,
             },
             SdpaForwardConfig::new(attn_scale)
-                .with_mask(SdpaMask::Causal)
+                .with_mask(if self.is_causal {
+                    SdpaMask::Causal
+                } else {
+                    SdpaMask::None
+                })
                 .with_ragged(SdpaForwardRaggedConfig {
                     sequence_lengths: SdpaSequenceLengths {
                         query: forward_seqlen_q,
@@ -314,7 +319,11 @@ impl ResourceKey for AttentionConfig {
                 stats: backward_input_stats,
             },
             SdpaBackwardConfig::new(attn_scale)
-                .with_mask(SdpaMask::Causal)
+                .with_mask(if self.is_causal {
+                    SdpaMask::Causal
+                } else {
+                    SdpaMask::None
+                })
                 .with_ragged(SdpaBackwardRaggedConfig {
                     sequence_lengths: SdpaSequenceLengths {
                         query: backward_seqlen_q,

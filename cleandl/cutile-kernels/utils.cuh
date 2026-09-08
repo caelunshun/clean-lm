@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_tile.h>
 #include <numbers>
 #include <cmath>
