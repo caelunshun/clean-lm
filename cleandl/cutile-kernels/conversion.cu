@@ -3,8 +3,8 @@
 extern "C" __tile_global__ void
 f32_to_bf16_16384(const float *__restrict__ in, __nv_bfloat16 *__restrict__ out,
                   int n) {
-  in = ct::assume_aligned(in, 16_ic);
-  out = ct::assume_aligned(out, 16_ic);
+  ASSUME_ALIGNED(in);
+  ASSUME_ALIGNED(out);
   n = ct::assume_divisible(n, 16_ic);
 
   auto in_view = ct::partition_view{ct::tensor_span{in, ct::extents{n}},
@@ -19,8 +19,8 @@ f32_to_bf16_16384(const float *__restrict__ in, __nv_bfloat16 *__restrict__ out,
 extern "C" 
 __tile_global__ void bf16_to_f32_16384(const __nv_bfloat16 *__restrict__ in,
                                        float *__restrict__ out, int n) {
-  in = ct::assume_aligned(in, 16_ic);
-  out = ct::assume_aligned(out, 16_ic);
+  ASSUME_ALIGNED(in);
+  ASSUME_ALIGNED(out);
   n = ct::assume_divisible(n, 16_ic);
 
   auto in_view = ct::partition_view{ct::tensor_span{in, ct::extents{n}},

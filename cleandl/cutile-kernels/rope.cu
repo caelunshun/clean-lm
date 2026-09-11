@@ -17,11 +17,11 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
 
     max_seqlen = ct::assume_divisible(max_seqlen, ct::integral_constant<BLOCK_SIZE>{});
 
-    x = ct::assume_aligned(x, 16_ic);
-    cu_seqlen = ct::assume_aligned(cu_seqlen, 16_ic);
-    cos_table = ct::assume_aligned(cos_table, 16_ic);
-    sin_table = ct::assume_aligned(sin_table, 16_ic);
-    out = ct::assume_aligned(out, 16_ic);
+    ASSUME_ALIGNED(x);
+    ASSUME_ALIGNED(cu_seqlen);
+    ASSUME_ALIGNED(cos_table);
+    ASSUME_ALIGNED(sin_table);
+    ASSUME_ALIGNED(out);
 
     auto cos_table_view = ct::partition_view{
         ct::tensor_span{cos_table, ct::extents{max_seqlen, HALF_HEAD_DIM}},
@@ -42,7 +42,7 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
 
     int64_t sequence_start = cu_seqlen[sequence_idx];
     int64_t sequence_end = cu_seqlen[sequence_idx + 1];
-    int seqlen = std::min(static_cast<int>(sequence_end - sequence_start), max_seqlen);
+    int seqlen = ct::min(static_cast<int>(sequence_end - sequence_start), max_seqlen);
 
     int64_t elements_offset = (sequence_start + token_offset) * num_heads * HEAD_DIM;
 

@@ -6,3 +6,5 @@
 
 namespace ct = cuda::tiles;
 using namespace ct::literals;
+
+#define ASSUME_ALIGNED(x) x = ct::assume_aligned(x, 16_ic);

@@ -3,8 +3,8 @@
 extern "C" __tile_global__ void gradient_l2_norm_reduction_bf16_16384(
     const __nv_bfloat16 *__restrict__ gradient, float *__restrict__ global_sum,
     int n) {
-  gradient = ct::assume_aligned(gradient, 16_ic);
-  global_sum = ct::assume_aligned(global_sum, 16_ic);
+  ASSUME_ALIGNED(gradient);
+  ASSUME_ALIGNED(global_sum);
   n = ct::assume_divisible(n, 16_ic);
 
   auto gradient_view = ct::partition_view{
@@ -34,23 +34,23 @@ adamw_weight_update_clipped_bf16grad_f32master_bf16replica_4096_persistent(
 
   n = ct::assume_divisible(n, 16_ic);
 
-  gradient = ct::assume_aligned(gradient, 16_ic);
+  ASSUME_ALIGNED(gradient);
   auto gradient_view = ct::partition_view{
       ct::tensor_span{gradient, ct::extents{n}}, ct::shape<4096>{}};
 
-  weight = ct::assume_aligned(weight, 16_ic);
+  ASSUME_ALIGNED(weight);
   auto weight_view = ct::partition_view{ct::tensor_span{weight, ct::extents{n}},
                                         ct::shape<4096>{}};
 
-  weight_bf16_replica = ct::assume_aligned(weight_bf16_replica, 16_ic);
+  ASSUME_ALIGNED(weight_bf16_replica);
   auto weight_bf16_replica_view = ct::partition_view{
       ct::tensor_span{weight_bf16_replica, ct::extents{n}}, ct::shape<4096>{}};
 
-  adam_m = ct::assume_aligned(adam_m, 16_ic);
+  ASSUME_ALIGNED(adam_m);
   auto adam_m_view = ct::partition_view{ct::tensor_span{adam_m, ct::extents{n}},
                                         ct::shape<4096>{}};
 
-  adam_v = ct::assume_aligned(adam_v, 16_ic);
+  ASSUME_ALIGNED(adam_v);
   auto adam_v_view = ct::partition_view{ct::tensor_span{adam_v, ct::extents{n}},
                                         ct::shape<4096>{}};
 

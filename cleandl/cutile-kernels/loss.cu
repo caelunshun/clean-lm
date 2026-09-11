@@ -6,8 +6,8 @@ constexpr float log2_e = std::numbers::log2e_v<float>;
 // and softmax denominator `d` and emitting `m + ln(d)`.
 extern "C" __tile_global__ void online_softmax_stats_128(const __nv_bfloat16 *__restrict__ x, float *__restrict__ out_stats, int batch_size, int hidden_size)
 {
-    x = ct::assume_aligned(x, 16_ic);
-    out_stats = ct::assume_aligned(out_stats, 16_ic);
+    ASSUME_ALIGNED(x);
+    ASSUME_ALIGNED(out_stats);
     hidden_size = ct::assume_divisible(hidden_size, 16_ic);
 
     auto x_view = ct::partition_view{
@@ -57,11 +57,11 @@ extern "C" __tile_global__ void cross_entropy_loss_fwd_128(const __nv_bfloat16 *
                                                            float *__restrict__ out_loss, __nv_bfloat16 *__restrict__ out_logits_grad,
                                                            int batch_size, float recip_batch_size, int num_classes)
 {
-    logits = ct::assume_aligned(logits, 16_ic);
-    stats = ct::assume_aligned(stats, 16_ic);
-    labels = ct::assume_aligned(labels, 16_ic);
-    out_logits_grad = ct::assume_aligned(out_logits_grad, 16_ic);
-    out_loss = ct::assume_aligned(out_loss, 16_ic);
+    ASSUME_ALIGNED(logits);
+    ASSUME_ALIGNED(stats);
+    ASSUME_ALIGNED(labels);
+    ASSUME_ALIGNED(out_logits_grad);
+    ASSUME_ALIGNED(out_loss);
     num_classes = ct::assume_divisible(num_classes, 16_ic);
 
     auto logits_view = ct::partition_view{

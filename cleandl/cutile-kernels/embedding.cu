@@ -5,9 +5,9 @@ extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
     __nv_bfloat16 *__restrict__ out, int vocab_size, int num_tokens,
     int embed_dim)
 {
-    indices = ct::assume_aligned(indices, 16_ic);
-    embeddings = ct::assume_aligned(embeddings, 16_ic);
-    out = ct::assume_aligned(out, 16_ic);
+    ASSUME_ALIGNED(indices);
+    ASSUME_ALIGNED(embeddings);
+    ASSUME_ALIGNED(out);
     embed_dim = ct::assume_divisible(embed_dim, 128_ic);
 
     auto indices_view = ct::partition_view{
@@ -32,9 +32,9 @@ extern "C" __tile_global__ void embedding_scatter_add_bf16in_f32out_32x128(
     const int *__restrict__ indices, const __nv_bfloat16 *__restrict__ dL_dout,
     float *__restrict__ dL_din, int vocab_size, int num_tokens, int embed_dim)
 {
-    indices = ct::assume_aligned(indices, 16_ic);
-    dL_dout = ct::assume_aligned(dL_dout, 16_ic);
-    dL_din = ct::assume_aligned(dL_din, 16_ic);
+    ASSUME_ALIGNED(indices);
+    ASSUME_ALIGNED(dL_dout);
+    ASSUME_ALIGNED(dL_din);
     embed_dim = ct::assume_divisible(embed_dim, 128_ic);
 
     auto indices_view = ct::partition_view{
