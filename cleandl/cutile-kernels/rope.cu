@@ -42,7 +42,7 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
 
     int64_t sequence_start = cu_seqlen[sequence_idx];
     int64_t sequence_end = cu_seqlen[sequence_idx + 1];
-    int seqlen = static_cast<int>(sequence_end - sequence_start);
+    int seqlen = std::min(static_cast<int>(sequence_end - sequence_start), max_seqlen);
 
     int64_t elements_offset = (sequence_start + token_offset) * num_heads * HEAD_DIM;
 

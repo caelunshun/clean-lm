@@ -48,6 +48,10 @@ impl RopeExecutor {
         assert_eq!(out.element_type(), x.element_type());
         assert_eq!(cu_seqlen.shape().dims_slice(), &[seqlens.len() + 1]);
 
+        assert!(x.is_packed_row_major());
+        assert!(cu_seqlen.is_packed_row_major());
+        assert!(out.is_packed_row_major());
+
         let (block_size, kernel_name) = match self.config.head_dim {
             64 => (64, "rope_hd64_64x1x64"),
             hd => bail!("unimplemented head dimension {hd} for rope"),
@@ -55,6 +59,7 @@ impl RopeExecutor {
 
         let mut cta_work_items = Vec::<u64>::new();
         for (sequence_idx, &seqlen) in seqlens.iter().enumerate() {
+            assert!(seqlen as usize <= self.config.max_seqlen);
             for block_idx in 0..seqlen.div_ceil(block_size) {
                 cta_work_items.push(sequence_idx as u64 | ((block_idx as u64) << 32));
             }
@@ -115,6 +120,7 @@ impl ResourceKey for RopeConfig {
     type Resource = RopeExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        assert!(self.max_seqlen.is_multiple_of(64));
         let (fwd_cos_table, fwd_sin_table) =
             build_tables(self.base_freq, self.max_seqlen, self.head_dim, 1.0, cx)?;
         let (bwd_cos_table, bwd_sin_table) =
@@ -179,7 +185,7 @@ fn build_table_data(
             .zip(sin_table.as_chunks_mut::<16>().0)
             .enumerate()
         {
-            let index = f32x16::new(array::from_fn(|offset| (i + offset) as u32 as f32));
+            let index = f32x16::new(array::from_fn(|offset| (i * 16 + offset) as u32 as f32));
             let freq = f32x16::splat(base_freq).powf_simd(index * (-2.0 / head_dim as f32));
             let theta = freq * (pos as f32 * dir);
 
