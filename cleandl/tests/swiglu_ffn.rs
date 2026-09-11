@@ -1,14 +1,17 @@
 use cleandl::{
-    bulk_copy::BulkCopyEngine,
-    context::{Context, CudaStream},
+    context::Context,
     operators::swiglu_ffn::{SwiGluConfig, SwiGluFfnExecutor},
-    tensor::TensorView,
+    tensor::Tensor,
 };
 use faer::Mat;
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
+use skycuda::{
+    device_memory_pool::DeviceMemoryPoolOptions,
+    host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
+};
 use skytens_core::data_type::{ElementType, FloatType};
 
 const BATCH_SIZE: usize = 16384;
@@ -21,7 +24,16 @@ const ABS_TOLERANCE: f32 = 1e-3;
 
 #[test]
 fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
-    let cx = &Context::new(0)?;
+    let cx = &Context::new(
+        0,
+        DeviceMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+        HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+    )?;
+    let stream = cx.cuda().create_stream()?;
 
     let executor = SwiGluFfnExecutor::get(
         SwiGluConfig {
@@ -34,12 +46,14 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     )?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let data = TensorView::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, cx)?;
-    let up = TensorView::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
-    let weight = TensorView::new_zeroed([IN_FEATURES, INTERMEDIATE_FEATURES], bf16_type, cx)?;
-    let out_gate = TensorView::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
-    let out_activation =
-        TensorView::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
+    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, &stream, cx)?;
+    let mut up = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
+    let mut weight =
+        Tensor::new_zeroed([IN_FEATURES, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
+    let mut out_gate =
+        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
+    let mut out_activation =
+        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (IN_FEATURES as f32).sqrt().recip();
@@ -53,33 +67,26 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
         .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
         .collect();
 
-    let mut copy_engine = BulkCopyEngine::new(cx)?;
-    let mut batch = copy_engine.start_batch()?;
-    batch.copy_to_device(&data, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&data_host));
-    })?;
-    batch.copy_to_device(&weight, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&weight_host));
-    })?;
-    batch.copy_to_device(&up, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&up_host));
-    })?;
-    batch.commit()?;
+    cx.upload_to_device(&data_host, data.storage_mut(), &stream)?;
+    cx.upload_to_device(&weight_host, weight.storage_mut(), &stream)?;
+    cx.upload_to_device(&up_host, up.storage_mut(), &stream)?;
 
-    let stream = CudaStream::new(&cx)?;
-    copy_engine.wait_for_last_batch_on(&stream)?;
-
-    executor.forward_gate_proj(&data, &up, &weight, &out_gate, &out_activation, &stream)?;
-
-    cx.cuda().synchronize()?;
+    executor.forward_gate_proj(
+        &data.view(),
+        &up.view(),
+        &weight.view(),
+        &mut out_gate.view_mut(),
+        &mut out_activation.view_mut(),
+        &stream,
+    )?;
 
     // Read the results back to the host.
-    let mut batch = copy_engine.start_batch()?;
-    let gate_token = batch.copy_to_host(&out_gate, None)?;
-    let activation_token = batch.copy_to_host(&out_activation, None)?;
-    batch.commit()?;
-    let gate_host: Vec<bf16> = bytemuck::cast_slice(copy_engine.retrieve(gate_token)?).to_vec();
-    let activation_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(activation_token)?);
+    let gate_staging = cx.download_from_device(out_gate.storage(), &stream)?;
+    let activation_staging = cx.download_from_device(out_activation.storage(), &stream)?;
+    stream.block_on()?;
+
+    let gate_host: &[bf16] = bytemuck::cast_slice(gate_staging.view()?);
+    let activation_host: &[bf16] = bytemuck::cast_slice(activation_staging.view()?);
 
     let data_ref = Mat::from_fn(BATCH_SIZE, IN_FEATURES, |i, j| {
         data_host[i * IN_FEATURES + j].to_f32()
@@ -97,11 +104,13 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
 
             let expected_gate = gate_ref[(i, j)];
             let actual_gate = gate_host[idx].to_f32();
+            assert!(actual_gate.is_finite());
             max_gate_error = max_gate_error.max((actual_gate - expected_gate).abs());
             check(expected_gate, actual_gate, "gate", i, j)?;
 
             let expected_activation = swish(expected_gate) * up_host[idx].to_f32();
             let actual_activation = activation_host[idx].to_f32();
+            assert!(actual_activation.is_finite());
             max_activation_error =
                 max_activation_error.max((actual_activation - expected_activation).abs());
             check(expected_activation, actual_activation, "activation", i, j)?;

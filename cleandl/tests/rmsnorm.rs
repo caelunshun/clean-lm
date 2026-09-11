@@ -1,13 +1,26 @@
 use cleandl::{
-    context::{Context, CudaStream},
+    context::Context,
     operators::rmsnorm::{RmsNormConfig, RmsNormExecutor},
-    tensor::TensorView,
+    tensor::Tensor,
+};
+use skycuda::{
+    device_memory_pool::DeviceMemoryPoolOptions,
+    host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 use skytens_core::data_type::{ElementType, FloatType};
 
 #[test]
 fn rmsnorm() -> anyhow::Result<()> {
-    let cx = Context::new(0)?;
+    let cx = Context::new(
+        0,
+        DeviceMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+        HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+    )?;
+    let stream = cx.cuda().create_stream()?;
 
     let rmsnorm = RmsNormExecutor::get(
         RmsNormConfig {
@@ -17,24 +30,35 @@ fn rmsnorm() -> anyhow::Result<()> {
         &cx,
     )?;
 
-    let x = TensorView::new_zeroed(
+    let x = Tensor::new_zeroed(
         [1024 * 1024, 1536],
         ElementType::Float(FloatType::Bf16),
+        &stream,
         &cx,
     )?;
-    let scale = TensorView::new_zeroed([1, 1536], ElementType::Float(FloatType::Bf16), &cx)?;
-    let out_inv_variance =
-        TensorView::new_zeroed([1024 * 1024, 1], ElementType::Float(FloatType::F32), &cx)?;
-    let out_y = TensorView::new_zeroed(
+    let scale = Tensor::new_zeroed([1, 1536], ElementType::Float(FloatType::Bf16), &stream, &cx)?;
+    let mut out_inv_variance = Tensor::new_zeroed(
+        [1024 * 1024, 1],
+        ElementType::Float(FloatType::F32),
+        &stream,
+        &cx,
+    )?;
+    let mut out_y = Tensor::new_zeroed(
         [1024 * 1024, 1536],
         ElementType::Float(FloatType::Bf16),
+        &stream,
         &cx,
     )?;
 
-    let stream = CudaStream::new(&cx)?;
-    rmsnorm.forward(&x, &scale, &out_y, &out_inv_variance, &stream)?;
+    rmsnorm.forward(
+        &x.view(),
+        &scale.view(),
+        &mut out_y.view_mut(),
+        &mut out_inv_variance.view_mut(),
+        &stream,
+    )?;
 
-    cx.cuda().synchronize()?;
+    stream.block_on()?;
 
     Ok(())
 }

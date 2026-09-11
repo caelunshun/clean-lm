@@ -1,13 +1,12 @@
-use cleandl::{
-    bulk_copy::BulkCopyEngine,
-    context::{Context, CudaStream},
-    operators::loss::LossExecutor,
-    tensor::TensorView,
-};
+use cleandl::{context::Context, operators::loss::LossExecutor, tensor::Tensor};
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
+use skycuda::{
+    device_memory_pool::DeviceMemoryPoolOptions,
+    host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
+};
 use skytens_core::{
     data_type::{ElementType, FloatType, SIntType},
     shape::Shape,
@@ -23,28 +22,46 @@ const ABS_TOLERANCE: f32 = 1e-9;
 
 #[test]
 fn cross_entropy_loss() -> anyhow::Result<()> {
-    let cx = Context::new(0)?;
+    let cx = Context::new(
+        0,
+        DeviceMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+        HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+    )?;
+    let stream = cx.cuda().create_stream()?;
     let loss_op = LossExecutor::get(&cx)?;
 
-    let logits = TensorView::new_zeroed(
+    let mut logits = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE, NUM_CLASSES]),
         ElementType::Float(FloatType::Bf16),
+        &stream,
         &cx,
     )?;
-    let stats = TensorView::new_zeroed(
+    let mut stats = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::Float(FloatType::F32),
+        &stream,
         &cx,
     )?;
-    let labels = TensorView::new_zeroed(
+    let mut labels = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::SInt(SIntType::S32),
+        &stream,
         &cx,
     )?;
-    let loss = TensorView::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &cx)?;
-    let logits_grad = TensorView::new_zeroed(
+    let mut loss = Tensor::new_zeroed(
+        Shape::new([]),
+        ElementType::Float(FloatType::F32),
+        &stream,
+        &cx,
+    )?;
+    let mut logits_grad = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE, NUM_CLASSES]),
         ElementType::Float(FloatType::Bf16),
+        &stream,
         &cx,
     )?;
 
@@ -56,33 +73,27 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         .map(|_| rng.random_range(0..NUM_CLASSES as i32))
         .collect();
 
-    let mut copy_engine = BulkCopyEngine::new(&cx)?;
-    let mut batch = copy_engine.start_batch()?;
-    batch.copy_to_device(&logits, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&logits_host));
-    })?;
-    batch.copy_to_device(&labels, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&labels_host));
-    })?;
-    batch.commit()?;
+    cx.upload_to_device(&logits_host, logits.storage_mut(), &stream)?;
+    cx.upload_to_device(&labels_host, labels.storage_mut(), &stream)?;
 
-    let stream = CudaStream::new(&cx)?;
+    loss_op.online_softmax_stats(&logits.view(), &mut stats.view_mut(), &stream)?;
+    loss_op.cross_entropy_loss_forward(
+        &logits.view(),
+        &stats.view(),
+        &labels.view(),
+        &mut loss.view_mut(),
+        &mut logits_grad.view_mut(),
+        &stream,
+    )?;
 
-    copy_engine.wait_for_last_batch_on(&stream)?;
+    let stats_staging = cx.download_from_device(stats.storage(), &stream)?;
+    let loss_staging = cx.download_from_device(loss.storage(), &stream)?;
+    let grad_staging = cx.download_from_device(logits_grad.storage(), &stream)?;
+    stream.block_on()?;
 
-    loss_op.online_softmax_stats(&logits, &stats, &stream)?;
-    loss_op.cross_entropy_loss_forward(&logits, &stats, &labels, &loss, &logits_grad, &stream)?;
-    cx.cuda().synchronize()?;
-
-    let mut batch = copy_engine.start_batch()?;
-    let stats_token = batch.copy_to_host(&stats, None)?;
-    let loss_token = batch.copy_to_host(&loss, None)?;
-    let grad_token = batch.copy_to_host(&logits_grad, None)?;
-    batch.commit()?;
-
-    let stats_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(stats_token)?);
-    let loss_out: f32 = bytemuck::cast_slice::<_, f32>(copy_engine.retrieve(loss_token)?)[0];
-    let grad_out: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(grad_token)?);
+    let stats_out: &[f32] = bytemuck::cast_slice(stats_staging.view()?);
+    let loss_out: f32 = bytemuck::cast_slice::<_, f32>(loss_staging.view()?)[0];
+    let grad_out: &[bf16] = bytemuck::cast_slice(grad_staging.view()?);
 
     let expected = reference_loss(&logits_host, &labels_host);
 
@@ -112,6 +123,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     let mut max_grad_error = 0.0f32;
     for i in 0..BATCH_SIZE * NUM_CLASSES {
         let actual = grad_out[i].to_f32();
+        assert!(actual.is_finite());
         max_grad_error = max_grad_error.max((actual - expected.grad[i]).abs());
         check(
             "logits_grad",

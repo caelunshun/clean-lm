@@ -5,11 +5,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use bytemuck::Pod;
 use parking_lot::ReentrantMutex;
 use serde::Serialize;
 use skycuda::{
     device::Device,
+    device_memory::{DeviceVisibleMemory, DeviceVisibleMemoryMut},
     device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
+    host_pinned_memory::HostPinnedMemory,
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
     stream::Stream,
 };
@@ -41,6 +44,32 @@ impl Context {
             device_memory_pool,
             host_pinned_memory_pool,
         })))
+    }
+
+    pub fn upload_to_device<T: Pod>(
+        &self,
+        src: &[T],
+        dst: &mut impl DeviceVisibleMemoryMut,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        let mut staging = self
+            .host_pinned_memory_pool()
+            .alloc_zeroed(std::mem::size_of_val(src))?;
+        staging
+            .view_mut()?
+            .copy_from_slice(bytemuck::cast_slice(src));
+        stream.copy(&staging, dst)?;
+        Ok(())
+    }
+
+    pub fn download_from_device(
+        &self,
+        src: &impl DeviceVisibleMemory,
+        stream: &Stream,
+    ) -> anyhow::Result<HostPinnedMemory> {
+        let mut staging = self.host_pinned_memory_pool().alloc_zeroed(src.len())?;
+        stream.copy(src, &mut staging)?;
+        Ok(staging)
     }
 
     pub fn cuda(&self) -> &Device {

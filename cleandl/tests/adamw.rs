@@ -1,13 +1,12 @@
-use cleandl::{
-    bulk_copy::BulkCopyEngine,
-    context::{Context, CudaStream},
-    operators::adamw::AdamWExecutor,
-    tensor::TensorView,
-};
+use cleandl::{context::Context, operators::adamw::AdamWExecutor, tensor::Tensor};
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
+use skycuda::{
+    device_memory_pool::DeviceMemoryPoolOptions,
+    host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
+};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
@@ -30,18 +29,27 @@ const REPLICA_REL_TOLERANCE: f32 = 8e-3;
 
 #[test]
 fn adamw_weight_update() -> anyhow::Result<()> {
-    let cx = Context::new(0)?;
+    let cx = Context::new(
+        0,
+        DeviceMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+        HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+    )?;
+    let stream = cx.cuda().create_stream()?;
     let adamw = AdamWExecutor::get(&cx)?;
 
     let shape = Shape::new([N]);
-    let gradient = TensorView::new_zeroed(shape, ElementType::Float(FloatType::Bf16), &cx)?;
-    let weight = TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), &cx)?;
-    let weight_bf16_replica =
-        TensorView::new_zeroed(shape, ElementType::Float(FloatType::Bf16), &cx)?;
-    let adam_m = TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), &cx)?;
-    let adam_v = TensorView::new_zeroed(shape, ElementType::Float(FloatType::F32), &cx)?;
-    let gradient_l2_global_sum =
-        TensorView::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &cx)?;
+    let bf16_type = ElementType::Float(FloatType::Bf16);
+    let f32_type = ElementType::Float(FloatType::F32);
+    let mut gradient = Tensor::new_zeroed(shape, bf16_type, &stream, &cx)?;
+    let mut weight = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut weight_bf16_replica = Tensor::new_zeroed(shape, bf16_type, &stream, &cx)?;
+    let mut adam_m = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut adam_v = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut gradient_l2_global_sum = Tensor::new_zeroed(Shape::new([]), f32_type, &stream, &cx)?;
 
     let mut rng = StdRng::seed_from_u64(0xADA3);
     let mut sample = |count: usize, scale: f32| -> Vec<f32> {
@@ -55,36 +63,28 @@ fn adamw_weight_update() -> anyhow::Result<()> {
     let adam_m_host = sample(N, 0.01);
     let adam_v_host: Vec<f32> = sample(N, 0.01).into_iter().map(f32::abs).collect();
 
-    let mut copy_engine = BulkCopyEngine::new(&cx)?;
-    let mut batch = copy_engine.start_batch()?;
-    batch.copy_to_device(&gradient, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&gradient_host));
-    })?;
+    cx.upload_to_device(&gradient_host, gradient.storage_mut(), &stream)?;
     for (tensor, host) in [
-        (&weight, &weight_host),
-        (&adam_m, &adam_m_host),
-        (&adam_v, &adam_v_host),
+        (&mut weight, &weight_host),
+        (&mut adam_m, &adam_m_host),
+        (&mut adam_v, &adam_v_host),
     ] {
-        batch.copy_to_device(tensor, |dest| {
-            dest.copy_from_slice(bytemuck::cast_slice(host));
-        })?;
+        cx.upload_to_device(host, tensor.storage_mut(), &stream)?;
     }
-    batch.copy_to_device(&gradient_l2_global_sum, |dest| {
-        dest.copy_from_slice(bytemuck::cast_slice(&[0.0f32]));
-    })?;
-    batch.commit()?;
+    cx.upload_to_device(&[0.0f32], gradient_l2_global_sum.storage_mut(), &stream)?;
 
-    let stream = CudaStream::new(&cx)?;
-    copy_engine.wait_for_last_batch_on(&stream)?;
-
-    adamw.gradient_l2_norm_reduction(&gradient, &gradient_l2_global_sum, &stream)?;
+    adamw.gradient_l2_norm_reduction(
+        &gradient.view(),
+        &mut gradient_l2_global_sum.view_mut(),
+        &stream,
+    )?;
     adamw.adamw_weight_update(
-        &gradient,
-        &gradient_l2_global_sum,
-        &weight,
-        &weight_bf16_replica,
-        &adam_m,
-        &adam_v,
+        &gradient.view(),
+        &gradient_l2_global_sum.view(),
+        &mut weight.view_mut(),
+        &mut weight_bf16_replica.view_mut(),
+        &mut adam_m.view_mut(),
+        &mut adam_v.view_mut(),
         BETA1,
         BETA2,
         WEIGHT_DECAY,
@@ -93,19 +93,17 @@ fn adamw_weight_update() -> anyhow::Result<()> {
         TRAIN_STEP,
         &stream,
     )?;
-    cx.cuda().synchronize()?;
 
-    let mut batch = copy_engine.start_batch()?;
-    let weight_token = batch.copy_to_host(&weight, None)?;
-    let replica_token = batch.copy_to_host(&weight_bf16_replica, None)?;
-    let m_token = batch.copy_to_host(&adam_m, None)?;
-    let v_token = batch.copy_to_host(&adam_v, None)?;
-    batch.commit()?;
+    let weight_staging = cx.download_from_device(weight.storage(), &stream)?;
+    let replica_staging = cx.download_from_device(weight_bf16_replica.storage(), &stream)?;
+    let m_staging = cx.download_from_device(adam_m.storage(), &stream)?;
+    let v_staging = cx.download_from_device(adam_v.storage(), &stream)?;
+    stream.block_on()?;
 
-    let weight_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(weight_token)?);
-    let replica_out: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(replica_token)?);
-    let m_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(m_token)?);
-    let v_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(v_token)?);
+    let weight_out: &[f32] = bytemuck::cast_slice(weight_staging.view()?);
+    let replica_out: &[bf16] = bytemuck::cast_slice(replica_staging.view()?);
+    let m_out: &[f32] = bytemuck::cast_slice(m_staging.view()?);
+    let v_out: &[f32] = bytemuck::cast_slice(v_staging.view()?);
 
     let expected = reference_adamw(&gradient_host, &weight_host, &adam_m_host, &adam_v_host);
 
@@ -124,6 +122,7 @@ fn adamw_weight_update() -> anyhow::Result<()> {
 
     let mut max_error = 0.0f32;
     for i in 0..N {
+        assert!(weight_out[i].is_finite());
         max_error = max_error.max((weight_out[i] - expected.weight[i]).abs());
 
         check(

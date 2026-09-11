@@ -1,13 +1,16 @@
 use cleandl::{
-    bulk_copy::BulkCopyEngine,
-    context::{Context, CudaStream},
+    context::Context,
     operators::attention::{AttentionConfig, AttentionExecutor},
-    tensor::TensorView,
+    tensor::Tensor,
 };
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
+use skycuda::{
+    device_memory_pool::DeviceMemoryPoolOptions,
+    host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
+};
 use skytens_core::{
     data_type::{ElementType, FloatType, SIntType},
     shape::Shape,
@@ -24,7 +27,16 @@ const ABS_TOLERANCE: f32 = 4e-3;
 
 #[test]
 fn attention() -> anyhow::Result<()> {
-    let cx = Context::new(0)?;
+    let cx = Context::new(
+        0,
+        DeviceMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+        HostPinnedMemoryPoolOptions {
+            max_reserved_free_bytes: 1 << 30,
+        },
+    )?;
+    let stream = cx.cuda().create_stream()?;
 
     let num_sequences = SEQLENS.len();
     let max_seqlen = SEQLENS.iter().copied().max().unwrap();
@@ -43,50 +55,60 @@ fn attention() -> anyhow::Result<()> {
         &cx,
     )?;
 
-    let q = TensorView::new_zeroed(
+    let bf16_type = ElementType::Float(FloatType::Bf16);
+    let mut q = Tensor::new_zeroed(
         Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
-        ElementType::Float(FloatType::Bf16),
+        bf16_type,
+        &stream,
         &cx,
     )?;
-    let k = TensorView::new_zeroed(
+    let mut k = Tensor::new_zeroed(
         Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
-        ElementType::Float(FloatType::Bf16),
+        bf16_type,
+        &stream,
         &cx,
     )?;
-    let v = TensorView::new_zeroed(
+    let mut v = Tensor::new_zeroed(
         Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
-        ElementType::Float(FloatType::Bf16),
+        bf16_type,
+        &stream,
         &cx,
     )?;
-    let out = TensorView::new_zeroed(
+    let mut out = Tensor::new_zeroed(
         Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
-        ElementType::Float(FloatType::Bf16),
+        bf16_type,
+        &stream,
         &cx,
     )?;
-    let out_stats = TensorView::new_zeroed(
+    let mut out_stats = Tensor::new_zeroed(
         Shape::new([total_tokens, Q_HEADS, 1]),
         ElementType::Float(FloatType::F32),
+        &stream,
         &cx,
     )?;
 
-    let cu_seqlen_q = TensorView::new_zeroed(
+    let mut cu_seqlen_q = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
+        &stream,
         &cx,
     )?;
-    let cu_seqlen_kv = TensorView::new_zeroed(
+    let mut cu_seqlen_kv = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
+        &stream,
         &cx,
     )?;
-    let seqlen_q = TensorView::new_zeroed(
+    let mut seqlen_q = Tensor::new_zeroed(
         Shape::new([num_sequences]),
         ElementType::SInt(SIntType::S32),
+        &stream,
         &cx,
     )?;
-    let seqlen_kv = TensorView::new_zeroed(
+    let mut seqlen_kv = Tensor::new_zeroed(
         Shape::new([num_sequences]),
         ElementType::SInt(SIntType::S32),
+        &stream,
         &cx,
     )?;
 
@@ -108,48 +130,33 @@ fn attention() -> anyhow::Result<()> {
     }
     let seqlens_host: Vec<i32> = SEQLENS.iter().map(|&len| len as i32).collect();
 
-    let mut copy_engine = BulkCopyEngine::new(&cx)?;
-    let mut batch = copy_engine.start_batch()?;
-    for (tensor, host) in [(&q, &q_host), (&k, &k_host), (&v, &v_host)] {
-        batch.copy_to_device(tensor, |dest| {
-            dest.copy_from_slice(bytemuck::cast_slice(host));
-        })?;
+    for (tensor, host) in [(&mut q, &q_host), (&mut k, &k_host), (&mut v, &v_host)] {
+        cx.upload_to_device(host, tensor.storage_mut(), &stream)?;
     }
-    for tensor in [&cu_seqlen_q, &cu_seqlen_kv] {
-        batch.copy_to_device(tensor, |dest| {
-            dest.copy_from_slice(bytemuck::cast_slice(&cu_seqlens_host));
-        })?;
+    for tensor in [&mut cu_seqlen_q, &mut cu_seqlen_kv] {
+        cx.upload_to_device(&cu_seqlens_host, tensor.storage_mut(), &stream)?;
     }
-    for tensor in [&seqlen_q, &seqlen_kv] {
-        batch.copy_to_device(tensor, |dest| {
-            dest.copy_from_slice(bytemuck::cast_slice(&seqlens_host));
-        })?;
+    for tensor in [&mut seqlen_q, &mut seqlen_kv] {
+        cx.upload_to_device(&seqlens_host, tensor.storage_mut(), &stream)?;
     }
-    batch.commit()?;
-
-    let stream = CudaStream::new(&cx)?;
-    copy_engine.wait_for_last_batch_on(&stream)?;
 
     executor.forward_attn(
-        &q,
-        &k,
-        &v,
-        &cu_seqlen_q,
-        &cu_seqlen_kv,
-        &seqlen_q,
-        &seqlen_kv,
-        &out,
-        &out_stats,
+        &q.view(),
+        &k.view(),
+        &v.view(),
+        &cu_seqlen_q.view(),
+        &cu_seqlen_kv.view(),
+        &seqlen_q.view(),
+        &seqlen_kv.view(),
+        &mut out.view_mut(),
+        &mut out_stats.view_mut(),
         &stream,
     )?;
 
-    cx.cuda().synchronize()?;
-
     // Read the result back to the host.
-    let mut batch = copy_engine.start_batch()?;
-    let token = batch.copy_to_host(&out, None)?;
-    batch.commit()?;
-    let out_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(token)?);
+    let out_staging = cx.download_from_device(out.storage(), &stream)?;
+    stream.block_on()?;
+    let out_host: &[bf16] = bytemuck::cast_slice(out_staging.view()?);
 
     let expected = reference_attention(&q_host, &k_host, &v_host, &cu_seqlens_host);
 
@@ -159,6 +166,7 @@ fn attention() -> anyhow::Result<()> {
             for d in 0..HEAD_DIM {
                 let idx = (token_idx * Q_HEADS + head) * HEAD_DIM + d;
                 let expected = expected[idx];
+                assert!(out_host[idx].is_finite());
                 let actual = out_host[idx].to_f32();
 
                 max_error = max_error.max((actual - expected).abs());
