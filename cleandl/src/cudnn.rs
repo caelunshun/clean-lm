@@ -1,84 +1,75 @@
 use std::{collections::HashMap, mem, sync::Arc};
 
-use singe_cuda::memory::DeviceMemory;
-use singe_cudnn::{
-    backend::tensor::{Shape, TensorId, TensorSpec},
-    data_type::DataType,
-    frontend::{
-        graph::{Graph, GraphConfig},
-        operation::HeuristicMode,
-        plan::CompiledGraph,
-    },
-    scalar::ScalarValue,
-};
+use skycuda_cudnn::{CudnnHandle, GraphBuilder, Tensor, TensorId};
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
 use crate::{
-    context::{Context, CudaStream},
+    context::Context,
     tensor::{TensorView, VirtTensorView},
 };
 
 /// Helper for building cuDNN graph.
-#[derive(Debug)]
-pub struct CudnnGraphBuilder {
+pub struct CudnnGraphBuilder<'a> {
     cx: Context,
-    graph: Graph,
+    cudnn: &'a CudnnHandle,
+    graph: GraphBuilder<'a>,
 }
 
-impl CudnnGraphBuilder {
-    pub fn new(cx: &Context) -> Self {
-        Self {
+impl<'a> CudnnGraphBuilder<'a> {
+    pub fn new(cx: &'a Context) -> anyhow::Result<Self> {
+        let cudnn = cx.cudnn()?;
+        Ok(Self {
             cx: cx.clone(),
-            graph: Graph::with_config(GraphConfig {
-                override_shape_enabled: false,
-                ..Default::default()
-            }),
-        }
+            cudnn,
+            graph: GraphBuilder::new(cudnn)?,
+        })
     }
 
-    pub fn bind_tensor(&mut self, tensor_view: &VirtTensorView) -> TensorId {
-        self.graph.tensor(TensorSpec {
-            data_type: match tensor_view.element_type() {
-                ElementType::Float(float_type) => match float_type {
-                    FloatType::F64 => DataType::F64,
-                    FloatType::F32 => DataType::F32,
-                    FloatType::Bf16 => DataType::BF16,
-                    FloatType::F16 => DataType::F16,
-                    FloatType::F8E4M3 => DataType::F8E4M3,
-                    FloatType::F8E5M2 => DataType::F8E5M2,
-                    FloatType::UF8E8M0 => DataType::F8E8M0,
-                    FloatType::F4E2M1 => DataType::F4E2M1,
+    pub fn bind_tensor(&mut self, tensor_view: &VirtTensorView) -> Tensor<'_, 'a> {
+        self.graph
+            .tensor(TensorSpec {
+                data_type: match tensor_view.element_type() {
+                    ElementType::Float(float_type) => match float_type {
+                        FloatType::F64 => DataType::F64,
+                        FloatType::F32 => DataType::F32,
+                        FloatType::Bf16 => DataType::BF16,
+                        FloatType::F16 => DataType::F16,
+                        FloatType::F8E4M3 => DataType::F8E4M3,
+                        FloatType::F8E5M2 => DataType::F8E5M2,
+                        FloatType::UF8E8M0 => DataType::F8E8M0,
+                        FloatType::F4E2M1 => DataType::F4E2M1,
+                    },
+                    ElementType::SInt(sint_type) => match sint_type {
+                        SIntType::S64 => DataType::I64,
+                        SIntType::S32 => DataType::I32,
+                        SIntType::S16 => unimplemented!("s16"),
+                        SIntType::S8 => DataType::I8,
+                    },
+                    ElementType::UInt(uint_type) => match uint_type {
+                        UIntType::U64 => unimplemented!("u64"),
+                        UIntType::U32 => DataType::U32,
+                        UIntType::U16 => unimplemented!("u16"),
+                        UIntType::U8 => DataType::U8,
+                    },
+                    ElementType::Bool => DataType::Boolean,
                 },
-                ElementType::SInt(sint_type) => match sint_type {
-                    SIntType::S64 => DataType::I64,
-                    SIntType::S32 => DataType::I32,
-                    SIntType::S16 => unimplemented!("s16"),
-                    SIntType::S8 => DataType::I8,
-                },
-                ElementType::UInt(uint_type) => match uint_type {
-                    UIntType::U64 => unimplemented!("u64"),
-                    UIntType::U32 => DataType::U32,
-                    UIntType::U16 => unimplemented!("u16"),
-                    UIntType::U8 => DataType::U8,
-                },
-                ElementType::Bool => DataType::Boolean,
-            },
-            shape: Shape::contiguous(tensor_view.shape().dims().map(|x| x as i64))
-                .unwrap()
-                .with_strides(tensor_view.strides().dims().map(|x| x as i64))
-                .unwrap(),
-            id: None,
-            name: None,
-            byte_alignment: 16,
-            is_virtual: false,
-            is_by_value: false,
-            vector_count: None,
-            vectorized_dimension: None,
-            reordering: None,
-            ragged_offset: None,
-            ragged_tensor_multiplier: None,
-            scalar_value: None,
-        })
+                shape: Shape::contiguous(tensor_view.shape().dims().map(|x| x as i64))
+                    .unwrap()
+                    .with_strides(tensor_view.strides().dims().map(|x| x as i64))
+                    .unwrap(),
+                id: None,
+                name: None,
+                byte_alignment: 16,
+                is_virtual: false,
+                is_by_value: false,
+                vector_count: None,
+                vectorized_dimension: None,
+                reordering: None,
+                ragged_offset: None,
+                ragged_tensor_multiplier: None,
+                scalar_value: None,
+            })
+            .expect("failed to bind tensor")
     }
 
     pub fn graph_mut(&mut self) -> &mut Graph {

@@ -10,37 +10,55 @@ use std::{
 
 use parking_lot::ReentrantMutex;
 use serde::Serialize;
-use singe_cuda::{
-    context::ContextFlags,
+use skycuda::{
     device::Device,
-    stream::{Stream, StreamFlags},
+    device_memory_pool::{DeviceMemoryPool, DeviceMemoryPoolOptions},
+    host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
+    stream::Stream,
 };
+use skycuda_cudnn::CudnnHandle;
 use thread_local::ThreadLocal;
 
-pub type CudaContext = Arc<singe_cuda::context::Context>;
-pub type CudnnContext = singe_cudnn::context::Context;
-
-/// Context for a CUDA device.
 #[derive(Debug, Clone)]
 pub struct Context(Arc<Inner>);
 
 impl Context {
-    pub fn new(device_index: i32) -> anyhow::Result<Self> {
-        let device = Device::new(device_index);
-        let cuda = singe_cuda::context::Context::create_for_device_with_flags(
-            device,
-            ContextFlags::empty(),
-        )?;
+    pub fn new(
+        device_index: u32,
+        device_memory_options: DeviceMemoryPoolOptions,
+        host_pinned_memory_options: HostPinnedMemoryPoolOptions,
+    ) -> anyhow::Result<Self> {
+        let cuda = Device::from_index(device_index)?;
+        let auxiliary_stream = cuda.create_stream()?;
+
+        let device_memory_pool = cuda.create_device_memory_pool(device_memory_options)?;
+        let host_pinned_memory_pool =
+            cuda.create_host_pinned_memory_pool(host_pinned_memory_options)?;
 
         Ok(Self(Arc::new(Inner {
             cuda,
+            default_stream: auxiliary_stream,
             resource_cache: ReentrantMutex::new(RefCell::new(HashMap::new())),
             default_cudnn_contexts: ThreadLocal::new(),
+            device_memory_pool,
+            host_pinned_memory_pool,
         })))
     }
 
-    pub fn cuda(&self) -> &CudaContext {
+    pub fn cuda(&self) -> &Device {
         &self.0.cuda
+    }
+
+    pub fn default_stream(&self) -> &Stream {
+        &self.0.default_stream
+    }
+
+    pub fn device_memory_pool(&self) -> &DeviceMemoryPool {
+        &self.0.device_memory_pool
+    }
+
+    pub fn host_pinned_memory_pool(&self) -> &HostPinnedMemoryPool {
+        &self.0.host_pinned_memory_pool
     }
 
     pub fn get_or_create_resource<K: ResourceKey>(
@@ -65,10 +83,10 @@ impl Context {
         Ok(resource)
     }
 
-    pub fn cudnn(&self) -> anyhow::Result<&CudnnContext> {
+    pub fn cudnn(&self) -> anyhow::Result<&CudnnHandle> {
         self.0
             .default_cudnn_contexts
-            .get_or_try(|| CudnnContext::create(self.cuda()))
+            .get_or_try(|| CudnnHandle::new(&self.0.default_stream))
             .map_err(From::from)
     }
 }
@@ -78,8 +96,11 @@ type ResourceKeyEncoded = (TypeId, Vec<u8>);
 
 #[derive(Debug)]
 struct Inner {
-    cuda: CudaContext,
-    default_cudnn_contexts: ThreadLocal<CudnnContext>,
+    cuda: Device,
+    device_memory_pool: DeviceMemoryPool,
+    host_pinned_memory_pool: HostPinnedMemoryPool,
+    default_stream: Stream,
+    default_cudnn_contexts: ThreadLocal<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
 }
 
@@ -87,51 +108,6 @@ pub trait ResourceKey: Serialize + 'static {
     type Resource: Send + Sync + 'static;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource>;
-}
-
-#[derive(Debug, Clone)]
-pub struct CudaStream {
-    id: u64,
-    stream: Stream,
-    cuda: CudaContext,
-    cudnn_cx: Arc<ThreadLocal<CudnnContext>>,
-}
-
-impl CudaStream {
-    pub fn new(cx: &Context) -> anyhow::Result<Self> {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Ok(Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            stream: cx
-                .cuda()
-                .create_stream_with_flags(StreamFlags::NON_BLOCKING)?,
-            cuda: cx.cuda().clone(),
-            cudnn_cx: Arc::new(ThreadLocal::new()),
-        })
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn cuda(&self) -> &CudaContext {
-        &self.cuda
-    }
-
-    pub fn get(&self) -> &Stream {
-        &self.stream
-    }
-
-    pub fn cudnn_cx(&self) -> anyhow::Result<&CudnnContext> {
-        self.cudnn_cx
-            .get_or_try(|| {
-                CudnnContext::create(&self.cuda).and_then(|cx| {
-                    cx.set_stream(Some(&self.stream))?;
-                    Ok(cx)
-                })
-            })
-            .map_err(From::from)
-    }
 }
 
 #[derive(Debug)]
@@ -148,7 +124,7 @@ impl<T> PerStreamResource<T> {
 
     pub fn get_or_create(
         &self,
-        stream: &CudaStream,
+        stream: &Stream,
         create: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<Arc<T>> {
         let mut map = self.by_stream.lock().unwrap();

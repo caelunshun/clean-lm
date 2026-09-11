@@ -4,7 +4,6 @@
 //! language perspective. Thus many operations which might
 //! require `unsafe` if executing on the CPU are not `unsafe`.
 
-pub mod bulk_copy;
 pub mod cudnn;
 pub mod tensor;
 // pub mod module;

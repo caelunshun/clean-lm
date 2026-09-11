@@ -1,6 +1,6 @@
 use anyhow::bail;
 use serde::Serialize;
-use singe_cuda::module::{Module, ModuleImage};
+use skycuda::module::Module;
 
 use crate::context::{Context, ResourceKey};
 
@@ -28,10 +28,10 @@ impl ResourceKey for Cubins<'static> {
     type Resource = Module;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        cx.cuda().bind()?;
-
-        let device_properties = cx.cuda().device().properties()?;
-        let cubin = match (device_properties.major, device_properties.minor) {
+        let cubin = match (
+            cx.cuda().compute_capability_major(),
+            cx.cuda().compute_capability_minor(),
+        ) {
             (8, 9) => self.sm89,
             (9, 0) => self.sm90a,
             (10, _) => self.sm100f,
@@ -39,7 +39,7 @@ impl ResourceKey for Cubins<'static> {
             (major, minor) => bail!("unsupported sm version {major}.{minor}"),
         };
 
-        let module = cx.cuda().load_module(&ModuleImage::new(cubin))?;
+        let module = unsafe { cx.cuda().load_module_cubin(cubin)? };
         Ok(module)
     }
 }

@@ -9,8 +9,8 @@ rand = "0.10"
 rand_distr = "0.6"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-singe-cuda = "0.1.0-alpha.9"
-singe-cudnn = "0.1.0-alpha.7"
+skycuda = { path = "../../skycuda" }
+skycuda-cudnn = { path = "../../skycuda/skycuda-cudnn" }
 skytens-core = { path = "../../skykern/crates/skytens-core" }
 rayon = "1"
 thread_local = "1"
