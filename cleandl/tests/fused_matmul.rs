@@ -75,13 +75,16 @@ fn fused_matmul() -> anyhow::Result<()> {
 
     let graph = graph.build()?;
 
-    graph.execute([(a_id, &a), (b_id, &b), (c_id, &c)], &CudaStream::new(&cx)?)?;
+    let stream = CudaStream::new(&cx)?;
+    copy_engine.wait_for_last_batch_on(&stream)?;
+
+    graph.execute([(a_id, &a), (b_id, &b), (c_id, &c)], &stream)?;
 
     cx.cuda().synchronize()?;
 
     // Read the result back to the host.
     let mut batch = copy_engine.start_batch()?;
-    let token = batch.copy_to_host(&c)?;
+    let token = batch.copy_to_host(&c, None)?;
     batch.commit()?;
     let c_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(token)?);
 

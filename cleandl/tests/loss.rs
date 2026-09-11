@@ -67,14 +67,17 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     batch.commit()?;
 
     let stream = CudaStream::new(&cx)?;
+
+    copy_engine.wait_for_last_batch_on(&stream)?;
+
     loss_op.online_softmax_stats(&logits, &stats, &stream)?;
     loss_op.cross_entropy_loss_forward(&logits, &stats, &labels, &loss, &logits_grad, &stream)?;
     cx.cuda().synchronize()?;
 
     let mut batch = copy_engine.start_batch()?;
-    let stats_token = batch.copy_to_host(&stats)?;
-    let loss_token = batch.copy_to_host(&loss)?;
-    let grad_token = batch.copy_to_host(&logits_grad)?;
+    let stats_token = batch.copy_to_host(&stats, None)?;
+    let loss_token = batch.copy_to_host(&loss, None)?;
+    let grad_token = batch.copy_to_host(&logits_grad, None)?;
     batch.commit()?;
 
     let stats_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(stats_token)?);

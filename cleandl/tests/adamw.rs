@@ -75,6 +75,8 @@ fn adamw_weight_update() -> anyhow::Result<()> {
     batch.commit()?;
 
     let stream = CudaStream::new(&cx)?;
+    copy_engine.wait_for_last_batch_on(&stream)?;
+
     adamw.gradient_l2_norm_reduction(&gradient, &gradient_l2_global_sum, &stream)?;
     adamw.adamw_weight_update(
         &gradient,
@@ -94,10 +96,10 @@ fn adamw_weight_update() -> anyhow::Result<()> {
     cx.cuda().synchronize()?;
 
     let mut batch = copy_engine.start_batch()?;
-    let weight_token = batch.copy_to_host(&weight)?;
-    let replica_token = batch.copy_to_host(&weight_bf16_replica)?;
-    let m_token = batch.copy_to_host(&adam_m)?;
-    let v_token = batch.copy_to_host(&adam_v)?;
+    let weight_token = batch.copy_to_host(&weight, None)?;
+    let replica_token = batch.copy_to_host(&weight_bf16_replica, None)?;
+    let m_token = batch.copy_to_host(&adam_m, None)?;
+    let v_token = batch.copy_to_host(&adam_v, None)?;
     batch.commit()?;
 
     let weight_out: &[f32] = bytemuck::cast_slice(copy_engine.retrieve(weight_token)?);

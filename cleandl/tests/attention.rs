@@ -127,6 +127,9 @@ fn attention() -> anyhow::Result<()> {
     }
     batch.commit()?;
 
+    let stream = CudaStream::new(&cx)?;
+    copy_engine.wait_for_last_batch_on(&stream)?;
+
     executor.forward_attn(
         &q,
         &k,
@@ -137,14 +140,14 @@ fn attention() -> anyhow::Result<()> {
         &seqlen_kv,
         &out,
         &out_stats,
-        &CudaStream::new(&cx)?,
+        &stream,
     )?;
 
     cx.cuda().synchronize()?;
 
     // Read the result back to the host.
     let mut batch = copy_engine.start_batch()?;
-    let token = batch.copy_to_host(&out)?;
+    let token = batch.copy_to_host(&out, None)?;
     batch.commit()?;
     let out_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(token)?);
 

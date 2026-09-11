@@ -66,21 +66,17 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     })?;
     batch.commit()?;
 
-    executor.forward_gate_proj(
-        &data,
-        &up,
-        &weight,
-        &out_gate,
-        &out_activation,
-        &CudaStream::new(cx)?,
-    )?;
+    let stream = CudaStream::new(&cx)?;
+    copy_engine.wait_for_last_batch_on(&stream)?;
+
+    executor.forward_gate_proj(&data, &up, &weight, &out_gate, &out_activation, &stream)?;
 
     cx.cuda().synchronize()?;
 
     // Read the results back to the host.
     let mut batch = copy_engine.start_batch()?;
-    let gate_token = batch.copy_to_host(&out_gate)?;
-    let activation_token = batch.copy_to_host(&out_activation)?;
+    let gate_token = batch.copy_to_host(&out_gate, None)?;
+    let activation_token = batch.copy_to_host(&out_activation, None)?;
     batch.commit()?;
     let gate_host: Vec<bf16> = bytemuck::cast_slice(copy_engine.retrieve(gate_token)?).to_vec();
     let activation_host: &[bf16] = bytemuck::cast_slice(copy_engine.retrieve(activation_token)?);

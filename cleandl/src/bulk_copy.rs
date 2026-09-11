@@ -31,6 +31,9 @@ pub struct BulkCopyEngine {
     next_epoch: u64,
 }
 
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
+
 const INITIAL_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 const CHUNK_GROWTH_FACTOR: usize = 2;
 const NUM_STREAMS: usize = 2;
@@ -123,6 +126,17 @@ impl BulkCopyEngine {
         })
     }
 
+    pub fn wait_for_last_batch_on(&self, stream: &CudaStream) -> anyhow::Result<()> {
+        for event in &self.completion_events {
+            stream.get().wait_event(event)?;
+        }
+        Ok(())
+    }
+
+    pub fn block_on_last_batch(&self) -> anyhow::Result<()> {
+        self.wait()
+    }
+
     fn chunk_with_space_for(&mut self, num_bytes: usize) -> anyhow::Result<(usize, &mut Chunk)> {
         let chunk = self.memory_chunks.last_mut().unwrap();
         if chunk.capacity - chunk.used >= num_bytes {
@@ -193,7 +207,11 @@ impl<'a> BulkCopyBatch<'a> {
     /// Copies device tensor to host buffer. Returns token
     /// which can later be used to access the data after
     /// completion of the copy.
-    pub fn copy_to_host(&mut self, tensor: &TensorView) -> anyhow::Result<CopyToken> {
+    pub fn copy_to_host(
+        &mut self,
+        tensor: &TensorView,
+        ready_event: Option<&Event>,
+    ) -> anyhow::Result<CopyToken> {
         ensure!(
             tensor.is_contiguous(),
             "transfers for non-contiguous tensors are unimplemented"
@@ -201,6 +219,10 @@ impl<'a> BulkCopyBatch<'a> {
         let num_bytes = tensor.allocation_size();
 
         let stream = self.engine.streams[self.num_ops % NUM_STREAMS].clone();
+
+        if let Some(ready_event) = ready_event {
+            stream.get().wait_event(ready_event)?;
+        }
 
         let (chunk_idx, chunk) = self.engine.chunk_with_space_for(num_bytes)?;
 

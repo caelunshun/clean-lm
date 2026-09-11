@@ -1,83 +1,71 @@
-// WIP, broken
-
 #include "utils.cuh"
 
-struct WorkSpan
-{
-    // In units of sequence-position tiles (128 for rope_128)
-    int sequence_pos_tile_idx;
-    // In units of sequences. Note cu_seqlen and ragged tensor
-    // storage.
-    int begin_sequence_idx;
-    int end_sequence_idx;
-};
-
-// Rotary positional embedding in either forward or backward
-// pass (set dir = -1.0 for backward, 1.0 for forward).
-// Requires head dimension = second tile size in kernel name.
-// Does not rely on precomputed cos/sin cache. Instead computes
-// those values on-the-fly inside the SM. Each CTA is assigned
-// a work-span by the host. The work-span specifies
-// which sequence-position tile to process and for which range
-// of sequences. Using fewer work-spans per sequence-position tile
-// amortizes the sin/cos overhead but may cause load balancing issues.
-extern "C" __tile_global__ void rope_128x64(
+extern "C" __tile_global__ void rope_hd64_64x1x64(
     const __nv_bfloat16 *__restrict__ x,
     const int64_t *__restrict__ cu_seqlen,
+    const __half *__restrict__ cos_table,
+    const __half *__restrict__ sin_table,
+    const uint64_t *__restrict__ cta_work_items,
     __nv_bfloat16 *__restrict__ out,
-    float base_freq,
-    float dir,
+    int total_num_tokens,
     int num_heads,
-    const WorkSpan *__restrict__ work_spans)
+    int max_seqlen)
 {
-    constexpr int BLOCK = 128;
+    constexpr int BLOCK_SIZE = 64;
     constexpr int HEAD_DIM = 64;
     constexpr int HALF_HEAD_DIM = HEAD_DIM / 2;
 
+    max_seqlen = ct::assume_divisible(max_seqlen, ct::integral_constant<BLOCK_SIZE>{});
+
     x = ct::assume_aligned(x, 16_ic);
     cu_seqlen = ct::assume_aligned(cu_seqlen, 16_ic);
+    cos_table = ct::assume_aligned(cos_table, 16_ic);
+    sin_table = ct::assume_aligned(sin_table, 16_ic);
     out = ct::assume_aligned(out, 16_ic);
 
-    auto work_span = work_spans[ct::bid().x];
+    auto cos_table_view = ct::partition_view{
+        ct::tensor_span{cos_table, ct::extents{max_seqlen, HALF_HEAD_DIM}},
+        ct::shape<BLOCK_SIZE, HALF_HEAD_DIM>{}};
+    auto sin_table_view = ct::partition_view{
+        ct::tensor_span{sin_table, ct::extents{max_seqlen, HALF_HEAD_DIM}},
+        ct::shape<BLOCK_SIZE, HALF_HEAD_DIM>{}};
 
-    auto frequencies = ct::pow(
-        base_freq,
-        -2.0f * ct::element_cast<float>(ct::iota<ct::tile<int, ct::shape<1, HALF_HEAD_DIM>>>()) * (1.0f / static_cast<float>(HEAD_DIM)));
-    auto sequence_positions = ct::iota<ct::tile<int, ct::shape<BLOCK, 1>>>() + BLOCK * work_span.begin_sequence_idx;
-    auto angles = dir * ct::element_cast<float>(sequence_positions) * frequencies;
+    uint64_t encoded_work_item;
+    encoded_work_item = cta_work_items[ct::bid().x];
+    int sequence_idx = static_cast<int>(static_cast<uint32_t>(encoded_work_item));
+    int token_offset = BLOCK_SIZE * static_cast<int>(static_cast<uint32_t>(encoded_work_item >> 32));
 
-    auto cos_theta = ct::cos(angles);
-    auto sin_theta = ct::sin(angles);
+    auto cos_theta = ct::reshape(ct::element_cast<float>(cos_table_view.load(token_offset / BLOCK_SIZE, 0)),
+                                 ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>{});
+    auto sin_theta = ct::reshape(ct::element_cast<float>(sin_table_view.load(token_offset / BLOCK_SIZE, 0)),
+                                 ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>{});
 
-    for (int sequence_idx : ct::irange(work_span.begin_sequence_idx, work_span.end_sequence_idx))
+    int64_t sequence_start = cu_seqlen[sequence_idx];
+    int64_t sequence_end = cu_seqlen[sequence_idx + 1];
+    int seqlen = static_cast<int>(sequence_end - sequence_start);
+
+    int64_t elements_offset = (sequence_start + token_offset) * num_heads * HEAD_DIM;
+
+    auto x_view = ct::partition_view{
+        ct::tensor_span{x + elements_offset,
+                        ct::extents{seqlen - token_offset, num_heads, HEAD_DIM}},
+        ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>{}};
+    auto out_view = ct::partition_view{
+        ct::tensor_span{out + elements_offset,
+                        ct::extents{seqlen - token_offset, num_heads, HEAD_DIM}},
+        ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>{}};
+
+    for (int head_idx : ct::irange(0, num_heads))
     {
-        int64_t seq_start = cu_seqlen[sequence_idx];
-        int64_t seq_end = cu_seqlen[sequence_idx + 1];
+        ct::tile<__nv_bfloat16, ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>> first_half;
+        [[cutile::hint(0, allow_tma = false)]] first_half = x_view.load_masked(0, head_idx, 0);
+        ct::tile<__nv_bfloat16, ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>> second_half;
+        [[cutile::hint(0, allow_tma = false)]] second_half = x_view.load_masked(0, head_idx, 1);
 
-        auto x_view = ct::partition_view{
-            ct::tensor_span{
-                x + sequence_idx * num_heads * HEAD_DIM,
-                ct::extents{static_cast<int>(seq_end - seq_start), num_heads * HEAD_DIM}},
-            ct::shape<BLOCK, HEAD_DIM>{}};
-        auto out_view = ct::partition_view{
-            ct::tensor_span{
-                out + sequence_idx * num_heads * HEAD_DIM,
-                ct::extents{static_cast<int>(seq_end - seq_start), num_heads * HEAD_DIM}},
-            ct::shape<BLOCK, HEAD_DIM>{}};
+        auto rot_first_half = ct::element_cast<__nv_bfloat16>(first_half * cos_theta - second_half * sin_theta);
+        auto rot_second_half = ct::element_cast<__nv_bfloat16>(first_half * sin_theta + second_half * cos_theta);
 
-        for (int head_idx : ct::irange(0, num_heads))
-        {
-            ct::tile<__nv_bfloat16, ct::shape<BLOCK, HEAD_DIM>> x_tile;
-            [[cutile::hint(0, allow_tma = false)]] x_tile = x_view.load_masked(0, head_idx);
-
-            auto first_half = ct::element_cast<float>(ct::extract(x_tile, ct::shape<BLOCK, HALF_HEAD_DIM>{}, 0, 0));
-            auto second_half = ct::element_cast<float>(ct::extract(x_tile, ct::shape<BLOCK, HALF_HEAD_DIM>{}, 0, 1));
-
-            auto new_first_half = first_half * cos_theta - second_half * sin_theta;
-            auto new_second_half = first_half * sin_theta + second_half * cos_theta;
-
-            auto out_tile = ct::element_cast<__nv_bfloat16>(ct::cat(new_first_half, new_second_half, 1_ic));
-            out_view.store_masked(out_tile, 0, head_idx);
-        }
+        [[cutile::hint(0, allow_tma = false)]] out_view.store_masked(rot_first_half, 0, head_idx, 0);
+        [[cutile::hint(0, allow_tma = false)]] out_view.store_masked(rot_second_half, 0, head_idx, 1);
     }
 }
