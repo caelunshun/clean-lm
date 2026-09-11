@@ -1,7 +1,4 @@
-use crate::{
-    context::Context,
-    tensor::{Tensor, TensorView},
-};
+use crate::{context::Context, tensor::Tensor};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,

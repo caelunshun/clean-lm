@@ -1,15 +1,12 @@
 use std::sync::Arc;
 
-use singe_cuda::{
-    dim::Dim3,
-    module::{KernelParameters, LaunchConfig, Module},
-};
+use skycuda::{module::Module, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
-    context::{Context, CudaStream, ResourceKey},
+    context::{Context, ResourceKey},
     include_cubins,
-    tensor::TensorView,
+    tensor::{TensorView, TensorViewMut},
 };
 
 pub struct ConversionExecutor {
@@ -25,9 +22,9 @@ impl ConversionExecutor {
     /// must match.
     pub fn bf16_to_f32(
         &self,
-        bf16: &TensorView,
-        f32: &TensorView,
-        stream: &CudaStream,
+        bf16: &TensorView<'_>,
+        f32: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         assert_eq!(bf16.shape(), f32.shape());
         assert_eq!(bf16.strides(), f32.strides());
@@ -37,19 +34,18 @@ impl ConversionExecutor {
         let n = bf16.shape().element_count();
         assert!(n.is_multiple_of(16));
 
-        let kernel = self.module.function("bf16_to_f32_16384")?;
-        kernel.launch_on(
-            &LaunchConfig::new(
-                Dim3::new(n.div_ceil(16384) as u32, 1, 1),
-                Dim3::new(1, 1, 1), // block dim overriden by TileIR
-                0,                  // smem overriden by TileIR
-            )?,
-            KernelParameters::new()
-                .push(bf16.data_view())
-                .push(f32.data_view())
-                .push(i32::try_from(n)?),
-            stream.get(),
-        )?;
+        let kernel = self.module.get_function("bf16_to_f32_16384")?;
+        let bf16_memory = bf16.storage();
+        let mut f32_memory = f32.storage_mut();
+        let mut launch = stream.launch_builder(&kernel);
+        launch
+            .arg(bf16_memory)?
+            .arg(&mut f32_memory)?
+            .arg(i32::try_from(n)?)?;
+        // Block dim and smem are overriden by TileIR.
+        unsafe {
+            launch.launch(n.div_ceil(16384) as u32, 1, 1)?;
+        }
 
         Ok(())
     }
@@ -58,10 +54,9 @@ impl ConversionExecutor {
     /// must match.
     pub fn f32_to_bf16(
         &self,
-        f32: &TensorView,
-        bf16: &TensorView,
-
-        stream: &CudaStream,
+        f32: &TensorView<'_>,
+        bf16: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         assert_eq!(bf16.shape(), f32.shape());
         assert_eq!(bf16.strides(), f32.strides());
@@ -71,19 +66,18 @@ impl ConversionExecutor {
         let n = bf16.shape().element_count();
         assert!(n.is_multiple_of(16));
 
-        let kernel = self.module.function("f32_to_bf16_16384")?;
-        kernel.launch_on(
-            &LaunchConfig::new(
-                Dim3::new(n.div_ceil(16384) as u32, 1, 1),
-                Dim3::new(1, 1, 1), // block dim overriden by TileIR
-                0,                  // smem overriden by TileIR
-            )?,
-            KernelParameters::new()
-                .push(f32.data_view())
-                .push(bf16.data_view())
-                .push(i32::try_from(n)?),
-            stream.get(),
-        )?;
+        let kernel = self.module.get_function("f32_to_bf16_16384")?;
+        let f32_memory = f32.storage();
+        let mut bf16_memory = bf16.storage_mut();
+        let mut launch = stream.launch_builder(&kernel);
+        launch
+            .arg(f32_memory)?
+            .arg(&mut bf16_memory)?
+            .arg(i32::try_from(n)?)?;
+        // Block dim and smem are overriden by TileIR.
+        unsafe {
+            launch.launch(n.div_ceil(16384) as u32, 1, 1)?;
+        }
 
         Ok(())
     }

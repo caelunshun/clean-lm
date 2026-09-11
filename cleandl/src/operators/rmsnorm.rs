@@ -1,21 +1,16 @@
 use std::sync::Arc;
 
-use singe_cudnn::{
-    backend::tensor::TensorId,
-    frontend::{
-        graph::{RmsNormalizationBackwardOutputs, RmsNormalizationOutputs},
-        operation::{RmsNormalizationBackwardConfig, RmsNormalizationConfig},
-    },
-};
+use skycuda::stream::Stream;
+use skycuda_cudnn::{NormAttributes, NormBackwardAttributes, NormFwdPhase, TensorId};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
 };
 
 use crate::{
-    context::{Context, CudaStream, ResourceKey},
+    context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{TensorView, VirtTensorView},
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
 #[derive(Debug)]
@@ -41,18 +36,17 @@ impl RmsNormExecutor {
 
     pub fn forward(
         &self,
-        x: &TensorView,
-        scale: &TensorView,
-        out_y: &TensorView,
-        out_inv_variance: &TensorView,
-        stream: &CudaStream,
+        x: &TensorView<'_>,
+        scale: &TensorView<'_>,
+        out_y: &mut TensorViewMut<'_>,
+        out_inv_variance: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.forward_graph.execute(
-            [
-                (self.forward_x, x),
-                (self.forward_scale, scale),
-                (self.forward_y, out_y),
-                (self.forward_inv_variance, out_inv_variance),
+            &[(self.forward_x, x), (self.forward_scale, scale)],
+            &mut [
+                (self.forward_y, out_y.view_mut()),
+                (self.forward_inv_variance, out_inv_variance.view_mut()),
             ],
             stream,
         )?;
@@ -63,22 +57,24 @@ impl RmsNormExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn backward(
         &self,
-        x: &TensorView,
-        dy: &TensorView,
-        inv_variance: &TensorView,
-        scale: &TensorView,
-        out_dx: &TensorView,
-        out_dscale: &TensorView,
-        stream: &CudaStream,
+        x: &TensorView<'_>,
+        dy: &TensorView<'_>,
+        inv_variance: &TensorView<'_>,
+        scale: &TensorView<'_>,
+        out_dx: &mut TensorViewMut<'_>,
+        out_dscale: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.backward_graph.execute(
-            [
+            &[
                 (self.backward_x, x),
                 (self.backward_dy, dy),
                 (self.backward_inv_variance, inv_variance),
                 (self.backward_scale, scale),
-                (self.backward_dx, out_dx),
-                (self.backward_dscale, out_dscale),
+            ],
+            &mut [
+                (self.backward_dx, out_dx.view_mut()),
+                (self.backward_dscale, out_dscale.view_mut()),
             ],
             stream,
         )?;
@@ -97,54 +93,59 @@ impl ResourceKey for RmsNormConfig {
     type Resource = RmsNormExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        let mut forward_graph = CudnnGraphBuilder::new(cx);
-
-        let forward_x = forward_graph.bind_tensor(&VirtTensorView::new(
+        let x_layout = VirtTensorView::new(
             Shape::new([self.batch_size, self.token_dim]),
             ElementType::Float(FloatType::Bf16),
-        ));
-        let epsilon = forward_graph.scalar(1e-6);
-        let RmsNormalizationOutputs {
-            output: forward_y,
-            inv_variance: forward_inv_variance,
-            scale: forward_scale,
-        } = forward_graph
-            .graph_mut()
-            .rms_normalization_infer(forward_x, RmsNormalizationConfig::training(epsilon))?;
-        let forward_graph = forward_graph.build()?;
-
-        let mut backward_graph = CudnnGraphBuilder::new(cx);
-
-        let backward_x = backward_graph.bind_tensor(&VirtTensorView::new(
-            Shape::new([self.batch_size, self.token_dim]),
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let backward_dy = backward_graph.bind_tensor(&VirtTensorView::new(
-            Shape::new([self.batch_size, self.token_dim]),
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let backward_inv_variance = backward_graph.bind_tensor(&VirtTensorView::new(
-            Shape::new([self.batch_size, 1]),
-            ElementType::Float(FloatType::F32),
-        ));
-        let backward_scale = backward_graph.bind_tensor(&VirtTensorView::new(
+        );
+        let scale_layout = VirtTensorView::new(
             Shape::new([1, self.token_dim]),
             ElementType::Float(FloatType::Bf16),
-        ));
+        );
+        let inv_variance_layout = VirtTensorView::new(
+            Shape::new([self.batch_size, 1]),
+            ElementType::Float(FloatType::F32),
+        );
 
-        let RmsNormalizationBackwardOutputs {
-            dx: backward_dx,
-            dscale: backward_dscale,
-            bias_gradient: _,
-        } = backward_graph
-            .graph_mut()
-            .rms_normalization_backward_infer(
-                backward_x,
-                backward_inv_variance,
-                backward_dy,
-                backward_scale,
-                RmsNormalizationBackwardConfig::new(),
-            )?;
+        let forward_graph = CudnnGraphBuilder::new(cx)?;
+
+        let forward_x = forward_graph.bind_tensor(&x_layout);
+        let forward_scale = forward_graph.bind_tensor(&scale_layout);
+        let epsilon = forward_graph.scalar(1e-6);
+        let [forward_y, forward_inv_variance, _] = forward_graph.graph().rmsnorm(
+            forward_x,
+            forward_scale,
+            None,
+            Some(epsilon),
+            &NormAttributes::new().forward_phase(NormFwdPhase::Training),
+        )?;
+        let forward_y = forward_graph.mark_output(forward_y.unwrap(), &x_layout);
+        let forward_inv_variance =
+            forward_graph.mark_output(forward_inv_variance.unwrap(), &inv_variance_layout);
+        let (forward_x, forward_scale) = (forward_x.uid(), forward_scale.uid());
+        let forward_graph = forward_graph.build()?;
+
+        let backward_graph = CudnnGraphBuilder::new(cx)?;
+
+        let backward_x = backward_graph.bind_tensor(&x_layout);
+        let backward_dy = backward_graph.bind_tensor(&x_layout);
+        let backward_inv_variance = backward_graph.bind_tensor(&inv_variance_layout);
+        let backward_scale = backward_graph.bind_tensor(&scale_layout);
+
+        let [backward_dx, backward_dscale, _] = backward_graph.graph().rmsnorm_backward(
+            backward_dy,
+            backward_x,
+            backward_scale,
+            Some(backward_inv_variance),
+            &NormBackwardAttributes::new().has_dbias(false),
+        )?;
+        let backward_dx = backward_graph.mark_output(backward_dx.unwrap(), &x_layout);
+        let backward_dscale = backward_graph.mark_output(backward_dscale.unwrap(), &scale_layout);
+        let (backward_x, backward_dy, backward_inv_variance, backward_scale) = (
+            backward_x.uid(),
+            backward_dy.uid(),
+            backward_inv_variance.uid(),
+            backward_scale.uid(),
+        );
         let backward_graph = backward_graph.build()?;
 
         Ok(RmsNormExecutor {

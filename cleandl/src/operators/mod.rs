@@ -5,5 +5,5 @@ pub mod embedding;
 pub mod loss;
 pub mod matmul;
 pub mod rmsnorm;
-pub mod swiglu_ffn;
 pub mod rope;
+pub mod swiglu_ffn;

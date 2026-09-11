@@ -2,10 +2,7 @@ use std::{
     any::{Any, TypeId},
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use parking_lot::ReentrantMutex;
@@ -40,6 +37,7 @@ impl Context {
             default_stream: auxiliary_stream,
             resource_cache: ReentrantMutex::new(RefCell::new(HashMap::new())),
             default_cudnn_contexts: ThreadLocal::new(),
+            stream_cudnn_contexts: PerStreamResource::new(),
             device_memory_pool,
             host_pinned_memory_pool,
         })))
@@ -83,11 +81,19 @@ impl Context {
         Ok(resource)
     }
 
+    /// cuDNN handle bound to the default stream, for graph construction.
     pub fn cudnn(&self) -> anyhow::Result<&CudnnHandle> {
         self.0
             .default_cudnn_contexts
             .get_or_try(|| CudnnHandle::new(&self.0.default_stream))
             .map_err(From::from)
+    }
+
+    /// cuDNN handle bound to the given stream, for graph execution.
+    pub fn cudnn_on(&self, stream: &Stream) -> anyhow::Result<Arc<CudnnHandle>> {
+        self.0
+            .stream_cudnn_contexts
+            .get_or_create(stream, || CudnnHandle::new(stream).map_err(From::from))
     }
 }
 
@@ -101,6 +107,7 @@ struct Inner {
     host_pinned_memory_pool: HostPinnedMemoryPool,
     default_stream: Stream,
     default_cudnn_contexts: ThreadLocal<CudnnHandle>,
+    stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
 }
 

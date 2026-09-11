@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use singe_cudnn::{backend::tensor::TensorId, data_type::DataType};
+use skycuda::stream::Stream;
+use skycuda_cudnn::{DataType, MatmulAttributes, TensorId};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::{Shape, Strides},
 };
 
 use crate::{
-    context::{Context, CudaStream, ResourceKey},
+    context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{TensorView, VirtTensorView},
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
 /// Unfused matmul executor.
@@ -30,20 +31,23 @@ impl MatmulExecutor {
 
     pub fn matmul(
         &self,
-        a: &TensorView,
-        b: &TensorView,
-        out: &TensorView,
-        stream: &CudaStream,
+        a: &TensorView<'_>,
+        b: &TensorView<'_>,
+        out: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         assert_eq!(a.shape().dims_slice(), &[self.config.m, self.config.k]);
         assert_eq!(b.shape().dims_slice(), &[self.config.k, self.config.n]);
         assert_eq!(out.shape().dims_slice(), &[self.config.m, self.config.n]);
         self.graph.execute(
-            [
+            &[
                 (self.a, &a.reshaped([1, self.config.m, self.config.k])),
                 (self.b, &b.reshaped([1, self.config.k, self.config.n])),
-                (self.out, &out.reshaped([1, self.config.m, self.config.n])),
             ],
+            &mut [(
+                self.out,
+                out.reshaped_mut([1, self.config.m, self.config.n]),
+            )],
             stream,
         )?;
         Ok(())
@@ -70,7 +74,7 @@ impl ResourceKey for MatmulConfig {
     type Resource = MatmulExecutor;
 
     fn create(&self, cx: &crate::context::Context) -> anyhow::Result<Self::Resource> {
-        let mut graph = CudnnGraphBuilder::new(cx);
+        let graph = CudnnGraphBuilder::new(cx)?;
 
         let make_view = |dim0: usize, dim1: usize, format: MatrixFormat| match format {
             MatrixFormat::RowMajor => VirtTensorView::new(
@@ -86,9 +90,13 @@ impl ResourceKey for MatmulConfig {
 
         let a = graph.bind_tensor(&make_view(self.m, self.k, self.a_format));
         let b = graph.bind_tensor(&make_view(self.k, self.n, self.b_format));
-        let out = graph.bind_tensor(&make_view(self.m, self.n, self.out_format));
-
-        graph.graph_mut().matmul(a, b, out, DataType::F32)?;
+        let out = graph.graph().matmul(
+            a,
+            b,
+            &MatmulAttributes::new().compute_data_type(DataType::Float),
+        )?;
+        let out = graph.mark_output(out, &make_view(self.m, self.n, self.out_format));
+        let (a, b) = (a.uid(), b.uid());
 
         Ok(MatmulExecutor {
             config: self.clone(),

@@ -1,19 +1,15 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use singe_cudnn::{
-    backend::{pointwise::PointwiseMode, tensor::TensorId},
-    data_type::DataType,
-    frontend::operation::PointwiseOperation,
-    math::NanPropagation,
-};
+use skycuda::stream::Stream;
+use skycuda_cudnn::{DataType, MatmulAttributes, PointwiseAttributes, PointwiseMode, TensorId};
 use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
-    context::{Context, CudaStream, ResourceKey},
+    context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
-    tensor::{TensorView, VirtTensorView},
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
 /// SwiGLU FFN forward and backward pass executor.
@@ -64,10 +60,10 @@ impl SwiGluFfnExecutor {
 
     pub fn forward_up_proj(
         &self,
-        data: &TensorView,
-        weight: &TensorView,
-        out_up: &TensorView,
-        stream: &CudaStream,
+        data: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        out_up: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.fwd_up_proj.matmul(data, weight, out_up, stream)
     }
@@ -75,22 +71,24 @@ impl SwiGluFfnExecutor {
     /// Gate projection fused with swish + hadamard product.
     pub fn forward_gate_proj(
         &self,
-        data: &TensorView,
-        up: &TensorView,
-        weight: &TensorView,
-        out_gate: &TensorView,
-        out_activation: &TensorView,
-        stream: &CudaStream,
+        data: &TensorView<'_>,
+        up: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        out_gate: &mut TensorViewMut<'_>,
+        out_activation: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.fwd_fused_gate_graph.execute(
-            [
+            &[
                 (self.fwd_fused_gate_data, &data.unsqueezed()),
                 (self.fwd_fused_gate_up, &up.unsqueezed()),
                 (self.fwd_fused_gate_weight, &weight.unsqueezed()),
-                (self.fwd_fused_gate_out_gate, &out_gate.unsqueezed()),
+            ],
+            &mut [
+                (self.fwd_fused_gate_out_gate, out_gate.unsqueezed_mut()),
                 (
                     self.fwd_fused_gate_out_activation,
-                    &out_activation.unsqueezed(),
+                    out_activation.unsqueezed_mut(),
                 ),
             ],
             stream,
@@ -99,10 +97,10 @@ impl SwiGluFfnExecutor {
 
     pub fn forward_down_proj(
         &self,
-        activation: &TensorView,
-        weight: &TensorView,
-        out: &TensorView,
-        stream: &CudaStream,
+        activation: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        out: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.fwd_down_proj.matmul(activation, weight, out, stream)
     }
@@ -110,16 +108,16 @@ impl SwiGluFfnExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn backward_down_proj_dgrad(
         &self,
-        weight: &TensorView,
-        dy: &TensorView,
-        gate: &TensorView,
-        up: &TensorView,
-        out_dgate: &TensorView,
-        out_dup: &TensorView,
-        stream: &CudaStream,
+        weight: &TensorView<'_>,
+        dy: &TensorView<'_>,
+        gate: &TensorView<'_>,
+        up: &TensorView<'_>,
+        out_dgate: &mut TensorViewMut<'_>,
+        out_dup: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_down_proj_dgrad_graph.execute(
-            [
+            &[
                 (
                     self.bwd_down_proj_dgrad_weight,
                     &weight.transposed(0, 1).unsqueezed(),
@@ -127,8 +125,13 @@ impl SwiGluFfnExecutor {
                 (self.bwd_down_proj_dgrad_dy, &dy.unsqueezed()),
                 (self.bwd_down_proj_dgrad_gate, &gate.unsqueezed()),
                 (self.bwd_down_proj_dgrad_up, &up.unsqueezed()),
-                (self.bwd_down_proj_dgrad_out_dgate, &out_dgate.unsqueezed()),
-                (self.bwd_down_proj_dgrad_out_dup, &out_dup.unsqueezed()),
+            ],
+            &mut [
+                (
+                    self.bwd_down_proj_dgrad_out_dgate,
+                    out_dgate.unsqueezed_mut(),
+                ),
+                (self.bwd_down_proj_dgrad_out_dup, out_dup.unsqueezed_mut()),
             ],
             stream,
         )
@@ -136,10 +139,10 @@ impl SwiGluFfnExecutor {
 
     pub fn backward_down_proj_wgrad(
         &self,
-        activation: &TensorView,
-        dy: &TensorView,
-        out_dweight: &TensorView,
-        stream: &CudaStream,
+        activation: &TensorView<'_>,
+        dy: &TensorView<'_>,
+        out_dweight: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_down_proj_wgrad
             .matmul(&activation.transposed(0, 1), dy, out_dweight, stream)
@@ -147,10 +150,10 @@ impl SwiGluFfnExecutor {
 
     pub fn backward_up_gate_proj_wgrad(
         &self,
-        data: &TensorView,
-        dout: &TensorView,
-        out_dweight: &TensorView,
-        stream: &CudaStream,
+        data: &TensorView<'_>,
+        dout: &TensorView<'_>,
+        out_dweight: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_up_gate_proj_wgrad
             .matmul(&data.transposed(0, 1), dout, out_dweight, stream)
@@ -158,10 +161,10 @@ impl SwiGluFfnExecutor {
 
     pub fn backward_up_proj_dgrad(
         &self,
-        dout: &TensorView,
-        weight: &TensorView,
-        out_ddata: &TensorView,
-        stream: &CudaStream,
+        dout: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        out_ddata: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_up_proj_dgrad
             .matmul(dout, &weight.transposed(0, 1), out_ddata, stream)
@@ -169,22 +172,22 @@ impl SwiGluFfnExecutor {
 
     pub fn backward_gate_proj_dgrad(
         &self,
-        dout: &TensorView,
-        weight: &TensorView,
-        ddata_up: &TensorView,
-        out_dffn: &TensorView,
-        stream: &CudaStream,
+        dout: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        ddata_up: &TensorView<'_>,
+        out_dffn: &mut TensorViewMut<'_>,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_gate_proj_dgrad_graph.execute(
-            [
+            &[
                 (self.bwd_gate_proj_dgrad_dgate, &dout.unsqueezed()),
                 (self.bwd_gate_proj_dgrad_dup_in, &ddata_up.unsqueezed()),
                 (
                     self.bwd_gate_proj_dgrad_weight,
                     &weight.transposed(0, 1).unsqueezed(),
                 ),
-                (self.bwd_gate_proj_dgrad_out_dffn, &out_dffn.unsqueezed()),
             ],
+            &mut [(self.bwd_gate_proj_dgrad_out_dffn, out_dffn.unsqueezed_mut())],
             stream,
         )?;
         Ok(())
@@ -199,10 +202,28 @@ pub struct SwiGluConfig {
     pub out_features: usize,
 }
 
+fn matmul_attrs() -> MatmulAttributes {
+    MatmulAttributes::new().compute_data_type(DataType::Float)
+}
+
+fn pointwise_attrs(mode: PointwiseMode) -> PointwiseAttributes {
+    PointwiseAttributes::new(mode).compute_data_type(DataType::Float)
+}
+
 impl ResourceKey for SwiGluConfig {
     type Resource = SwiGluFfnExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        let bf16 = ElementType::Float(FloatType::Bf16);
+        let data_layout = VirtTensorView::new([1, self.batch_size, self.in_features], bf16);
+        let intermediate_layout =
+            VirtTensorView::new([1, self.batch_size, self.intermediate_features], bf16);
+        let out_layout = VirtTensorView::new([1, self.batch_size, self.out_features], bf16);
+        let up_gate_weight_layout =
+            VirtTensorView::new([1, self.in_features, self.intermediate_features], bf16);
+        let down_weight_layout =
+            VirtTensorView::new([1, self.intermediate_features, self.out_features], bf16);
+
         let fwd_up_proj = MatmulExecutor::get(
             MatmulConfig {
                 m: self.batch_size,
@@ -226,65 +247,32 @@ impl ResourceKey for SwiGluConfig {
             cx,
         )?;
 
-        let mut fwd_fused_gate_graph = CudnnGraphBuilder::new(cx);
-        let fwd_fused_gate_data = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.in_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let fwd_fused_gate_up = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let fwd_fused_gate_weight = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.in_features, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
+        let fwd_fused_gate_graph = CudnnGraphBuilder::new(cx)?;
+        let fwd_fused_gate_data = fwd_fused_gate_graph.bind_tensor(&data_layout);
+        let fwd_fused_gate_up = fwd_fused_gate_graph.bind_tensor(&intermediate_layout);
+        let fwd_fused_gate_weight = fwd_fused_gate_graph.bind_tensor(&up_gate_weight_layout);
 
-        let fwd_fused_gate_out_gate = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-
-        let tmp = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        fwd_fused_gate_graph.graph_mut().mark_as_virtual(tmp)?;
-
-        let fwd_fused_gate_out_activation = fwd_fused_gate_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-
-        fwd_fused_gate_graph.graph_mut().matmul(
+        let gate = fwd_fused_gate_graph.graph().matmul(
             fwd_fused_gate_data,
             fwd_fused_gate_weight,
-            fwd_fused_gate_out_gate,
-            DataType::F32,
+            &matmul_attrs(),
         )?;
-        fwd_fused_gate_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Unary {
-                mode: PointwiseMode::SwishFwd,
-                input: fwd_fused_gate_out_gate,
-                output: tmp,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                axis: None,
-            });
-        fwd_fused_gate_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Binary {
-                mode: PointwiseMode::Mul,
-                lhs: tmp,
-                rhs: fwd_fused_gate_up,
-                output: fwd_fused_gate_out_activation,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                alpha2: 1.0,
-            });
+        let fwd_fused_gate_out_gate = fwd_fused_gate_graph.mark_output(gate, &intermediate_layout);
+        let tmp = fwd_fused_gate_graph
+            .graph()
+            .pointwise_unary(gate, &pointwise_attrs(PointwiseMode::SwishFwd))?;
+        let activation = fwd_fused_gate_graph.graph().pointwise_binary(
+            tmp,
+            fwd_fused_gate_up,
+            &pointwise_attrs(PointwiseMode::Mul),
+        )?;
+        let fwd_fused_gate_out_activation =
+            fwd_fused_gate_graph.mark_output(activation, &intermediate_layout);
+        let (fwd_fused_gate_data, fwd_fused_gate_up, fwd_fused_gate_weight) = (
+            fwd_fused_gate_data.uid(),
+            fwd_fused_gate_up.uid(),
+            fwd_fused_gate_weight.uid(),
+        );
         let fwd_fused_gate_graph = fwd_fused_gate_graph.build()?;
 
         let bwd_down_proj_wgrad = MatmulExecutor::get(
@@ -322,150 +310,88 @@ impl ResourceKey for SwiGluConfig {
             cx,
         )?;
 
-        let mut bwd_gate_proj_dgrad_graph = CudnnGraphBuilder::new(cx);
-        let bwd_gate_proj_dgrad_dgate =
-            bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [1, self.batch_size, self.intermediate_features],
-                ElementType::Float(FloatType::Bf16),
-            ));
-        let bwd_gate_proj_dgrad_weight = bwd_gate_proj_dgrad_graph.bind_tensor(
-            &VirtTensorView::new(
-                [1, self.in_features, self.intermediate_features],
-                ElementType::Float(FloatType::Bf16),
-            )
-            .transposed(1, 2),
-        );
-        let bwd_gate_proj_dgrad_dup_in =
-            bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [1, self.batch_size, self.in_features],
-                ElementType::Float(FloatType::Bf16),
-            ));
-        let bwd_gate_proj_dgrad_out_dffn =
-            bwd_gate_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [1, self.batch_size, self.in_features],
-                ElementType::Float(FloatType::Bf16),
-            ));
+        let bwd_gate_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
+        let bwd_gate_proj_dgrad_dgate = bwd_gate_proj_dgrad_graph.bind_tensor(&intermediate_layout);
+        let bwd_gate_proj_dgrad_weight =
+            bwd_gate_proj_dgrad_graph.bind_tensor(&up_gate_weight_layout.transposed(1, 2));
+        let bwd_gate_proj_dgrad_dup_in = bwd_gate_proj_dgrad_graph.bind_tensor(&data_layout);
 
-        let tmp_dgate_in = bwd_gate_proj_dgrad_graph
-            .graph_mut()
-            .matmul_infer_with_config(
-                bwd_gate_proj_dgrad_dgate,
-                bwd_gate_proj_dgrad_weight,
-                singe_cudnn::frontend::operation::MatmulConfig::new(DataType::F32),
-            )?;
-        bwd_gate_proj_dgrad_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Binary {
-                mode: PointwiseMode::Add,
-                lhs: tmp_dgate_in,
-                rhs: bwd_gate_proj_dgrad_dup_in,
-                output: bwd_gate_proj_dgrad_out_dffn,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                alpha2: 1.0,
-            });
+        let tmp_dgate_in = bwd_gate_proj_dgrad_graph.graph().matmul(
+            bwd_gate_proj_dgrad_dgate,
+            bwd_gate_proj_dgrad_weight,
+            &matmul_attrs(),
+        )?;
+        let dffn = bwd_gate_proj_dgrad_graph.graph().pointwise_binary(
+            tmp_dgate_in,
+            bwd_gate_proj_dgrad_dup_in,
+            &pointwise_attrs(PointwiseMode::Add),
+        )?;
+        let bwd_gate_proj_dgrad_out_dffn =
+            bwd_gate_proj_dgrad_graph.mark_output(dffn, &data_layout);
+        let (bwd_gate_proj_dgrad_dgate, bwd_gate_proj_dgrad_weight, bwd_gate_proj_dgrad_dup_in) = (
+            bwd_gate_proj_dgrad_dgate.uid(),
+            bwd_gate_proj_dgrad_weight.uid(),
+            bwd_gate_proj_dgrad_dup_in.uid(),
+        );
         let bwd_gate_proj_dgrad_graph = bwd_gate_proj_dgrad_graph.build()?;
 
-        let mut bwd_down_proj_dgrad_graph = CudnnGraphBuilder::new(cx);
+        let bwd_down_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
 
-        let bwd_down_proj_dgrad_weight = bwd_down_proj_dgrad_graph.bind_tensor(
-            &VirtTensorView::new(
-                [1, self.intermediate_features, self.out_features],
-                ElementType::Float(FloatType::Bf16),
-            )
-            .transposed(1, 2),
-        );
-        let bwd_down_proj_dgrad_dy = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.out_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let bwd_down_proj_dgrad_gate = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let bwd_down_proj_dgrad_up = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        let bwd_down_proj_dgrad_out_dgate =
-            bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [1, self.batch_size, self.intermediate_features],
-                ElementType::Float(FloatType::Bf16),
-            ));
-        let bwd_down_proj_dgrad_out_dup =
-            bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-                [1, self.batch_size, self.intermediate_features],
-                ElementType::Float(FloatType::Bf16),
-            ));
+        let bwd_down_proj_dgrad_weight =
+            bwd_down_proj_dgrad_graph.bind_tensor(&down_weight_layout.transposed(1, 2));
+        let bwd_down_proj_dgrad_dy = bwd_down_proj_dgrad_graph.bind_tensor(&out_layout);
+        let bwd_down_proj_dgrad_gate = bwd_down_proj_dgrad_graph.bind_tensor(&intermediate_layout);
+        let bwd_down_proj_dgrad_up = bwd_down_proj_dgrad_graph.bind_tensor(&intermediate_layout);
 
-        let tmp_grad = bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .matmul_infer_with_config(
-                bwd_down_proj_dgrad_dy,
-                bwd_down_proj_dgrad_weight,
-                singe_cudnn::frontend::operation::MatmulConfig::new(DataType::F32),
-            )?;
-        bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .mark_as_virtual(tmp_grad)?;
+        let tmp_grad = bwd_down_proj_dgrad_graph.graph().matmul(
+            bwd_down_proj_dgrad_dy,
+            bwd_down_proj_dgrad_weight,
+            &matmul_attrs(),
+        )?;
 
         // Recompute swish forward
-        let tmp_gate_swish = bwd_down_proj_dgrad_graph.bind_tensor(&VirtTensorView::new(
-            [1, self.batch_size, self.intermediate_features],
-            ElementType::Float(FloatType::Bf16),
-        ));
-        bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Unary {
-                mode: PointwiseMode::SwishFwd,
-                input: bwd_down_proj_dgrad_gate,
-                output: tmp_gate_swish,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                axis: None,
-            });
+        let tmp_gate_swish = bwd_down_proj_dgrad_graph.graph().pointwise_unary(
+            bwd_down_proj_dgrad_gate,
+            &pointwise_attrs(PointwiseMode::SwishFwd),
+        )?;
 
         // Apply product rule
         // (1) dup
-        bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Binary {
-                mode: PointwiseMode::Mul,
-                lhs: tmp_gate_swish,
-                rhs: tmp_grad,
-                output: bwd_down_proj_dgrad_out_dup,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                alpha2: 1.0,
-            });
+        let dup = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
+            tmp_gate_swish,
+            tmp_grad,
+            &pointwise_attrs(PointwiseMode::Mul),
+        )?;
+        let bwd_down_proj_dgrad_out_dup =
+            bwd_down_proj_dgrad_graph.mark_output(dup, &intermediate_layout);
         // (2) dgate, requiring dswish operation
-        let tmp_dswish = bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .pointwise_binary_infer(
-                tmp_grad,
-                bwd_down_proj_dgrad_up,
-                PointwiseMode::Mul,
-                DataType::F32,
-            )?;
-        bwd_down_proj_dgrad_graph
-            .graph_mut()
-            .pointwise(PointwiseOperation::Binary {
-                mode: PointwiseMode::SwishBwd,
-                output: bwd_down_proj_dgrad_out_dgate,
-                compute_type: DataType::F32,
-                nan_propagation: NanPropagation::Propagate,
-                alpha1: 1.0,
-                lhs: tmp_dswish,
-                rhs: bwd_down_proj_dgrad_gate,
-                alpha2: 1.0,
-            });
+        let tmp_dswish = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
+            tmp_grad,
+            bwd_down_proj_dgrad_up,
+            &pointwise_attrs(PointwiseMode::Mul),
+        )?;
+        let dgate = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
+            tmp_dswish,
+            bwd_down_proj_dgrad_gate,
+            &pointwise_attrs(PointwiseMode::SwishBwd),
+        )?;
+        let bwd_down_proj_dgrad_out_dgate =
+            bwd_down_proj_dgrad_graph.mark_output(dgate, &intermediate_layout);
+        let (
+            bwd_down_proj_dgrad_weight,
+            bwd_down_proj_dgrad_dy,
+            bwd_down_proj_dgrad_gate,
+            bwd_down_proj_dgrad_up,
+        ) = (
+            bwd_down_proj_dgrad_weight.uid(),
+            bwd_down_proj_dgrad_dy.uid(),
+            bwd_down_proj_dgrad_gate.uid(),
+            bwd_down_proj_dgrad_up.uid(),
+        );
         let bwd_down_proj_dgrad_graph = bwd_down_proj_dgrad_graph.build()?;
 
         Ok(SwiGluFfnExecutor {
-            config: self.clone(),
+            config: *self,
             fwd_up_proj,
             fwd_down_proj,
             fwd_fused_gate_graph,

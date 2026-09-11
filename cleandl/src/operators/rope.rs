@@ -1,29 +1,27 @@
-use std::{array, cell::RefCell, sync::Arc};
+use std::{array, sync::Arc};
 
 use anyhow::bail;
 use half::{f16, slice::HalfFloatSliceExt};
 use serde::Serialize;
-use singe_cuda::module::Module;
+use skycuda::{module::Module, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType, SIntType};
-use thread_local::ThreadLocal;
 use wide::f32x16;
 
 use crate::{
-    bulk_copy::BulkCopyEngine,
-    context::{Context, CudaStream, PerStreamResource, ResourceKey},
+    context::{Context, ResourceKey},
     include_cubins,
-    tensor::TensorView,
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RopeExecutor {
     config: RopeConfig,
     module: Arc<Module>,
-    fwd_cos_table: TensorView,
-    fwd_sin_table: TensorView,
-    bwd_cos_table: TensorView,
-    bwd_sin_table: TensorView,
-    bulk_copy_engine: ThreadLocal<RefCell<BulkCopyEngine>>,
+    fwd_cos_table: Tensor,
+    fwd_sin_table: Tensor,
+    bwd_cos_table: Tensor,
+    bwd_sin_table: Tensor,
 }
 
 impl RopeExecutor {
@@ -31,14 +29,15 @@ impl RopeExecutor {
         cx.get_or_create_resource(config)
     }
 
+    #[allow(unused_variables)]
     pub fn execute(
         &self,
-        x: &TensorView,
-        cu_seqlen: &TensorView,
+        x: &TensorView<'_>,
+        cu_seqlen: &TensorView<'_>,
         seqlens: &[u32],
-        out: &TensorView,
+        out: &mut TensorViewMut<'_>,
         mode: RopeMode,
-        stream: &CudaStream,
+        stream: &Stream,
     ) -> anyhow::Result<()> {
         assert_eq!(cu_seqlen.element_type(), ElementType::SInt(SIntType::S64));
         assert_eq!(x.element_type(), ElementType::Float(FloatType::Bf16));
@@ -98,7 +97,6 @@ impl ResourceKey for RopeConfig {
             fwd_sin_table,
             bwd_cos_table,
             bwd_sin_table,
-            bulk_copy_engine: ThreadLocal::new(),
         })
     }
 }
@@ -109,31 +107,21 @@ fn build_tables(
     head_dim: usize,
     dir: f32,
     cx: &Context,
-) -> anyhow::Result<(TensorView, TensorView)> {
+) -> anyhow::Result<(Tensor, Tensor)> {
     let (cos_data, sin_data) = build_table_data(base_freq, max_seqlen, head_dim, dir);
-    let cos_tensor = TensorView::new_zeroed(
-        [max_seqlen, head_dim / 2],
-        ElementType::Float(FloatType::F16),
-        cx,
-    )?;
-    let sin_tensor = TensorView::new_zeroed(
-        [max_seqlen, head_dim / 2],
-        ElementType::Float(FloatType::F16),
-        cx,
-    )?;
-
-    let mut copier = BulkCopyEngine::new(cx)?;
-    let mut batch = copier.start_batch()?;
-    batch.copy_to_device(&cos_tensor, |dst| {
-        dst.copy_from_slice(bytemuck::cast_slice(&cos_data))
-    })?;
-    batch.copy_to_device(&sin_tensor, |dst| {
-        dst.copy_from_slice(bytemuck::cast_slice(&sin_data))
-    })?;
-    batch.commit()?;
-    copier.block_on_last_batch()?;
-
+    let cos_tensor = upload_table(&cos_data, [max_seqlen, head_dim / 2], cx)?;
+    let sin_tensor = upload_table(&sin_data, [max_seqlen, head_dim / 2], cx)?;
     Ok((cos_tensor, sin_tensor))
+}
+
+fn upload_table(data: &[f16], shape: [usize; 2], cx: &Context) -> anyhow::Result<Tensor> {
+    let stream = cx.default_stream();
+    let mut tensor = Tensor::new_zeroed(shape, ElementType::Float(FloatType::F16), stream, cx)?;
+    let bytes: &[u8] = bytemuck::cast_slice(data);
+    let mut staging = cx.host_pinned_memory_pool().alloc_zeroed(bytes.len())?;
+    staging.view_mut()?.copy_from_slice(bytes);
+    stream.copy(&staging, tensor.storage_mut())?;
+    Ok(tensor)
 }
 
 fn build_table_data(
@@ -153,8 +141,10 @@ fn build_table_data(
         .enumerate()
     {
         for (i, (cos_chunk_f16, sin_chunk_f16)) in cos_table
-            .chunks_exact_mut(16)
-            .zip(sin_table.chunks_exact_mut(16))
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .zip(sin_table.as_chunks_mut::<16>().0)
             .enumerate()
         {
             let index = f32x16::new(array::from_fn(|offset| (i + offset) as u32 as f32));

@@ -86,22 +86,17 @@ impl Tensor {
         TensorView {
             virt: self.virt.clone(),
             cx: self.cx.clone(),
-            storage: &self.storage,
-            offset: 0,
-            len: self.storage.len(),
+            storage: self.storage.slice(..),
         }
     }
 
     /// Returns a mutable view over the entirety of this tensor.
     #[must_use]
     pub fn view_mut(&mut self) -> TensorViewMut<'_> {
-        let len = self.storage.len();
         TensorViewMut {
             virt: self.virt.clone(),
             cx: self.cx.clone(),
-            storage: &mut self.storage,
-            offset: 0,
-            len,
+            storage: self.storage.slice_mut(..),
         }
     }
 
@@ -164,13 +159,6 @@ impl Tensor {
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorView<'_> {
         self.view().sliced(dim, bounds)
     }
-
-    #[must_use]
-    pub fn sliced_mut(&mut self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorViewMut<'_> {
-        let mut view = self.view_mut();
-        view.slice_in_place(dim, bounds);
-        view
-    }
 }
 
 /// Immutable view into a (sub-slice of a) tensor.
@@ -178,11 +166,7 @@ impl Tensor {
 pub struct TensorView<'a> {
     virt: VirtTensorView,
     cx: Context,
-    storage: &'a DeviceMemory,
-    /// Byte offset of this view within `storage`.
-    offset: usize,
-    /// Length of this view, in bytes.
-    len: usize,
+    storage: MemorySlice<&'a DeviceMemory>,
 }
 
 impl<'a> Clone for TensorView<'a> {
@@ -191,8 +175,6 @@ impl<'a> Clone for TensorView<'a> {
             virt: self.virt.clone(),
             cx: self.cx.clone(),
             storage: self.storage,
-            offset: self.offset,
-            len: self.len,
         }
     }
 }
@@ -202,8 +184,8 @@ impl<'a> TensorView<'a> {
         &self.cx
     }
 
-    pub fn storage(&self) -> MemorySlice<&'a DeviceMemory> {
-        self.storage.slice(self.offset..self.offset + self.len)
+    pub fn storage(&self) -> &MemorySlice<&'a DeviceMemory> {
+        &self.storage
     }
 
     pub fn element_type(&self) -> ElementType {
@@ -266,8 +248,9 @@ impl<'a> TensorView<'a> {
         let (virt, offset_bytes) = self.virt.sliced(dim, bounds);
         Self {
             virt,
-            offset: self.offset + offset_bytes,
-            len: self.len - offset_bytes,
+            storage: self.storage.inner().slice(
+                self.storage.offset() + offset_bytes..self.storage.offset() + self.storage.len(),
+            ),
             ..self.clone()
         }
     }
@@ -278,11 +261,7 @@ impl<'a> TensorView<'a> {
 pub struct TensorViewMut<'a> {
     virt: VirtTensorView,
     cx: Context,
-    storage: &'a mut DeviceMemory,
-    /// Byte offset of this view within `storage`.
-    offset: usize,
-    /// Length of this view, in bytes.
-    len: usize,
+    storage: MemorySliceMut<&'a mut DeviceMemory>,
 }
 
 impl<'a> TensorViewMut<'a> {
@@ -290,12 +269,12 @@ impl<'a> TensorViewMut<'a> {
         &self.cx
     }
 
-    pub fn storage(&self) -> MemorySlice<&DeviceMemory> {
-        self.storage.slice(self.offset..self.offset + self.len)
+    pub fn storage(&self) -> &MemorySliceMut<&'a mut DeviceMemory> {
+        &self.storage
     }
 
-    pub fn storage_mut(&mut self) -> MemorySliceMut<&mut DeviceMemory> {
-        self.storage.slice_mut(self.offset..self.offset + self.len)
+    pub fn storage_mut(&mut self) -> &mut MemorySliceMut<&'a mut DeviceMemory> {
+        &mut self.storage
     }
 
     pub fn element_type(&self) -> ElementType {
@@ -328,21 +307,22 @@ impl<'a> TensorViewMut<'a> {
         TensorView {
             virt: self.virt.clone(),
             cx: self.cx.clone(),
-            storage: &*self.storage,
-            offset: self.offset,
-            len: self.len,
+            storage: self
+                .storage
+                .inner()
+                .slice(self.storage.offset()..self.storage.offset() + self.storage.len()),
         }
     }
 
     /// Reborrows this view mutably.
     #[must_use]
     pub fn view_mut(&mut self) -> TensorViewMut<'_> {
+        let offset = self.storage.offset();
+        let len = self.storage.len();
         TensorViewMut {
             virt: self.virt.clone(),
             cx: self.cx.clone(),
-            storage: &mut *self.storage,
-            offset: self.offset,
-            len: self.len,
+            storage: self.storage.inner_mut().slice_mut(offset..offset + len),
         }
     }
 
@@ -404,20 +384,6 @@ impl<'a> TensorViewMut<'a> {
     #[must_use]
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorView<'_> {
         self.view().sliced(dim, bounds)
-    }
-
-    #[must_use]
-    pub fn sliced_mut(&mut self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorViewMut<'_> {
-        let mut view = self.view_mut();
-        view.slice_in_place(dim, bounds);
-        view
-    }
-
-    fn slice_in_place(&mut self, dim: usize, bounds: impl RangeBounds<usize>) {
-        let (virt, offset_bytes) = self.virt.sliced(dim, bounds);
-        self.virt = virt;
-        self.offset += offset_bytes;
-        self.len -= offset_bytes;
     }
 }
 

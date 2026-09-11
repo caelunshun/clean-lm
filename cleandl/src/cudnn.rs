@@ -1,167 +1,196 @@
-use std::{collections::HashMap, mem, sync::Arc};
+use std::{collections::HashMap, fmt};
 
-use skycuda_cudnn::{CudnnHandle, GraphBuilder, Tensor, TensorId};
+use skycuda::{
+    device_memory::DeviceMemory,
+    host_pinned_memory::HostPinnedMemory,
+    memory_slice::{MemorySlice, MemorySliceMut},
+    stream::Stream,
+};
+use skycuda_cudnn::{
+    BuiltGraph, DataType, GraphBuilder, HeurMode, Tensor, TensorAttributes, TensorId,
+};
 use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
 
 use crate::{
     context::Context,
-    tensor::{TensorView, VirtTensorView},
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
-/// Helper for building cuDNN graph.
+pub fn to_cudnn_data_type(element_type: ElementType) -> DataType {
+    match element_type {
+        ElementType::Float(float_type) => match float_type {
+            FloatType::F64 => DataType::Double,
+            FloatType::F32 => DataType::Float,
+            FloatType::Bf16 => DataType::Bfloat16,
+            FloatType::F16 => DataType::Half,
+            FloatType::F8E4M3 => DataType::Fp8E4m3,
+            FloatType::F8E5M2 => DataType::Fp8E5m2,
+            FloatType::UF8E8M0 => DataType::Fp8E8m0,
+            FloatType::F4E2M1 => DataType::Fp4E2m1,
+        },
+        ElementType::SInt(sint_type) => match sint_type {
+            SIntType::S64 => DataType::Int64,
+            SIntType::S32 => DataType::Int32,
+            SIntType::S16 => unimplemented!("s16"),
+            SIntType::S8 => DataType::Int8,
+        },
+        ElementType::UInt(uint_type) => match uint_type {
+            UIntType::U8 => DataType::Uint8,
+            other => unimplemented!("{other:?}"),
+        },
+        ElementType::Bool => DataType::Boolean,
+    }
+}
+
+pub fn from_cudnn_data_type(data_type: DataType) -> ElementType {
+    match data_type {
+        DataType::Double => ElementType::Float(FloatType::F64),
+        DataType::Float => ElementType::Float(FloatType::F32),
+        DataType::Bfloat16 => ElementType::Float(FloatType::Bf16),
+        DataType::Half => ElementType::Float(FloatType::F16),
+        DataType::Fp8E4m3 => ElementType::Float(FloatType::F8E4M3),
+        DataType::Fp8E5m2 => ElementType::Float(FloatType::F8E5M2),
+        DataType::Fp8E8m0 => ElementType::Float(FloatType::UF8E8M0),
+        DataType::Fp4E2m1 => ElementType::Float(FloatType::F4E2M1),
+        DataType::Int64 => ElementType::SInt(SIntType::S64),
+        DataType::Int32 => ElementType::SInt(SIntType::S32),
+        DataType::Int8 => ElementType::SInt(SIntType::S8),
+        DataType::Uint8 => ElementType::UInt(UIntType::U8),
+        DataType::Boolean => ElementType::Bool,
+        other => todo!("{other:?}"),
+    }
+}
+
+/// Helper for building cuDNN graphs.
 pub struct CudnnGraphBuilder<'a> {
     cx: Context,
-    cudnn: &'a CudnnHandle,
     graph: GraphBuilder<'a>,
+    next_id: std::cell::Cell<i64>,
+    scalars: std::cell::RefCell<Vec<(TensorId, [u8; 4])>>,
 }
 
 impl<'a> CudnnGraphBuilder<'a> {
     pub fn new(cx: &'a Context) -> anyhow::Result<Self> {
-        let cudnn = cx.cudnn()?;
+        let graph = GraphBuilder::new(cx.cudnn()?)?;
+        graph
+            .set_compute_data_type(DataType::Float)
+            .set_intermediate_data_type(DataType::Float);
         Ok(Self {
             cx: cx.clone(),
-            cudnn,
-            graph: GraphBuilder::new(cudnn)?,
+            graph,
+            next_id: std::cell::Cell::new(1),
+            scalars: Default::default(),
         })
     }
 
-    pub fn bind_tensor(&mut self, tensor_view: &VirtTensorView) -> Tensor<'_, 'a> {
+    pub fn graph(&self) -> &GraphBuilder<'a> {
+        &self.graph
+    }
+
+    fn alloc_id(&self) -> TensorId {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        TensorId(id)
+    }
+
+    /// Adds a non-virtual input tensor with the given layout.
+    pub fn bind_tensor(&self, tensor_view: &VirtTensorView) -> Tensor<'_, 'a> {
+        let dims = tensor_view.shape().dims().collect::<Vec<_>>();
+        let strides = tensor_view.strides().dims().collect::<Vec<_>>();
         self.graph
-            .tensor(TensorSpec {
-                data_type: match tensor_view.element_type() {
-                    ElementType::Float(float_type) => match float_type {
-                        FloatType::F64 => DataType::F64,
-                        FloatType::F32 => DataType::F32,
-                        FloatType::Bf16 => DataType::BF16,
-                        FloatType::F16 => DataType::F16,
-                        FloatType::F8E4M3 => DataType::F8E4M3,
-                        FloatType::F8E5M2 => DataType::F8E5M2,
-                        FloatType::UF8E8M0 => DataType::F8E8M0,
-                        FloatType::F4E2M1 => DataType::F4E2M1,
-                    },
-                    ElementType::SInt(sint_type) => match sint_type {
-                        SIntType::S64 => DataType::I64,
-                        SIntType::S32 => DataType::I32,
-                        SIntType::S16 => unimplemented!("s16"),
-                        SIntType::S8 => DataType::I8,
-                    },
-                    ElementType::UInt(uint_type) => match uint_type {
-                        UIntType::U64 => unimplemented!("u64"),
-                        UIntType::U32 => DataType::U32,
-                        UIntType::U16 => unimplemented!("u16"),
-                        UIntType::U8 => DataType::U8,
-                    },
-                    ElementType::Bool => DataType::Boolean,
-                },
-                shape: Shape::contiguous(tensor_view.shape().dims().map(|x| x as i64))
-                    .unwrap()
-                    .with_strides(tensor_view.strides().dims().map(|x| x as i64))
-                    .unwrap(),
-                id: None,
-                name: None,
-                byte_alignment: 16,
-                is_virtual: false,
-                is_by_value: false,
-                vector_count: None,
-                vectorized_dimension: None,
-                reordering: None,
-                ragged_offset: None,
-                ragged_tensor_multiplier: None,
-                scalar_value: None,
-            })
+            .tensor(
+                &TensorAttributes::new(&dims, &strides)
+                    .data_type(to_cudnn_data_type(tensor_view.element_type()))
+                    .uid(self.alloc_id())
+                    .alignment(16),
+            )
             .expect("failed to bind tensor")
     }
 
-    pub fn graph_mut(&mut self) -> &mut Graph {
-        &mut self.graph
+    /// Marks an operation output as a non-virtual graph output with the given layout,
+    /// returning its ID.
+    pub fn mark_output(&self, tensor: Tensor<'_, 'a>, tensor_view: &VirtTensorView) -> TensorId {
+        let id = self.alloc_id();
+        let dims = tensor_view.shape().dims().collect::<Vec<_>>();
+        let strides = tensor_view.strides().dims().collect::<Vec<_>>();
+        tensor.set_uid(id);
+        tensor.set_output(true);
+        tensor.set_data_type(to_cudnn_data_type(tensor_view.element_type()));
+        tensor.set_dim(&dims);
+        tensor.set_stride(&strides);
+        id
     }
 
-    pub fn scalar(&mut self, value: f32) -> TensorId {
-        self.graph.tensor(TensorSpec {
-            data_type: DataType::F32,
-            shape: Shape::contiguous([1]).unwrap(),
-            id: None,
-            scalar_value: Some(ScalarValue::F32(value)),
-            name: None,
-            byte_alignment: 16,
-            is_virtual: false,
-            is_by_value: true,
-            vector_count: None,
-            vectorized_dimension: None,
-            reordering: None,
-            ragged_offset: None,
-            ragged_tensor_multiplier: None,
-        })
+    pub fn scalar(&self, value: f32) -> Tensor<'_, 'a> {
+        let id = self.alloc_id();
+        self.scalars.borrow_mut().push((id, value.to_ne_bytes()));
+        self.graph
+            .tensor(
+                &TensorAttributes::new(&[1, 1], &[1, 1])
+                    .data_type(DataType::Float)
+                    .uid(id)
+                    .pass_by_value(true),
+            )
+            .expect("failed to create scalar tensor")
     }
 
     pub fn build(self) -> anyhow::Result<ExecutableCudnnGraph> {
+        self.cx.cuda().set_as_current()?;
+        let graph = self.graph.build(&[HeurMode::A, HeurMode::B])?;
+
         let mut tensor_virt_descs = HashMap::new();
-
-        let cudnn_context = self.cx.cudnn()?;
-        let compiled = self.graph.compile(cudnn_context, &[HeuristicMode::B])?;
-
-        for (tensor_id, tensor) in self.graph.tensors() {
-            let element_type = match tensor.data_type {
-                DataType::F32 => ElementType::Float(FloatType::F32),
-                DataType::BF16 => ElementType::Float(FloatType::Bf16),
-                DataType::U32 => ElementType::UInt(UIntType::U32),
-                DataType::I64 => ElementType::SInt(SIntType::S64),
-                DataType::I32 => ElementType::SInt(SIntType::S32),
-                _ => todo!("{:?}", tensor.data_type),
-            };
-            match tensor.ragged_offset {
-                Some(_) => {
-                    tensor_virt_descs.insert(
-                        tensor_id,
-                        ExpectedVirtDesc::Ragged {
-                            num_dims: tensor.shape.dimensions().len().checked_sub(1).unwrap(),
-                            element_type,
-                        },
-                    );
-                }
-                None => {
-                    tensor_virt_descs.insert(
-                        tensor_id,
-                        ExpectedVirtDesc::Exact(VirtTensorView::with_strides(
-                            skytens_core::shape::Shape::new(
-                                tensor
-                                    .shape
-                                    .dimensions()
-                                    .iter()
-                                    .copied()
-                                    .map(|x| x as usize),
-                            ),
-                            skytens_core::shape::Strides::new(
-                                tensor.shape.strides().iter().copied().map(|x| x as usize),
-                            ),
-                            element_type,
-                        )),
-                    );
-                }
+        for req in graph.all_tensor_requirements() {
+            if req.is_pass_by_value() {
+                continue;
             }
+            let element_type = from_cudnn_data_type(req.data_type());
+            let desc = if req.is_ragged() {
+                ExpectedVirtDesc::Ragged {
+                    num_dims: req.dim().len().checked_sub(1).unwrap(),
+                    element_type,
+                }
+            } else {
+                ExpectedVirtDesc::Exact(VirtTensorView::with_strides(
+                    skytens_core::shape::Shape::new(req.dim().iter().copied()),
+                    skytens_core::shape::Strides::new(req.stride().iter().copied()),
+                    element_type,
+                ))
+            };
+            tensor_virt_descs.insert(req.uid(), desc);
         }
 
-        let plan_index = compiled.default_plan_index();
-        let workspace_bytes = compiled.workspace_size_at(plan_index)?;
-        self.cx.cuda().bind()?;
+        let mut scalars = Vec::new();
+        for (id, bytes) in self.scalars.into_inner() {
+            let mut memory = self
+                .cx
+                .host_pinned_memory_pool()
+                .alloc_zeroed(bytes.len())?;
+            memory.view_mut()?.copy_from_slice(&bytes);
+            scalars.push((id, memory));
+        }
 
         Ok(ExecutableCudnnGraph {
-            cx: self.cx.clone(),
-            graph: compiled,
-            plan_index,
-            workspace_bytes,
+            cx: self.cx,
+            graph,
             tensor_virt_descs,
+            scalars,
         })
     }
 }
 
-#[derive(Debug)]
 pub struct ExecutableCudnnGraph {
     cx: Context,
-    graph: CompiledGraph,
+    graph: BuiltGraph,
     tensor_virt_descs: HashMap<TensorId, ExpectedVirtDesc>,
-    plan_index: usize,
-    workspace_bytes: usize,
+    scalars: Vec<(TensorId, HostPinnedMemory)>,
+}
+
+impl fmt::Debug for ExecutableCudnnGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecutableCudnnGraph")
+            .field("tensor_virt_descs", &self.tensor_virt_descs)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -173,63 +202,71 @@ enum ExpectedVirtDesc {
     },
 }
 
-impl ExecutableCudnnGraph {
-    /// Executes the graph with the given tensor inputs, on the given stream.
-    pub fn execute<'a>(
-        &self,
-        operands: impl IntoIterator<Item = (TensorId, &'a TensorView)>,
-        stream: &CudaStream,
-    ) -> anyhow::Result<()> {
-        assert!(Arc::ptr_eq(stream.cuda(), self.cx.cuda()));
-        let operands = operands.into_iter().collect::<Vec<_>>();
-
-        let workspace_ptr = if self.workspace_bytes > 0 {
-            Some(unsafe { DeviceMemory::<u8>::alloc_async(self.workspace_bytes, stream.get())? })
-        } else {
-            None
-        };
-        let mut workspace = workspace_ptr.map(|workspace_ptr| unsafe {
-            DeviceMemory::<u8>::from_raw_parts(workspace_ptr, self.workspace_bytes)
-        });
-
-        let mut bindings = self.graph.bindings();
-        for (tensor_id, tensor_view) in operands {
-            match &self.tensor_virt_descs[&tensor_id] {
-                ExpectedVirtDesc::Exact(virt_tensor_view) => {
-                    assert!(
-                        tensor_view.virt().same_layout_as(virt_tensor_view),
-                        "expected layout of {:?}, found {:?}",
-                        virt_tensor_view,
-                        tensor_view.virt()
-                    );
-                }
-                ExpectedVirtDesc::Ragged {
-                    num_dims,
-                    element_type,
-                } => {
-                    assert_eq!(tensor_view.shape().num_dims(), *num_dims);
-                    assert!(tensor_view.is_packed_row_major());
-                    assert_eq!(tensor_view.element_type(), *element_type);
-                }
+impl ExpectedVirtDesc {
+    fn check(&self, actual: &VirtTensorView) {
+        match self {
+            ExpectedVirtDesc::Exact(expected) => {
+                assert!(
+                    actual.same_layout_as(expected),
+                    "expected layout of {expected:?}, found {actual:?}"
+                );
             }
-
-            unsafe {
-                bindings.set_ptr(tensor_id, tensor_view.data_ptr())?;
+            ExpectedVirtDesc::Ragged {
+                num_dims,
+                element_type,
+            } => {
+                assert_eq!(actual.shape().num_dims(), *num_dims);
+                assert!(actual.is_packed_row_major());
+                assert_eq!(actual.element_type(), *element_type);
             }
         }
+    }
+}
 
-        self.graph.execute_at(
-            stream.cudnn_cx()?,
-            &bindings,
-            workspace.as_mut(),
-            self.plan_index,
-        )?;
+impl ExecutableCudnnGraph {
+    /// Executes the graph with the given tensor operands, on the given stream.
+    pub fn execute(
+        &self,
+        inputs: &[(TensorId, &TensorView<'_>)],
+        outputs: &mut [(TensorId, TensorViewMut<'_>)],
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        assert_eq!(stream.device(), self.cx.cuda());
 
-        mem::forget(workspace);
-        if let Some(workspace_ptr) = workspace_ptr {
-            unsafe {
-                DeviceMemory::<u8>::free_async(workspace_ptr, stream.get())?;
-            }
+        let cudnn = self.cx.cudnn_on(stream)?;
+        let mut workspace = self
+            .cx
+            .device_memory_pool()
+            .alloc_zeroed_on(self.graph.workspace_size(), stream)?;
+
+        let input_memories: Vec<(TensorId, &MemorySlice<&DeviceMemory>)> = inputs
+            .iter()
+            .map(|(id, view)| {
+                self.tensor_virt_descs[id].check(view.virt());
+                (*id, view.storage())
+            })
+            .collect();
+        let mut output_memories: Vec<(TensorId, &mut MemorySliceMut<&mut DeviceMemory>)> = outputs
+            .iter_mut()
+            .map(|(id, view)| {
+                self.tensor_virt_descs[id].check(view.virt());
+                (*id, view.storage_mut())
+            })
+            .collect();
+
+        let mut variant_pack = self.graph.new_variant_pack(&cudnn);
+        for (id, memory) in &input_memories {
+            variant_pack.add(*id, memory)?;
+        }
+        for (id, memory) in &mut output_memories {
+            variant_pack.add_mut(*id, memory)?;
+        }
+        for (id, memory) in &self.scalars {
+            variant_pack.add(*id, memory)?;
+        }
+
+        unsafe {
+            self.graph.execute(&variant_pack, &mut workspace)?;
         }
 
         Ok(())
