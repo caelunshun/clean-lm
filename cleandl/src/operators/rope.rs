@@ -16,6 +16,7 @@ use crate::{
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct RopeExecutor {
+    cx: Context,
     config: RopeConfig,
     module: Arc<Module>,
     fwd_cos_table: Tensor,
@@ -63,7 +64,37 @@ impl RopeExecutor {
         // to optimize for sin/cos table cache locality
         cta_work_items.sort_unstable_by_key(|encoded| *encoded >> 32);
 
-        todo!()
+        let mut cta_work_items_mem = self
+            .cx
+            .host_pinned_memory_pool()
+            .alloc_zeroed(size_of_val(cta_work_items.as_slice()))?;
+        cta_work_items_mem
+            .view_mut()?
+            .copy_from_slice(bytemuck::cast_slice(&cta_work_items));
+
+        let kernel = self.module.get_function("rope_hd64_64x1x64")?;
+
+        let (cos_table, sin_table) = match mode {
+            RopeMode::Forward => (&self.fwd_cos_table, &self.fwd_sin_table),
+            RopeMode::Backward => (&self.bwd_cos_table, &self.bwd_sin_table),
+        };
+
+        unsafe {
+            stream
+                .launch_builder(&kernel)
+                .arg(x.storage())?
+                .arg(cu_seqlen.storage())?
+                .arg(cos_table.storage())?
+                .arg(sin_table.storage())?
+                .arg(&cta_work_items_mem)?
+                .arg(out.storage_mut())?
+                .arg(i32::try_from(x.shape()[0])?)?
+                .arg(i32::try_from(x.shape()[1])?)?
+                .arg(i32::try_from(self.config.max_seqlen)?)?
+                .launch(cta_work_items.len().try_into()?, 1, 1)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -97,6 +128,7 @@ impl ResourceKey for RopeConfig {
             fwd_sin_table,
             bwd_cos_table,
             bwd_sin_table,
+            cx: cx.clone(),
         })
     }
 }
