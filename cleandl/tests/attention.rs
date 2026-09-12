@@ -1,6 +1,6 @@
 use cleandl::{
     context::Context,
-    operators::attention::{AttentionConfig, AttentionExecutor},
+    operators::attention::{AttentionConfig, AttentionExecutor, CuSeqlenTensors},
     tensor::Tensor,
 };
 use float_cmp::{ApproxEq, F32Margin};
@@ -81,19 +81,19 @@ fn attention() -> anyhow::Result<()> {
         &cx,
     )?;
     let mut out_stats = Tensor::new_zeroed(
-        Shape::new([total_tokens, Q_HEADS, 1]),
+        Shape::new([num_sequences, max_seqlen, Q_HEADS]),
         ElementType::Float(FloatType::F32),
         &stream,
         &cx,
     )?;
 
-    let mut cu_seqlen_q = Tensor::new_zeroed(
+    let mut cu_seqlen_q_times_hd_times_qh = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
         &stream,
         &cx,
     )?;
-    let mut cu_seqlen_kv = Tensor::new_zeroed(
+    let mut cu_seqlen_kv_times_hd_times_kvh = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
         &stream,
@@ -133,8 +133,24 @@ fn attention() -> anyhow::Result<()> {
     for (tensor, host) in [(&mut q, &q_host), (&mut k, &k_host), (&mut v, &v_host)] {
         cx.upload_to_device(host, tensor.storage_mut(), &stream)?;
     }
-    for tensor in [&mut cu_seqlen_q, &mut cu_seqlen_kv] {
-        cx.upload_to_device(&cu_seqlens_host, tensor.storage_mut(), &stream)?;
+
+    let scaled = |multiplier: usize| -> Vec<i64> {
+        cu_seqlens_host
+            .iter()
+            .map(|&offset| offset * multiplier as i64)
+            .collect()
+    };
+    for (tensor, host) in [
+        (
+            &mut cu_seqlen_q_times_hd_times_qh,
+            scaled(HEAD_DIM * Q_HEADS),
+        ),
+        (
+            &mut cu_seqlen_kv_times_hd_times_kvh,
+            scaled(HEAD_DIM * KV_HEADS),
+        ),
+    ] {
+        cx.upload_to_device(&host, tensor.storage_mut(), &stream)?;
     }
     for tensor in [&mut seqlen_q, &mut seqlen_kv] {
         cx.upload_to_device(&seqlens_host, tensor.storage_mut(), &stream)?;
@@ -144,8 +160,10 @@ fn attention() -> anyhow::Result<()> {
         &q.view(),
         &k.view(),
         &v.view(),
-        &cu_seqlen_q.view(),
-        &cu_seqlen_kv.view(),
+        &CuSeqlenTensors {
+            cu_seqlen_q_times_hd_times_qh: cu_seqlen_q_times_hd_times_qh.view(),
+            cu_seqlen_kv_times_hd_times_kvh: cu_seqlen_kv_times_hd_times_kvh.view(),
+        },
         &seqlen_q.view(),
         &seqlen_kv.view(),
         &mut out.view_mut(),
