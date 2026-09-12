@@ -16,8 +16,10 @@ pub struct BlocksConfig {
     pub num_heads: usize,
     pub num_decoder_kv_heads: usize,
     pub head_dim: usize,
-    pub total_batch_tokens: usize,
+    pub max_batch_encoder_tokens: usize,
+    pub max_batch_decoder_tokens: usize,
     pub max_num_sequences: usize,
-    pub max_seqlen: usize, 
+    pub max_encoder_seqlen: usize,
+    pub max_decoder_seqlen: usize,
     pub rope_base_freq: f32,
 }

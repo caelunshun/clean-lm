@@ -41,7 +41,7 @@ impl ResourceKey for EncoderExecutorKey {
         let pre_qkv_norm = NormExecutor::get(cx)?;
         let qkv_proj = LinearExecutor::get(
             LinearConfig {
-                batch_size: self.config.total_batch_tokens,
+                estimated_batch_size: self.config.max_batch_encoder_tokens,
                 in_features: self.config.hidden_size,
                 out_features: 3 * self.config.head_dim * self.config.num_heads,
                 forward_fused_residual_add: false,
@@ -51,7 +51,7 @@ impl ResourceKey for EncoderExecutorKey {
         let rope = RopeExecutor::get(
             RopeConfig {
                 base_freq: self.config.rope_base_freq,
-                max_seqlen: self.config.max_seqlen,
+                max_seqlen: self.config.max_encoder_seqlen,
                 head_dim: self.config.head_dim,
             },
             cx,
@@ -60,8 +60,8 @@ impl ResourceKey for EncoderExecutorKey {
         let attention = AttentionExecutor::get(
             AttentionConfig {
                 is_causal: false,
-                max_q_seqlen: self.config.max_seqlen,
-                max_kv_seqlen: self.config.max_seqlen,
+                max_q_seqlen: self.config.max_encoder_seqlen,
+                max_kv_seqlen: self.config.max_encoder_seqlen,
                 max_num_sequences: self.config.max_num_sequences,
                 q_heads: self.config.num_heads,
                 kv_heads: self.config.num_heads,
@@ -71,7 +71,7 @@ impl ResourceKey for EncoderExecutorKey {
         )?;
         let o_proj = LinearExecutor::get(
             LinearConfig {
-                batch_size: self.config.total_batch_tokens,
+                estimated_batch_size: self.config.max_batch_encoder_tokens,
                 in_features: self.config.num_heads * self.config.head_dim,
                 out_features: self.config.hidden_size,
                 forward_fused_residual_add: true,
@@ -81,7 +81,7 @@ impl ResourceKey for EncoderExecutorKey {
         let pre_ffn_norm = NormExecutor::get(cx)?;
         let ffn = SwiGluFfnExecutor::get(
             SwiGluConfig {
-                estimated_batch_size: self.config.total_batch_tokens,
+                estimated_batch_size: self.config.max_batch_encoder_tokens,
                 in_features: self.config.hidden_size,
                 intermediate_features: self.config.ffn_intermediate_size,
                 out_features: self.config.hidden_size,
