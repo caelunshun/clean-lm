@@ -1,10 +1,19 @@
-use cleandl::tensor::Tensor;
+use std::sync::Arc;
+
+use cleandl::{
+    context::Context,
+    operators::{embedding::EmbeddingExecutor, linear::LinearExecutor, norm::NormExecutor},
+    parameter::Parameter,
+    tensor::Tensor,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::model::decoder::{DecoderExecutor, DecoderWeights};
 
 pub mod decoder;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct Sky1Config {
     pub blocks_config: BlocksConfig,
     pub num_encoder_blocks: usize,
     pub num_decoder_blocks: usize,
@@ -29,4 +38,21 @@ pub struct MetaTensors {
     pub decoder_cu_seqlen: Tensor,
     pub decoder_cu_seqlen_times_hd_times_qh: Tensor,
     pub decoder_cu_seqlen_times_hd_times_kvh: Tensor,
+}
+
+#[derive(Debug)]
+pub struct Sky1Weights {
+    embeddings: Parameter,
+    decoder: Vec<DecoderWeights>,
+    final_norm_gamma: Parameter,
+}
+
+#[derive(Debug)]
+pub struct Sky1Executor {
+    config: Sky1Config,
+    cx: Context,
+    embedding: Arc<EmbeddingExecutor>,
+    decoder: Arc<DecoderExecutor>,
+    final_norm: Arc<NormExecutor>,
+    lm_head: Arc<LinearExecutor>,
 }
