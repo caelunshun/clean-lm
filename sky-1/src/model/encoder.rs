@@ -1,25 +1,137 @@
 use std::sync::Arc;
 
 use cleandl::{
-    cudnn::ExecutableCudnnGraph,
+    context::{Context, ResourceKey},
     operators::{
-        attention::AttentionExecutor, matmul::MatmulExecutor, norm::NormExecutor,
-        rope::RopeExecutor, swiglu_ffn::SwiGluFfnExecutor,
+        attention::{AttentionConfig, AttentionExecutor},
+        linear::{LinearConfig, LinearExecutor},
+        norm::NormExecutor,
+        rope::{RopeConfig, RopeExecutor},
+        swiglu_ffn::{SwiGluConfig, SwiGluFfnExecutor},
     },
+    parameter::Parameter,
+    tensor::Tensor,
 };
-use singe_cudnn::backend::tensor::TensorId;
+use serde::Serialize;
 
 use crate::model::BlocksConfig;
 
 #[derive(Debug)]
 pub struct EncoderExecutor {
     config: BlocksConfig,
-    input_norm: Arc<NormExecutor>,
+    pre_qkv_norm: Arc<NormExecutor>,
+    qkv_proj: Arc<LinearExecutor>,
     rope: Arc<RopeExecutor>,
     qk_norm: Arc<NormExecutor>,
     attention: Arc<AttentionExecutor>,
-    o_proj_fwd: Arc<MatmulExecutor>,
-    o_proj_bwd: Arc<MatmulExecutor>,
-    o_norm: Arc<NormExecutor>,
+    o_proj: Arc<LinearExecutor>,
+    pre_ffn_norm: Arc<NormExecutor>,
     ffn: Arc<SwiGluFfnExecutor>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EncoderExecutorKey {
+    pub config: BlocksConfig,
+}
+
+impl ResourceKey for EncoderExecutorKey {
+    type Resource = EncoderExecutor;
+
+    fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        let input_norm = NormExecutor::get(cx)?;
+        let qkv_proj = LinearExecutor::get(
+            LinearConfig {
+                batch_size: self.config.total_batch_tokens,
+                in_features: self.config.hidden_size,
+                out_features: 3 * self.config.head_dim * self.config.num_heads,
+            },
+            cx,
+        )?;
+        let rope = RopeExecutor::get(
+            RopeConfig {
+                base_freq: self.config.rope_base_freq,
+                max_seqlen: self.config.max_seqlen,
+                head_dim: self.config.head_dim,
+            },
+            cx,
+        )?;
+        let qk_norm = NormExecutor::get(cx)?;
+        let attention = AttentionExecutor::get(
+            AttentionConfig {
+                is_causal: false,
+                max_q_seqlen: self.config.max_seqlen,
+                max_kv_seqlen: self.config.max_seqlen,
+                max_num_sequences: self.config.max_num_sequences,
+                q_heads: self.config.num_heads,
+                kv_heads: self.config.num_heads,
+                head_dim: self.config.head_dim,
+            },
+            cx,
+        )?;
+        let o_proj = LinearExecutor::get(
+            LinearConfig {
+                batch_size: self.config.total_batch_tokens,
+                in_features: self.config.num_heads * self.config.head_dim,
+                out_features: self.config.hidden_size,
+            },
+            cx,
+        )?;
+        let o_norm = NormExecutor::get(cx)?;
+        let ffn = SwiGluFfnExecutor::get(
+            SwiGluConfig {
+                batch_size: self.config.total_batch_tokens,
+                in_features: self.config.hidden_size,
+                intermediate_features: self.config.ffn_intermediate_size,
+                out_features: self.config.hidden_size,
+            },
+            cx,
+        )?;
+
+        Ok(EncoderExecutor {
+            config: self.config.clone(),
+            input_norm,
+            qkv_proj,
+            rope,
+            qk_norm,
+            attention,
+            o_proj,
+            o_norm,
+            ffn,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct EncoderWeights {
+    pub pre_qkv_norm_gamma: Parameter,
+    pub qkv_proj: Parameter,
+    pub qk_norm_gamma: Parameter,
+    pub o_proj: Parameter,
+    pub pre_ffn_norm_gamma: Parameter,
+    pub ffn_up: Parameter,
+    pub ffn_gate: Parameter,
+    pub ffn_down: Parameter,
+}
+
+/// Saved tensors for the backward pass.
+#[derive(Debug)]
+pub struct EncoderSavedTensors {
+    pre_qkv_norm_r_inv: Tensor,
+    pre_qkv_norm_result: Tensor,
+    qkv_proj_result: Tensor,
+    qk_norm_result: Tensor,
+    qk_norm_r_inv: Tensor,
+    attention_result: Tensor,
+    o_proj_result: Tensor,
+    pre_ffn_norm_result: Tensor,
+    pre_ffn_norm_r_inv: Tensor,
+    ffn_up_result: Tensor,
+    ffn_gate_result: Tensor,
+    ffn_down_result: Tensor,
+}
+
+impl EncoderExecutor {
+    /// Executes forward pass given output and residual stream
+    /// of the previous layer.
+    pub fn train_forward(&self, weights: &EncoderWeights) -> anyhow::Result {}
 }

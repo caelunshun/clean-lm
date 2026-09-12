@@ -23,27 +23,21 @@ impl NormExecutor {
         cx.get_or_create_resource(NormExecutorKey)
     }
 
-    /// Computes `RMSNorm(prev_layer_output + residual_stream) * gamma`, where
-    /// `residual_stream` comes from the start of the previous layer and is skipped
-    /// if `None`.
+    /// Computes `RMSNorm(x) * gamma`
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_prenorm_forward(
+    pub fn rmsnorm_forward(
         &self,
-        prev_layer_output: &TensorView<'_>,
-        residual_stream: Option<&TensorView<'_>>,
+        x: &TensorView<'_>,
         gamma: &TensorView<'_>,
         out_y: &mut TensorViewMut<'_>,
         out_r_inv: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        let &[batch_size, inner_dim] = prev_layer_output.shape().dims_slice() else {
+        let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
         };
 
-        check_bf16_matrix(prev_layer_output, batch_size, inner_dim);
-        if let Some(residual_stream) = residual_stream {
-            check_bf16_matrix(residual_stream, batch_size, inner_dim);
-        }
+        check_bf16_matrix(x, batch_size, inner_dim);
         check_bf16_matrix(gamma, 1, inner_dim);
         check_bf16_matrix(&out_y.view(), batch_size, inner_dim);
 
@@ -55,18 +49,13 @@ impl NormExecutor {
 
         let kernel = self.module.get_function(&kernel_name)?;
 
-        let prev_layer_output_memory = prev_layer_output.storage();
-        let residual_stream_memory = residual_stream.map(|t| t.storage());
+        let x_memory = x.storage();
         let gamma_memory = gamma.storage();
         let mut out_y_memory = out_y.storage_mut();
         let mut out_r_inv_memory = out_r_inv.storage_mut();
 
         let mut launch = stream.launch_builder(&kernel);
-        launch.arg(prev_layer_output_memory)?;
-        match residual_stream_memory {
-            Some(memory) => launch.arg(memory)?,
-            None => launch.arg(NULL_POINTER)?,
-        };
+        launch.arg(x_memory)?;
         launch
             .arg(gamma_memory)?
             .arg(&mut out_y_memory)?
@@ -86,10 +75,9 @@ impl NormExecutor {
 
     /// Backward pass for [`Self::rms_prenorm_forward`]. `out_dgamma` must be pre-zeroed
     #[allow(clippy::too_many_arguments)]
-    pub fn rms_prenorm_backward(
+    pub fn rmsnorm_backward(
         &self,
-        prev_layer_output: &TensorView<'_>,
-        prev_layer_residual_stream: Option<&TensorView<'_>>,
+        x: &TensorView<'_>,
         dy: &TensorView<'_>,
         residual_gradient_stream: Option<&TensorView<'_>>,
         gamma: &TensorView<'_>,
@@ -98,14 +86,11 @@ impl NormExecutor {
         out_dgamma: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        let &[batch_size, inner_dim] = prev_layer_output.shape().dims_slice() else {
+        let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
         };
 
-        check_bf16_matrix(prev_layer_output, batch_size, inner_dim);
-        if let Some(prev_layer_residual_stream) = prev_layer_residual_stream {
-            check_bf16_matrix(prev_layer_residual_stream, batch_size, inner_dim);
-        }
+        check_bf16_matrix(x, batch_size, inner_dim);
         check_bf16_matrix(dy, batch_size, inner_dim);
         if let Some(residual_gradient_stream) = residual_gradient_stream {
             check_bf16_matrix(residual_gradient_stream, batch_size, inner_dim);
@@ -127,8 +112,7 @@ impl NormExecutor {
         let (kernel_name, block_size_0, block_size_1) = bwd_kernel_name_and_block_sizes(inner_dim)?;
         let kernel = self.module.get_function(&kernel_name)?;
 
-        let prev_layer_output_memory = prev_layer_output.storage();
-        let prev_layer_residual_stream_memory = prev_layer_residual_stream.map(|t| t.storage());
+        let x_memory = x.storage();
         let dy_memory = dy.storage();
         let residual_gradient_stream_memory = residual_gradient_stream.map(|t| t.storage());
         let gamma_memory = gamma.storage();
@@ -137,11 +121,7 @@ impl NormExecutor {
         let mut out_dgamma_memory = out_dgamma.storage_mut();
 
         let mut launch = stream.launch_builder(&kernel);
-        launch.arg(prev_layer_output_memory)?;
-        match prev_layer_residual_stream_memory {
-            Some(memory) => launch.arg(memory)?,
-            None => launch.arg(NULL_POINTER)?,
-        };
+        launch.arg(x_memory)?;
         launch.arg(dy_memory)?;
         match residual_gradient_stream_memory {
             Some(memory) => launch.arg(memory)?,
@@ -172,7 +152,7 @@ fn fwd_kernel_name_and_block_sizes(
     inner_dim: usize,
 ) -> anyhow::Result<(&'static str, usize, usize)> {
     match inner_dim {
-        2048 => Ok(("rms_prenorm_fwd_inner2048_4x2048", 4, 2048)),
+        2048 => Ok(("rmsnorm_fwd_inner2048_4x2048", 4, 2048)),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
 }
@@ -181,7 +161,7 @@ fn bwd_kernel_name_and_block_sizes(
     inner_dim: usize,
 ) -> anyhow::Result<(&'static str, usize, usize)> {
     match inner_dim {
-        2048 => Ok(("rms_prenorm_bwd_inner2048_4x2048", 4, 2048)),
+        2048 => Ok(("rmsnorm_bwd_inner2048_4x2048", 4, 2048)),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
 }

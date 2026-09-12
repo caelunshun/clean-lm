@@ -57,7 +57,6 @@ fn run_case(
     };
 
     let prev_layer_output_host = normal(1.0);
-    let residual_stream_host = normal(2.0);
     let dy_host = normal(1.0);
     let residual_gradient_stream_host = normal(0.5);
     let gamma_host: Vec<bf16> = (0..INNER_DIM)
@@ -75,7 +74,6 @@ fn run_case(
     };
 
     let prev_layer_output = upload(&prev_layer_output_host, matrix_shape)?;
-    let residual_stream = upload(&residual_stream_host, matrix_shape)?;
     let dy = upload(&dy_host, matrix_shape)?;
     let residual_gradient_stream = upload(&residual_gradient_stream_host, matrix_shape)?;
     let gamma = upload(&gamma_host, Shape::new([1, INNER_DIM]))?;
@@ -85,12 +83,10 @@ fn run_case(
     let mut dx = Tensor::new_zeroed(matrix_shape, bf16_type, stream, cx)?;
     let mut dgamma = Tensor::new_zeroed(Shape::new([1, INNER_DIM]), f32_type, stream, cx)?;
 
-    let residual_stream_view = with_residuals.then(|| residual_stream.view());
     let residual_gradient_stream_view = with_residuals.then(|| residual_gradient_stream.view());
 
-    norm.rms_prenorm_forward(
+    norm.rmsnorm_forward(
         &prev_layer_output.view(),
-        residual_stream_view.as_ref(),
         &gamma.view(),
         &mut y.view_mut(),
         &mut r_inv.view_mut(),
@@ -100,9 +96,8 @@ fn run_case(
     // The kernel accumulates dgamma atomically.
     stream.fill(&mut dgamma.view_mut().storage_mut(), 0u8)?;
 
-    norm.rms_prenorm_backward(
+    norm.rmsnorm_backward(
         &prev_layer_output.view(),
-        residual_stream_view.as_ref(),
         &dy.view(),
         residual_gradient_stream_view.as_ref(),
         &gamma.view(),
@@ -125,7 +120,6 @@ fn run_case(
 
     let expected = reference(
         &prev_layer_output_host,
-        with_residuals.then_some(residual_stream_host.as_slice()),
         &dy_host,
         with_residuals.then_some(residual_gradient_stream_host.as_slice()),
         &gamma_host,
@@ -209,7 +203,6 @@ struct Reference {
 
 fn reference(
     prev_layer_output: &[bf16],
-    residual_stream: Option<&[bf16]>,
     dy: &[bf16],
     residual_gradient_stream: Option<&[bf16]>,
     gamma: &[bf16],
@@ -227,10 +220,7 @@ fn reference(
     for row in 0..BATCH_SIZE {
         let range = row * INNER_DIM..(row + 1) * INNER_DIM;
         let x: Vec<f32> = (range.clone())
-            .map(|i| {
-                prev_layer_output[i].to_f32()
-                    + residual_stream.map_or(0.0, |residual| residual[i].to_f32())
-            })
+            .map(|i| prev_layer_output[i].to_f32())
             .collect();
 
         let mean_square = x.iter().map(|&v| (v * v) as f64).sum::<f64>() / INNER_DIM as f64;

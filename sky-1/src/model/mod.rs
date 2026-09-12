@@ -18,4 +18,6 @@ pub struct BlocksConfig {
     pub head_dim: usize,
     pub total_batch_tokens: usize,
     pub max_num_sequences: usize,
+    pub max_seqlen: usize, 
+    pub rope_base_freq: f32,
 }

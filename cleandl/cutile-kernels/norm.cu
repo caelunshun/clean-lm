@@ -1,31 +1,23 @@
 #include "utils.cuh"
 
-// Computes RMSNorm(prev_layer_output + residual_stream)
-// (residual_stream not added if set to null). The residual stream
-// comes from the start of the _previous_ layer while
-// prev_layer_output is the value before adding the residual back.
+// Computes RMSNorm(x) * gamma.
 //
 // Outputs the RMSNorm scale (1/r) for use in backward pass.
 template <int INNER_DIM, int BLOCK_SIZE>
-__tile__ void rms_prenorm_fwd_impl(
-    const __nv_bfloat16 *__restrict__ prev_layer_output,
-    const __nv_bfloat16 *__restrict__ residual_stream, // optional, can be null
+__tile__ void rmsnorm_fwd_impl(
+    const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ gamma,
     __nv_bfloat16 *__restrict__ out,
     float *__restrict__ out_r_inv,
     int batch_size)
 {
-    ASSUME_ALIGNED(prev_layer_output);
-    ASSUME_ALIGNED(residual_stream);
+    ASSUME_ALIGNED(x);
     ASSUME_ALIGNED(gamma);
     ASSUME_ALIGNED(out);
     ASSUME_ALIGNED(out_r_inv);
 
-    auto prev_layer_output_view = ct::partition_view{
-        ct::tensor_span{prev_layer_output, ct::extents{batch_size, INNER_DIM}},
-        ct::shape<BLOCK_SIZE, INNER_DIM>{}};
-    auto residual_stream_view = ct::partition_view{
-        ct::tensor_span{residual_stream, ct::extents{batch_size, INNER_DIM}},
+    auto x_view = ct::partition_view{
+        ct::tensor_span{x, ct::extents{batch_size, INNER_DIM}},
         ct::shape<BLOCK_SIZE, INNER_DIM>{}};
     auto gamma_view = ct::partition_view{
         ct::tensor_span{gamma, ct::extents{1, INNER_DIM}},
@@ -37,45 +29,36 @@ __tile__ void rms_prenorm_fwd_impl(
         ct::tensor_span{out_r_inv, ct::extents{batch_size}},
         ct::shape<BLOCK_SIZE>{}};
 
-    auto prev_layer_output_tile = prev_layer_output_view.load_masked(ct::bid().x, 0);
-    auto residual_stream_tile = ct::zeros<ct::tile<__nv_bfloat16, ct::shape<BLOCK_SIZE, INNER_DIM>>>();
-    if (residual_stream != nullptr)
-    {
-        residual_stream_tile = residual_stream_view.load_masked(ct::bid().x, 0);
-    }
+    auto x_tile = ct::element_cast<float>(x_view.load_masked(ct::bid().x, 0));
 
-    auto x = ct::element_cast<float>(prev_layer_output_tile) + ct::element_cast<float>(residual_stream_tile);
-
-    auto x2 = x * x;
+    auto x2 = x_tile * x_tile;
     auto x2_mean = ct::sum(x2, 1_ic) * (1.0f / static_cast<float>(INNER_DIM));
     auto r_inv = ct::rsqrt(x2_mean + 1e-6f, ct::round_subnormals_to_zero_t{});
 
-    auto x_norm = x * r_inv * gamma_view.load_masked(0, 0);
+    auto x_norm = x_tile * r_inv * gamma_view.load_masked(0, 0);
 
     out_view.store_masked(ct::element_cast<__nv_bfloat16>(x_norm), ct::bid().x, 0);
     out_r_inv_view.store_masked(ct::reshape(r_inv, ct::shape<BLOCK_SIZE>{}), ct::bid().x);
 }
 
-extern "C" __tile_global__ void rms_prenorm_fwd_inner2048_4x2048(
-    const __nv_bfloat16 *__restrict__ prev_layer_output,
-    const __nv_bfloat16 *__restrict__ residual_stream, // optional, can be null
+extern "C" __tile_global__ void rmsnorm_fwd_inner2048_4x2048(
+    const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ gamma,
     __nv_bfloat16 *__restrict__ out,
     float *__restrict__ out_r_inv,
     int batch_size)
 {
-    rms_prenorm_fwd_impl<2048, 4>(prev_layer_output, residual_stream, gamma, out, out_r_inv, batch_size);
+    rmsnorm_fwd_impl<2048, 4>(x, gamma, out, out_r_inv, batch_size);
 }
 
 // Backward pass for rms_prenorm_fwd_impl computing the gradient w.r.t.
-// the input, optionally incorporating the residual gradient stream from
-// the output of this layer (assuming pre-norm).
+// the input, optionally adding a residual gradient stream
+// to the gradient before writing.
 //
 // dgamma must be pre-zeroed to enable atomic accumulation.
 template <int INNER_DIM, int BLOCK_SIZE>
-__tile__ void rms_prenorm_bwd_impl(
-    const __nv_bfloat16 *__restrict__ prev_layer_output,
-    const __nv_bfloat16 *__restrict__ prev_layer_residual_stream, // optional, can be null
+__tile__ void rmsnorm_bwd_impl(
+    const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ dy,
     const __nv_bfloat16 *__restrict__ residual_gradient_stream, // optional, can be null
     const __nv_bfloat16 *__restrict__ gamma,
@@ -84,8 +67,7 @@ __tile__ void rms_prenorm_bwd_impl(
     float *__restrict__ dgamma,
     int batch_size)
 {
-    ASSUME_ALIGNED(prev_layer_output);
-    ASSUME_ALIGNED(prev_layer_residual_stream);
+    ASSUME_ALIGNED(x);
     ASSUME_ALIGNED(dy);
     ASSUME_ALIGNED(residual_gradient_stream);
     ASSUME_ALIGNED(gamma);
@@ -93,11 +75,8 @@ __tile__ void rms_prenorm_bwd_impl(
     ASSUME_ALIGNED(dx);
     ASSUME_ALIGNED(dgamma);
 
-    auto prev_layer_output_view = ct::partition_view{
-        ct::tensor_span{prev_layer_output, ct::extents{batch_size, INNER_DIM}},
-        ct::shape<BLOCK_SIZE, INNER_DIM>{}};
-    auto prev_layer_residual_stream_view = ct::partition_view{
-        ct::tensor_span{prev_layer_residual_stream, ct::extents{batch_size, INNER_DIM}},
+    auto x_view = ct::partition_view{
+        ct::tensor_span{x, ct::extents{batch_size, INNER_DIM}},
         ct::shape<BLOCK_SIZE, INNER_DIM>{}};
     auto dy_view = ct::partition_view{
         ct::tensor_span{dy, ct::extents{batch_size, INNER_DIM}},
@@ -118,17 +97,11 @@ __tile__ void rms_prenorm_bwd_impl(
         ct::tensor_span{r_inv, ct::extents{batch_size}},
         ct::shape<BLOCK_SIZE>{}};
 
-    auto prev_layer_residual_stream_tile = ct::zeros<ct::tile<__nv_bfloat16, ct::shape<BLOCK_SIZE, INNER_DIM>>>();
-    if (prev_layer_residual_stream != nullptr)
-    {
-        prev_layer_residual_stream_tile = prev_layer_residual_stream_view.load_masked(ct::bid().x, 0);
-    }
-
-    auto x = ct::element_cast<float>(prev_layer_residual_stream_tile) + ct::element_cast<float>(prev_layer_output_view.load_masked(ct::bid().x, 0));
+    auto x_tile = ct::element_cast<float>(x_view.load_masked(ct::bid().x, 0));
 
     auto r_inv_tile = ct::reshape(r_inv_view.load_masked(ct::bid().x), ct::shape<BLOCK_SIZE, 1>{});
 
-    auto x_hat = x * r_inv_tile;
+    auto x_hat = x_tile * r_inv_tile;
 
     auto dy_tile = ct::element_cast<float>(dy_view.load_masked(ct::bid().x, 0));
     auto gamma_tile = ct::element_cast<float>(gamma_view.load_masked(0, 0));
@@ -151,9 +124,8 @@ __tile__ void rms_prenorm_bwd_impl(
     dgamma_view.atomic_add(dgamma_contrib, ct::memory_order_relaxed_t{}, ct::thread_scope_device_t{}, 0, 0);
 }
 
-extern "C" __tile_global__ void rms_prenorm_bwd_inner2048_4x2048(
-    const __nv_bfloat16 *__restrict__ prev_layer_output,
-    const __nv_bfloat16 *__restrict__ prev_layer_residual_stream, // optional, can be null
+extern "C" __tile_global__ void rmsnorm_bwd_inner2048_4x2048(
+    const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ dy,
     const __nv_bfloat16 *__restrict__ residual_gradient_stream, // optional, can be null
     const __nv_bfloat16 *__restrict__ gamma,
@@ -162,6 +134,6 @@ extern "C" __tile_global__ void rms_prenorm_bwd_inner2048_4x2048(
     float *__restrict__ dgamma,
     int batch_size)
 {
-    rms_prenorm_bwd_impl<2048, 4>(prev_layer_output, prev_layer_residual_stream, dy, residual_gradient_stream,
-                                  gamma, r_inv, dx, dgamma, batch_size);
+    rmsnorm_bwd_impl<2048, 4>(x, dy, residual_gradient_stream,
+                              gamma, r_inv, dx, dgamma, batch_size);
 }
