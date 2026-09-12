@@ -65,7 +65,7 @@ impl SwiGluFfnExecutor {
         out_up: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        self.fwd_up_proj.matmul(data, weight, out_up, stream)
+        self.fwd_up_proj.matmul(data, weight, None, out_up, stream)
     }
 
     /// Gate projection fused with swish + hadamard product.
@@ -99,10 +99,12 @@ impl SwiGluFfnExecutor {
         &self,
         activation: &TensorView<'_>,
         weight: &TensorView<'_>,
+        residual: &TensorView<'_>,
         out: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        self.fwd_down_proj.matmul(activation, weight, out, stream)
+        self.fwd_down_proj
+            .matmul(activation, weight, Some(residual), out, stream)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,7 +147,7 @@ impl SwiGluFfnExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_down_proj_wgrad
-            .matmul(&activation.transposed(0, 1), dy, out_dweight, stream)
+            .matmul(&activation.transposed(0, 1), dy, None, out_dweight, stream)
     }
 
     pub fn backward_up_gate_proj_wgrad(
@@ -156,7 +158,7 @@ impl SwiGluFfnExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_up_gate_proj_wgrad
-            .matmul(&data.transposed(0, 1), dout, out_dweight, stream)
+            .matmul(&data.transposed(0, 1), dout, None, out_dweight, stream)
     }
 
     pub fn backward_up_proj_dgrad(
@@ -167,7 +169,7 @@ impl SwiGluFfnExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_up_proj_dgrad
-            .matmul(dout, &weight.transposed(0, 1), out_ddata, stream)
+            .matmul(dout, &weight.transposed(0, 1), None, out_ddata, stream)
     }
 
     pub fn backward_gate_proj_dgrad(
@@ -229,6 +231,7 @@ impl ResourceKey for SwiGluConfig {
                 m: self.batch_size,
                 n: self.intermediate_features,
                 k: self.in_features,
+                residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
@@ -240,6 +243,7 @@ impl ResourceKey for SwiGluConfig {
                 m: self.batch_size,
                 n: self.out_features,
                 k: self.intermediate_features,
+                residual_format: Some(MatrixFormat::RowMajor),
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
@@ -280,6 +284,7 @@ impl ResourceKey for SwiGluConfig {
                 m: self.intermediate_features,
                 n: self.out_features,
                 k: self.batch_size,
+                residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
@@ -292,6 +297,7 @@ impl ResourceKey for SwiGluConfig {
                 m: self.in_features,
                 n: self.intermediate_features,
                 k: self.batch_size,
+                residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
@@ -303,6 +309,7 @@ impl ResourceKey for SwiGluConfig {
                 m: self.batch_size,
                 n: self.in_features,
                 k: self.intermediate_features,
+                residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,

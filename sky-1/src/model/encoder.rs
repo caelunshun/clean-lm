@@ -38,12 +38,13 @@ impl ResourceKey for EncoderExecutorKey {
     type Resource = EncoderExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        let input_norm = NormExecutor::get(cx)?;
+        let pre_qkv_norm = NormExecutor::get(cx)?;
         let qkv_proj = LinearExecutor::get(
             LinearConfig {
                 batch_size: self.config.total_batch_tokens,
                 in_features: self.config.hidden_size,
                 out_features: 3 * self.config.head_dim * self.config.num_heads,
+                forward_fused_residual_add: false,
             },
             cx,
         )?;
@@ -73,10 +74,11 @@ impl ResourceKey for EncoderExecutorKey {
                 batch_size: self.config.total_batch_tokens,
                 in_features: self.config.num_heads * self.config.head_dim,
                 out_features: self.config.hidden_size,
+                forward_fused_residual_add: true,
             },
             cx,
         )?;
-        let o_norm = NormExecutor::get(cx)?;
+        let pre_ffn_norm = NormExecutor::get(cx)?;
         let ffn = SwiGluFfnExecutor::get(
             SwiGluConfig {
                 batch_size: self.config.total_batch_tokens,
@@ -89,13 +91,13 @@ impl ResourceKey for EncoderExecutorKey {
 
         Ok(EncoderExecutor {
             config: self.config.clone(),
-            input_norm,
+            pre_qkv_norm,
             qkv_proj,
             rope,
             qk_norm,
             attention,
             o_proj,
-            o_norm,
+            pre_ffn_norm,
             ffn,
         })
     }
@@ -130,8 +132,16 @@ pub struct EncoderSavedTensors {
     ffn_down_result: Tensor,
 }
 
+impl EncoderSavedTensors {
+    pub fn output(&self) -> &Tensor {
+        &self.ffn_down_result
+    }
+}
+
 impl EncoderExecutor {
-    /// Executes forward pass given output and residual stream
+    /// Executes forward pass given output
     /// of the previous layer.
-    pub fn train_forward(&self, weights: &EncoderWeights) -> anyhow::Result {}
+    pub fn train_forward(&self, weights: &EncoderWeights) -> anyhow::Result<EncoderSavedTensors> {
+        todo!()
+    }
 }

@@ -33,7 +33,7 @@ impl LinearExecutor {
         out: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        self.fwd.matmul(data, weight, out, stream)
+        self.fwd.matmul(data, weight, None, out, stream)
     }
 
     pub fn backward_dgrad(
@@ -44,7 +44,7 @@ impl LinearExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_dgrad
-            .matmul(dy, &weight.transposed(0, 1), out_ddata, stream)
+            .matmul(dy, &weight.transposed(0, 1), None, out_ddata, stream)
     }
 
     pub fn backward_wgrad(
@@ -55,7 +55,7 @@ impl LinearExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         self.bwd_wgrad
-            .matmul(&data.transposed(0, 1), dy, out_dweight, stream)
+            .matmul(&data.transposed(0, 1), dy, None, out_dweight, stream)
     }
 }
 
@@ -64,6 +64,7 @@ pub struct LinearConfig {
     pub batch_size: usize,
     pub in_features: usize,
     pub out_features: usize,
+    pub forward_fused_residual_add: bool,
 }
 
 impl ResourceKey for LinearConfig {
@@ -75,6 +76,9 @@ impl ResourceKey for LinearConfig {
                 m: self.batch_size,
                 n: self.out_features,
                 k: self.in_features,
+                residual_format: self
+                    .forward_fused_residual_add
+                    .then_some(MatrixFormat::RowMajor),
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
@@ -86,6 +90,7 @@ impl ResourceKey for LinearConfig {
                 m: self.batch_size,
                 n: self.in_features,
                 k: self.out_features,
+                residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,
@@ -97,6 +102,7 @@ impl ResourceKey for LinearConfig {
                 m: self.in_features,
                 n: self.out_features,
                 k: self.batch_size,
+                residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
