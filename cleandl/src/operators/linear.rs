@@ -36,6 +36,17 @@ impl LinearExecutor {
         self.fwd.matmul(data, weight, None, out, stream)
     }
 
+    pub fn forward_with_residual(
+        &self,
+        data: &TensorView,
+        weight: &TensorView,
+        residual: &TensorView,
+        out: &mut TensorViewMut,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        self.fwd.matmul(data, weight, Some(residual), out, stream)
+    }
+
     pub fn backward_dgrad(
         &self,
         dy: &TensorView<'_>,

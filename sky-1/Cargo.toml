@@ -5,8 +5,7 @@ edition = "2024"
 
 [dependencies]
 cleandl = { path = "../cleandl" }
-singe-cuda = "0.1.0-alpha.9"
-singe-cudnn = "0.1.0-alpha.7"
+skycuda = { git = "https://github.com/caelunshun/skycuda" }
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
