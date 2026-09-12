@@ -18,7 +18,8 @@ use skytens_core::{
     shape::Shape,
 };
 
-const M: usize = 8192;
+const M_BUILT: usize = 8192;
+const M_ACTUAL: usize = 16384;
 const N: usize = 8192;
 const K: usize = 8192;
 
@@ -39,13 +40,13 @@ fn fused_matmul() -> anyhow::Result<()> {
     let stream = cx.cuda().create_stream()?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut a = Tensor::new_zeroed(Shape::new([M, K]), bf16_type, &stream, &cx)?;
+    let mut a = Tensor::new_zeroed(Shape::new([M_ACTUAL, K]), bf16_type, &stream, &cx)?;
     let mut b = Tensor::new_zeroed(Shape::new([K, N]), bf16_type, &stream, &cx)?;
-    let mut c = Tensor::new_zeroed(Shape::new([M, N]), bf16_type, &stream, &cx)?;
+    let mut c = Tensor::new_zeroed(Shape::new([M_ACTUAL, N]), bf16_type, &stream, &cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (K as f32).sqrt().recip();
-    let a_host: Vec<bf16> = (0..M * K)
+    let a_host: Vec<bf16> = (0..M_ACTUAL * K)
         .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
         .collect();
     let b_host: Vec<bf16> = (0..K * N)
@@ -55,10 +56,9 @@ fn fused_matmul() -> anyhow::Result<()> {
     cx.upload_to_device(&a_host, a.storage_mut(), &stream)?;
     cx.upload_to_device(&b_host, b.storage_mut(), &stream)?;
 
-    // cuDNN matmul operates on batched [1, rows, cols] layouts.
-    let a_layout = VirtTensorView::new([1, M, K], bf16_type);
+    let a_layout = VirtTensorView::new([1, M_BUILT, K], bf16_type);
     let b_layout = VirtTensorView::new([1, K, N], bf16_type);
-    let c_layout = VirtTensorView::new([1, M, N], bf16_type);
+    let c_layout = VirtTensorView::new([1, M_BUILT, N], bf16_type);
 
     let graph = CudnnGraphBuilder::new(&cx)?;
     let a_tensor = graph.bind_tensor(&a_layout);
@@ -68,6 +68,7 @@ fn fused_matmul() -> anyhow::Result<()> {
         b_tensor,
         &MatmulAttributes::new().compute_data_type(DataType::Float),
     )?;
+    graph.graph().set_override_shape_enabled(true);
     let activation = graph.graph().pointwise_unary(
         product,
         &PointwiseAttributes::new(PointwiseMode::SwishFwd).compute_data_type(DataType::Float),
@@ -78,10 +79,10 @@ fn fused_matmul() -> anyhow::Result<()> {
 
     graph.execute(
         &[
-            (a_id, &a.reshaped([1, M, K])),
+            (a_id, &a.reshaped([1, M_ACTUAL, K])),
             (b_id, &b.reshaped([1, K, N])),
         ],
-        &mut [(c_id, c.reshaped_mut([1, M, N]))],
+        &mut [(c_id, c.reshaped_mut([1, M_ACTUAL, N]))],
         &stream,
     )?;
 
@@ -90,12 +91,12 @@ fn fused_matmul() -> anyhow::Result<()> {
     stream.block_on()?;
     let c_host: &[bf16] = bytemuck::cast_slice(c_staging.view()?);
 
-    let a_ref = Mat::from_fn(M, K, |i, j| a_host[i * K + j].to_f32());
+    let a_ref = Mat::from_fn(M_ACTUAL, K, |i, j| a_host[i * K + j].to_f32());
     let b_ref = Mat::from_fn(K, N, |i, j| b_host[i * N + j].to_f32());
     let c_ref = a_ref * b_ref;
 
     let mut max_error = 0.0f32;
-    for i in 0..M {
+    for i in 0..M_ACTUAL {
         for j in 0..N {
             let expected = swish(c_ref[(i, j)]);
             let actual = c_host[i * N + j].to_f32();

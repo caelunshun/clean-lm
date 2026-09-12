@@ -56,6 +56,16 @@ extern "C" __tile_global__ void rmsnorm_fwd_inner2048_persistent(
     rmsnorm_fwd_impl<2048, 4>(x, gamma, out, out_r_inv, batch_size);
 }
 
+extern "C" __tile_global__ void rmsnorm_fwd_inner64_persistent(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ gamma,
+    __nv_bfloat16 *__restrict__ out,
+    float *__restrict__ out_r_inv,
+    int batch_size)
+{
+    rmsnorm_fwd_impl<64, 64>(x, gamma, out, out_r_inv, batch_size);
+}
+
 // Backward pass for rmsnorm computing the gradient w.r.t.
 // the input, optionally adding a residual gradient stream
 // to the gradient before writing.
@@ -148,4 +158,20 @@ extern "C"
 {
     rmsnorm_bwd_impl<2048, 4>(x, dy, residual_gradient_stream,
                               gamma, r_inv, dx, dgamma, batch_size);
+}
+
+extern "C"
+    [[cutile::hint(0, occupancy = 2)]]
+    __tile_global__ void rmsnorm_bwd_inner64_persistent(
+        const __nv_bfloat16 *__restrict__ x,
+        const __nv_bfloat16 *__restrict__ dy,
+        const __nv_bfloat16 *__restrict__ residual_gradient_stream, // optional, can be null
+        const __nv_bfloat16 *__restrict__ gamma,
+        const float *__restrict__ r_inv,
+        __nv_bfloat16 *__restrict__ dx,
+        float *__restrict__ dgamma,
+        int batch_size)
+{
+    rmsnorm_bwd_impl<64, 64>(x, dy, residual_gradient_stream,
+                             gamma, r_inv, dx, dgamma, batch_size);
 }

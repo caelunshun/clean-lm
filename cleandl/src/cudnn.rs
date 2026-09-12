@@ -9,7 +9,10 @@ use skycuda::{
 use skycuda_cudnn::{
     BuiltGraph, DataType, GraphBuilder, HeurMode, Tensor, TensorAttributes, TensorId,
 };
-use skytens_core::data_type::{ElementType, FloatType, SIntType, UIntType};
+use skytens_core::{
+    data_type::{ElementType, FloatType, SIntType, UIntType},
+    shape::{Shape, Strides},
+};
 
 use crate::{
     context::Context,
@@ -203,13 +206,20 @@ enum ExpectedVirtDesc {
 }
 
 impl ExpectedVirtDesc {
-    fn check(&self, actual: &VirtTensorView) {
+    fn check(&self, actual: &VirtTensorView, override_shape_enabled: bool) -> bool {
         match self {
             ExpectedVirtDesc::Exact(expected) => {
-                assert!(
-                    actual.same_layout_as(expected),
-                    "expected layout of {expected:?}, found {actual:?}"
-                );
+                if override_shape_enabled {
+                    assert_eq!(expected.shape().num_dims(), actual.shape().num_dims());
+                    assert_eq!(expected.element_type(), actual.element_type());
+                    expected.shape() != actual.shape() || expected.strides() != actual.strides()
+                } else {
+                    assert!(
+                        actual.same_layout_as(expected),
+                        "expected layout of {expected:?}, found {actual:?}"
+                    );
+                    false
+                }
             }
             ExpectedVirtDesc::Ragged {
                 num_dims,
@@ -218,6 +228,7 @@ impl ExpectedVirtDesc {
                 assert_eq!(actual.shape().num_dims(), *num_dims);
                 assert!(actual.is_packed_row_major());
                 assert_eq!(actual.element_type(), *element_type);
+                false
             }
         }
     }
@@ -239,27 +250,78 @@ impl ExecutableCudnnGraph {
             .device_memory_pool()
             .alloc_zeroed_on(self.graph.workspace_size(), stream)?;
 
-        let input_memories: Vec<(TensorId, &MemorySlice<&DeviceMemory>)> = inputs
+        enum Input<'a, 'b> {
+            StaticShape(&'a MemorySlice<&'b DeviceMemory>),
+            OverrideShape(&'a MemorySlice<&'b DeviceMemory>, Shape, Strides),
+        }
+        enum InputMut<'a, 'b> {
+            StaticShape(&'a mut MemorySliceMut<&'b mut DeviceMemory>),
+            OverrideShape(&'a mut MemorySliceMut<&'b mut DeviceMemory>, Shape, Strides),
+        }
+
+        let input_memories: Vec<(TensorId, _)> = inputs
             .iter()
             .map(|(id, view)| {
-                self.tensor_virt_descs[id].check(view.virt());
-                (*id, view.storage())
+                if self.tensor_virt_descs[id]
+                    .check(view.virt(), self.graph.is_override_shape_enabled())
+                {
+                    (
+                        *id,
+                        Input::OverrideShape(view.storage(), view.shape(), view.strides()),
+                    )
+                } else {
+                    (*id, Input::StaticShape(view.storage()))
+                }
             })
             .collect();
-        let mut output_memories: Vec<(TensorId, &mut MemorySliceMut<&mut DeviceMemory>)> = outputs
+        let mut output_memories: Vec<(TensorId, _)> = outputs
             .iter_mut()
             .map(|(id, view)| {
-                self.tensor_virt_descs[id].check(view.virt());
-                (*id, view.storage_mut())
+                if self.tensor_virt_descs[id]
+                    .check(view.virt(), self.graph.is_override_shape_enabled())
+                {
+                    let shape = view.shape();
+                    let strides = view.strides();
+                    (
+                        *id,
+                        InputMut::OverrideShape(view.storage_mut(), shape, strides),
+                    )
+                } else {
+                    (*id, InputMut::StaticShape(view.storage_mut()))
+                }
             })
             .collect();
 
         let mut variant_pack = self.graph.new_variant_pack(&cudnn);
-        for (id, memory) in &input_memories {
-            variant_pack.add(*id, memory)?;
+        for (id, input) in &input_memories {
+            match input {
+                Input::StaticShape(memory) => {
+                    variant_pack.add(*id, *memory)?;
+                }
+                Input::OverrideShape(memory, shape, strides) => {
+                    variant_pack.add_with_shape(
+                        *id,
+                        *memory,
+                        shape.dims_slice(),
+                        strides.dims_slice(),
+                    )?;
+                }
+            }
         }
-        for (id, memory) in &mut output_memories {
-            variant_pack.add_mut(*id, memory)?;
+        for (id, input) in &mut output_memories {
+            match input {
+                InputMut::StaticShape(memory) => {
+                    variant_pack.add_mut(*id, *memory)?;
+                }
+                InputMut::OverrideShape(memory, shape, strides) => {
+                    variant_pack.add_mut_with_shape(
+                        *id,
+                        *memory,
+                        shape.dims_slice(),
+                        strides.dims_slice(),
+                    )?;
+                }
+            }
         }
         for (id, memory) in &self.scalars {
             variant_pack.add(*id, memory)?;
