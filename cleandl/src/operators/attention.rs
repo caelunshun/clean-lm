@@ -177,7 +177,6 @@ impl AttentionConfig {
         )
     }
 
-    /// [B, H, S, D] view of a [B, S, H, D] tensor, as expected by cuDNN.
     fn q_layout(&self) -> VirtTensorView {
         VirtTensorView::new(
             [

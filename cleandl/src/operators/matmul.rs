@@ -17,6 +17,7 @@ use crate::{
 /// Matmul executor with optional residual add.
 #[derive(Debug)]
 pub struct MatmulExecutor {
+    #[allow(unused)]
     config: MatmulConfig,
     graph: ExecutableCudnnGraph,
     a: TensorId,
@@ -38,28 +39,26 @@ impl MatmulExecutor {
         out: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        assert_eq!(a.shape().dims_slice(), &[self.config.m, self.config.k]);
-        assert_eq!(b.shape().dims_slice(), &[self.config.k, self.config.n]);
-        assert_eq!(out.shape().dims_slice(), &[self.config.m, self.config.n]);
+        let &[m, k] = a.shape().dims_slice() else {
+            panic!()
+        };
+        let &[_, n] = b.shape().dims_slice() else {
+            panic!()
+        };
+
         let mut inputs = vec![
-            (self.a, a.reshaped([1, self.config.m, self.config.k])),
-            (self.b, b.reshaped([1, self.config.k, self.config.n])),
+            (self.a, a.reshaped([1, m, k])),
+            (self.b, b.reshaped([1, k, n])),
         ];
         if let Some(residual) = residual {
-            inputs.push((
-                self.residual.unwrap(),
-                residual.reshaped([1, self.config.m, self.config.n]),
-            ));
+            inputs.push((self.residual.unwrap(), residual.reshaped([1, m, n])));
         }
         self.graph.execute(
             &inputs
                 .iter()
                 .map(|(id, view)| (*id, view))
                 .collect::<Vec<_>>(),
-            &mut [(
-                self.out,
-                out.reshaped_mut([1, self.config.m, self.config.n]),
-            )],
+            &mut [(self.out, out.reshaped_mut([1, m, n]))],
             stream,
         )?;
         Ok(())
@@ -75,6 +74,7 @@ pub struct MatmulConfig {
     pub b_format: MatrixFormat,
     pub residual_format: Option<MatrixFormat>,
     pub out_format: MatrixFormat,
+    pub allow_shape_override: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize)]
@@ -120,6 +120,10 @@ impl ResourceKey for MatmulConfig {
         }
         let out = graph.mark_output(out, &make_view(self.m, self.n, self.out_format));
         let (a, b) = (a.uid(), b.uid());
+
+        if self.allow_shape_override {
+            graph.graph().set_override_shape_enabled(true);
+        }
 
         Ok(MatmulExecutor {
             config: self.clone(),

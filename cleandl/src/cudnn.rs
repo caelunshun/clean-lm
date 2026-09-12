@@ -245,10 +245,6 @@ impl ExecutableCudnnGraph {
         assert_eq!(stream.device(), self.cx.cuda());
 
         let cudnn = self.cx.cudnn_on(stream)?;
-        let mut workspace = self
-            .cx
-            .device_memory_pool()
-            .alloc_zeroed_on(self.graph.workspace_size(), stream)?;
 
         enum Input<'a, 'b> {
             StaticShape(&'a MemorySlice<&'b DeviceMemory>),
@@ -326,6 +322,11 @@ impl ExecutableCudnnGraph {
         for (id, memory) in &self.scalars {
             variant_pack.add(*id, memory)?;
         }
+
+        let mut workspace = self
+            .cx
+            .device_memory_pool()
+            .alloc_zeroed_on(self.graph.workspace_size_for(&variant_pack)?, stream)?;
 
         unsafe {
             self.graph.execute(&variant_pack, &mut workspace)?;

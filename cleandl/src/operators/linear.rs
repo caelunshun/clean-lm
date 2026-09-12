@@ -61,7 +61,7 @@ impl LinearExecutor {
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct LinearConfig {
-    pub batch_size: usize,
+    pub estimated_batch_size: usize,
     pub in_features: usize,
     pub out_features: usize,
     pub forward_fused_residual_add: bool,
@@ -73,7 +73,7 @@ impl ResourceKey for LinearConfig {
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         let fwd = MatmulExecutor::get(
             MatmulConfig {
-                m: self.batch_size,
+                m: self.estimated_batch_size,
                 n: self.out_features,
                 k: self.in_features,
                 residual_format: self
@@ -82,18 +82,20 @@ impl ResourceKey for LinearConfig {
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
         let bwd_dgrad = MatmulExecutor::get(
             MatmulConfig {
-                m: self.batch_size,
+                m: self.estimated_batch_size,
                 n: self.in_features,
                 k: self.out_features,
                 residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
@@ -101,11 +103,12 @@ impl ResourceKey for LinearConfig {
             MatmulConfig {
                 m: self.in_features,
                 n: self.out_features,
-                k: self.batch_size,
+                k: self.estimated_batch_size,
                 residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;

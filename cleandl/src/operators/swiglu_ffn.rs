@@ -198,7 +198,7 @@ impl SwiGluFfnExecutor {
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct SwiGluConfig {
-    pub batch_size: usize,
+    pub estimated_batch_size: usize,
     pub in_features: usize,
     pub intermediate_features: usize,
     pub out_features: usize,
@@ -217,10 +217,14 @@ impl ResourceKey for SwiGluConfig {
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         let bf16 = ElementType::Float(FloatType::Bf16);
-        let data_layout = VirtTensorView::new([1, self.batch_size, self.in_features], bf16);
-        let intermediate_layout =
-            VirtTensorView::new([1, self.batch_size, self.intermediate_features], bf16);
-        let out_layout = VirtTensorView::new([1, self.batch_size, self.out_features], bf16);
+        let data_layout =
+            VirtTensorView::new([1, self.estimated_batch_size, self.in_features], bf16);
+        let intermediate_layout = VirtTensorView::new(
+            [1, self.estimated_batch_size, self.intermediate_features],
+            bf16,
+        );
+        let out_layout =
+            VirtTensorView::new([1, self.estimated_batch_size, self.out_features], bf16);
         let up_gate_weight_layout =
             VirtTensorView::new([1, self.in_features, self.intermediate_features], bf16);
         let down_weight_layout =
@@ -228,30 +232,35 @@ impl ResourceKey for SwiGluConfig {
 
         let fwd_up_proj = MatmulExecutor::get(
             MatmulConfig {
-                m: self.batch_size,
+                m: self.estimated_batch_size,
                 n: self.intermediate_features,
                 k: self.in_features,
                 residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
         let fwd_down_proj = MatmulExecutor::get(
             MatmulConfig {
-                m: self.batch_size,
+                m: self.estimated_batch_size,
                 n: self.out_features,
                 k: self.intermediate_features,
                 residual_format: Some(MatrixFormat::RowMajor),
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
 
         let fwd_fused_gate_graph = CudnnGraphBuilder::new(cx)?;
+        fwd_fused_gate_graph
+            .graph()
+            .set_override_shape_enabled(true);
         let fwd_fused_gate_data = fwd_fused_gate_graph.bind_tensor(&data_layout);
         let fwd_fused_gate_up = fwd_fused_gate_graph.bind_tensor(&intermediate_layout);
         let fwd_fused_gate_weight = fwd_fused_gate_graph.bind_tensor(&up_gate_weight_layout);
@@ -283,11 +292,12 @@ impl ResourceKey for SwiGluConfig {
             MatmulConfig {
                 m: self.intermediate_features,
                 n: self.out_features,
-                k: self.batch_size,
+                k: self.estimated_batch_size,
                 residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
@@ -296,28 +306,33 @@ impl ResourceKey for SwiGluConfig {
             MatmulConfig {
                 m: self.in_features,
                 n: self.intermediate_features,
-                k: self.batch_size,
+                k: self.estimated_batch_size,
                 residual_format: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
         let bwd_up_proj_dgrad = MatmulExecutor::get(
             MatmulConfig {
-                m: self.batch_size,
+                m: self.estimated_batch_size,
                 n: self.in_features,
                 k: self.intermediate_features,
                 residual_format: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
             },
             cx,
         )?;
 
         let bwd_gate_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
+        bwd_gate_proj_dgrad_graph
+            .graph()
+            .set_override_shape_enabled(true);
         let bwd_gate_proj_dgrad_dgate = bwd_gate_proj_dgrad_graph.bind_tensor(&intermediate_layout);
         let bwd_gate_proj_dgrad_weight =
             bwd_gate_proj_dgrad_graph.bind_tensor(&up_gate_weight_layout.transposed(1, 2));
@@ -343,6 +358,9 @@ impl ResourceKey for SwiGluConfig {
         let bwd_gate_proj_dgrad_graph = bwd_gate_proj_dgrad_graph.build()?;
 
         let bwd_down_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
+        bwd_down_proj_dgrad_graph
+            .graph()
+            .set_override_shape_enabled(true);
 
         let bwd_down_proj_dgrad_weight =
             bwd_down_proj_dgrad_graph.bind_tensor(&down_weight_layout.transposed(1, 2));

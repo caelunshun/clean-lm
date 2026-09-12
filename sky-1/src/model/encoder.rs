@@ -81,7 +81,7 @@ impl ResourceKey for EncoderExecutorKey {
         let pre_ffn_norm = NormExecutor::get(cx)?;
         let ffn = SwiGluFfnExecutor::get(
             SwiGluConfig {
-                batch_size: self.config.total_batch_tokens,
+                estimated_batch_size: self.config.total_batch_tokens,
                 in_features: self.config.hidden_size,
                 intermediate_features: self.config.ffn_intermediate_size,
                 out_features: self.config.hidden_size,

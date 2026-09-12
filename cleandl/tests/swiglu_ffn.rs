@@ -37,7 +37,7 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
 
     let executor = SwiGluFfnExecutor::get(
         SwiGluConfig {
-            batch_size: BATCH_SIZE,
+            estimated_batch_size: BATCH_SIZE,
             in_features: IN_FEATURES,
             intermediate_features: INTERMEDIATE_FEATURES,
             out_features: OUT_FEATURES,

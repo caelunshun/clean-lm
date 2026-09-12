@@ -46,7 +46,7 @@ impl NormExecutor {
         assert!(out_r_inv.is_packed_row_major());
 
         let kernel_name = fwd_kernel_name(inner_dim)?;
-        let kernel = self.module.get_function(&kernel_name)?;
+        let kernel = self.module.get_function(kernel_name)?;
 
         let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
@@ -107,7 +107,7 @@ impl NormExecutor {
         assert!(out_dgamma.is_packed_row_major());
 
         let kernel_name = bwd_kernel_name(inner_dim)?;
-        let kernel = self.module.get_function(&kernel_name)?;
+        let kernel = self.module.get_function(kernel_name)?;
 
         let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
