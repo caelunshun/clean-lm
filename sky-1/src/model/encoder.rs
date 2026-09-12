@@ -124,6 +124,7 @@ pub struct EncoderSavedTensors {
     qk_norm_result: Tensor,
     qk_norm_r_inv: Tensor,
     attention_result: Tensor,
+    attention_stats: Tensor,
     o_proj_result: Tensor,
     pre_ffn_norm_result: Tensor,
     pre_ffn_norm_r_inv: Tensor,

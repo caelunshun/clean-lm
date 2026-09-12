@@ -45,9 +45,10 @@ impl NormExecutor {
         assert_eq!(out_r_inv.shape(), Shape::new([batch_size]));
         assert!(out_r_inv.is_packed_row_major());
 
-        let (kernel_name, block_size_0, block_size_1) = fwd_kernel_name_and_block_sizes(inner_dim)?;
-
+        let kernel_name = fwd_kernel_name(inner_dim)?;
         let kernel = self.module.get_function(&kernel_name)?;
+
+        let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
         let x_memory = x.storage();
         let gamma_memory = gamma.storage();
@@ -63,11 +64,7 @@ impl NormExecutor {
             .arg(i32::try_from(batch_size)?)?;
 
         unsafe {
-            launch.launch(
-                batch_size.div_ceil(block_size_0) as u32,
-                inner_dim.div_ceil(block_size_1) as u32,
-                1,
-            )?;
+            launch.launch(occupancy as u32, 1, 1)?;
         }
 
         Ok(())
@@ -109,8 +106,10 @@ impl NormExecutor {
         assert_eq!(out_dgamma.shape(), Shape::new([1, inner_dim]));
         assert!(out_dgamma.is_packed_row_major());
 
-        let (kernel_name, block_size_0, block_size_1) = bwd_kernel_name_and_block_sizes(inner_dim)?;
+        let kernel_name = bwd_kernel_name(inner_dim)?;
         let kernel = self.module.get_function(&kernel_name)?;
+
+        let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
         let x_memory = x.storage();
         let dy_memory = dy.storage();
@@ -135,11 +134,7 @@ impl NormExecutor {
             .arg(i32::try_from(batch_size)?)?;
         // Block dim and smem are overriden by TileIR.
         unsafe {
-            launch.launch(
-                batch_size.div_ceil(block_size_0) as u32,
-                inner_dim.div_ceil(block_size_1) as u32,
-                1,
-            )?;
+            launch.launch(occupancy as u32, 1, 1)?;
         }
 
         Ok(())
@@ -148,20 +143,16 @@ impl NormExecutor {
 
 const NULL_POINTER: u64 = 0;
 
-fn fwd_kernel_name_and_block_sizes(
-    inner_dim: usize,
-) -> anyhow::Result<(&'static str, usize, usize)> {
+fn fwd_kernel_name(inner_dim: usize) -> anyhow::Result<&'static str> {
     match inner_dim {
-        2048 => Ok(("rmsnorm_fwd_inner2048_4x2048", 4, 2048)),
+        2048 => Ok("rmsnorm_fwd_inner2048_persistent"),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
 }
 
-fn bwd_kernel_name_and_block_sizes(
-    inner_dim: usize,
-) -> anyhow::Result<(&'static str, usize, usize)> {
+fn bwd_kernel_name(inner_dim: usize) -> anyhow::Result<&'static str> {
     match inner_dim {
-        2048 => Ok(("rmsnorm_bwd_inner2048_4x2048", 4, 2048)),
+        2048 => Ok("rmsnorm_bwd_inner2048_persistent"),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
 }

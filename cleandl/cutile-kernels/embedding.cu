@@ -18,8 +18,8 @@ extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
 
     auto indices_tile = indices_view.load_masked(ct::bid().y, 0);
 
-    auto offsets_tile = indices_tile * embed_dim +
-                        ct::iota<ct::tile<int32_t, ct::shape<1, 128>>>() + (int)ct::bid().x * 128;
+    auto offsets_tile = ct::element_cast<int64_t>(indices_tile) * ct::element_cast<int64_t>(embed_dim) +
+                        ct::iota<ct::tile<int64_t, ct::shape<1, 128>>>() + (int)ct::bid().x * 128;
 
     ct::tile<float, ct::shape<32, 128>> embeddings_tile =
         ct::load(embeddings + offsets_tile);
@@ -47,7 +47,7 @@ extern "C" __tile_global__ void embedding_scatter_add_bf16in_f32out_32x128(
     auto dL_dout_tile = dL_dout_view.load_masked(ct::bid().y, ct::bid().x);
 
     auto offsets_tile =
-        indices_tile * embed_dim + ct::iota<ct::tile<int, ct::shape<1, 128>>>() + (int)ct::bid().x * 128;
+        ct::element_cast<int64_t>(indices_tile) * embed_dim + ct::iota<ct::tile<int64_t, ct::shape<1, 128>>>() + (int)ct::bid().x * 128;
     auto ptrs_tile = dL_din + offsets_tile;
 
     ct::atomic_add(ptrs_tile, ct::element_cast<float>(dL_dout_tile),

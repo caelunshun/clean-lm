@@ -35,7 +35,6 @@ fn rms_prenorm() -> anyhow::Result<()> {
     let stream = cx.cuda().create_stream()?;
     let norm = NormExecutor::get(&cx)?;
 
-    // With and without the optional residual streams on either end.
     for with_residuals in [true, false] {
         run_case(&cx, &stream, &norm, with_residuals)?;
     }
