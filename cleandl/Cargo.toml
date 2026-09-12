@@ -9,9 +9,9 @@ rand = "0.10"
 rand_distr = "0.6"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-skycuda = { path = "../../skycuda" }
-skycuda-cudnn = { path = "../../skycuda/skycuda-cudnn" }
-skytens-core = { path = "../../skykern/crates/skytens-core" }
+skycuda = { git = "https://github.com/caelunshun/skycuda" }
+skycuda-cudnn = { git = "https://github.com/caelunshun/skycuda" }
+skytens-core = { git = "https://github.com/caelunshun/skykern" }
 rayon = "1"
 thread_local = "1"
 serde = { version = "1", features = ["derive"] }

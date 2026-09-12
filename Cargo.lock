@@ -1649,6 +1649,7 @@ dependencies = [
 [[package]]
 name = "skycuda"
 version = "0.1.0"
+source = "git+https://github.com/caelunshun/skycuda#f64a3162c78272d43dd97147b2860d427a8caea0"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -1661,6 +1662,7 @@ dependencies = [
 [[package]]
 name = "skycuda-cudnn"
 version = "0.1.0"
+source = "git+https://github.com/caelunshun/skycuda#f64a3162c78272d43dd97147b2860d427a8caea0"
 dependencies = [
  "bytemuck",
  "skycuda",
@@ -1670,6 +1672,7 @@ dependencies = [
 [[package]]
 name = "skycuda-cudnn-sys"
 version = "0.1.0"
+source = "git+https://github.com/caelunshun/skycuda#f64a3162c78272d43dd97147b2860d427a8caea0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1678,6 +1681,7 @@ dependencies = [
 [[package]]
 name = "skytens-core"
 version = "0.1.0"
+source = "git+https://github.com/caelunshun/skykern#8dacc2289f51f1afe52c6d57e081e774e77f162d"
 dependencies = [
  "foldhash",
  "half",
