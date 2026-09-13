@@ -7,8 +7,9 @@ edition = "2024"
 anyhow = "1"
 rand = "0.10"
 rand_distr = "0.6"
+rand_xoshiro = "0.8"
 half = { version = "2", features = ["bytemuck"] }
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = { version = "1.25", features = ["derive"] }
 skycuda = { git = "https://github.com/caelunshun/skycuda" }
 skycuda-cudnn = { git = "https://github.com/caelunshun/skycuda" }
 skytens-core = { git = "https://github.com/caelunshun/skykern" }

@@ -9,3 +9,6 @@ skycuda = { git = "https://github.com/caelunshun/skycuda" }
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+rand = "0.10"
+rand_distr = "0.6"
+bytemuck = "1.25"

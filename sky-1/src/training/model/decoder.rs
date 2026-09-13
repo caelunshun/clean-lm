@@ -9,14 +9,17 @@ use cleandl::{
         rope::{RopeConfig, RopeExecutor},
         swiglu_ffn::{SwiGluConfig, SwiGluFfnExecutor},
     },
-    parameter::Parameter,
     tensor::{Tensor, TensorView},
 };
+use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
 use skytens_core::data_type::{ElementType, FloatType};
 
-use crate::model::{BlocksConfig, MetaTensors};
+use crate::{
+    model::{BlocksConfig, Sky1Config},
+    training::{model::MetaTensors, parameter::Parameter},
+};
 
 #[derive(Debug)]
 pub struct DecoderExecutor {
@@ -32,9 +35,15 @@ pub struct DecoderExecutor {
     ffn: Arc<SwiGluFfnExecutor>,
 }
 
+impl DecoderExecutor {
+    pub fn get(config: BlocksConfig, cx: &Context) -> anyhow::Result<Arc<Self>> {
+        cx.get_or_create_resource(DecoderExecutorKey { config })
+    }
+}
+
 #[derive(Debug, Serialize)]
-pub struct DecoderExecutorKey {
-    pub config: BlocksConfig,
+struct DecoderExecutorKey {
+    config: BlocksConfig,
 }
 
 impl ResourceKey for DecoderExecutorKey {
@@ -112,12 +121,93 @@ impl ResourceKey for DecoderExecutorKey {
 pub struct DecoderWeights {
     pub pre_qkv_norm_gamma: Parameter,
     pub qkv_proj: Parameter,
-    pub qk_norm_gamma: Parameter,
+    pub q_norm_gamma: Parameter,
+    pub k_norm_gamma: Parameter,
     pub o_proj: Parameter,
     pub pre_ffn_norm_gamma: Parameter,
     pub ffn_up: Parameter,
     pub ffn_gate: Parameter,
     pub ffn_down: Parameter,
+}
+
+impl DecoderWeights {
+    pub fn new_random(
+        config: &Sky1Config,
+        rng: &mut impl Rng,
+        stream: &Stream,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        let ffn_up_gate_stdev = 1.0 / (config.blocks.hidden_size as f32).sqrt();
+        let o_proj_stdev = 1.0
+            / (config.blocks.hidden_size as f32 * 2.0 * config.num_decoder_blocks as f32).sqrt();
+        let ffn_down_stdev = 1.0
+            / (config.blocks.ffn_intermediate_size as f32 * 2.0 * config.num_decoder_blocks as f32)
+                .sqrt();
+
+        Ok(Self {
+            pre_qkv_norm_gamma: Parameter::constant([config.blocks.hidden_size], 1.0, stream, cx)?,
+            qkv_proj: Parameter::from_normal_distr(
+                [
+                    config.blocks.hidden_size,
+                    config.blocks.head_dim
+                        * (config.blocks.num_decoder_q_heads
+                            + 2 * config.blocks.num_decoder_kv_heads),
+                ],
+                0.0,
+                ffn_up_gate_stdev,
+                rng,
+                stream,
+                cx,
+            )?,
+            q_norm_gamma: Parameter::constant([config.blocks.head_dim], 1.0, stream, cx)?,
+            k_norm_gamma: Parameter::constant([config.blocks.head_dim], 1.0, stream, cx)?,
+            o_proj: Parameter::from_normal_distr(
+                [
+                    config.blocks.head_dim * config.blocks.num_decoder_q_heads,
+                    config.blocks.hidden_size,
+                ],
+                0.0,
+                o_proj_stdev,
+                rng,
+                stream,
+                cx,
+            )?,
+            pre_ffn_norm_gamma: Parameter::constant([config.blocks.hidden_size], 1.0, stream, cx)?,
+            ffn_up: Parameter::from_normal_distr(
+                [
+                    config.blocks.hidden_size,
+                    config.blocks.ffn_intermediate_size,
+                ],
+                0.0,
+                ffn_up_gate_stdev,
+                rng,
+                stream,
+                cx,
+            )?,
+            ffn_gate: Parameter::from_normal_distr(
+                [
+                    config.blocks.hidden_size,
+                    config.blocks.ffn_intermediate_size,
+                ],
+                0.0,
+                ffn_up_gate_stdev,
+                rng,
+                stream,
+                cx,
+            )?,
+            ffn_down: Parameter::from_normal_distr(
+                [
+                    config.blocks.ffn_intermediate_size,
+                    config.blocks.hidden_size,
+                ],
+                0.0,
+                ffn_down_stdev,
+                rng,
+                stream,
+                cx,
+            )?,
+        })
+    }
 }
 
 /// Saved tensors for the backward pass.
@@ -126,8 +216,10 @@ pub struct DecoderSavedTensors {
     pre_qkv_norm_r_inv: Tensor,
     pre_qkv_norm_result: Tensor,
     qkv_proj_result: Tensor,
-    qk_norm_result: Tensor,
-    qk_norm_r_inv: Tensor,
+    q_norm_result: Tensor,
+    q_norm_r_inv: Tensor,
+    k_norm_result: Tensor,
+    k_norm_r_inv: Tensor,
     attn_result: Tensor,
     attn_stats: Tensor,
     o_proj_result: Tensor,
@@ -195,36 +287,61 @@ impl DecoderExecutor {
             stream,
         )?;
 
-        // --- QK norm --- //
-        let qk = qkv_proj_result.sliced(
-            1,
-            0..self.config.head_dim
-                * (self.config.num_decoder_q_heads + self.config.num_decoder_kv_heads),
-        );
-        let mut qk_norm_result =
-            Tensor::new_zeroed(qk.shape(), qk.element_type(), stream, &self.cx)?;
-        let mut qk_norm_r_inv = Tensor::new_zeroed(
-            [batch_size],
+        // --- Q norm --- //
+        let q =
+            qkv_proj_result.sliced(1, 0..self.config.head_dim * self.config.num_decoder_q_heads);
+        let mut q_norm_result = Tensor::new_zeroed(q.shape(), q.element_type(), stream, &self.cx)?;
+        let mut q_norm_r_inv = Tensor::new_zeroed(
+            [batch_size * self.config.num_decoder_q_heads],
             ElementType::Float(FloatType::F32),
             stream,
             &self.cx,
         )?;
         self.qk_norm.rmsnorm_forward(
-            &qk,
-            &weights.qk_norm_gamma.bf16_weights().view(),
-            &mut qk_norm_result.view_mut(),
-            &mut qk_norm_r_inv.view_mut(),
+            &q.reshaped([
+                batch_size * self.config.num_decoder_q_heads,
+                self.config.head_dim,
+            ]),
+            &weights.q_norm_gamma.bf16_weights().view(),
+            &mut q_norm_result.reshaped_mut([
+                batch_size * self.config.num_decoder_q_heads,
+                self.config.head_dim,
+            ]),
+            &mut q_norm_r_inv.view_mut(),
             stream,
         )?;
 
-        // --- Attention --- //
-        let q = qk_norm_result.sliced(1, 0..self.config.head_dim * self.config.num_decoder_q_heads);
-        let k = qk_norm_result.sliced(
+        // --- K norm --- //
+        let k = qkv_proj_result.sliced(
             1,
             self.config.head_dim * self.config.num_decoder_q_heads
                 ..self.config.head_dim
                     * (self.config.num_decoder_q_heads + self.config.num_decoder_kv_heads),
         );
+        let mut k_norm_result = Tensor::new_zeroed(k.shape(), k.element_type(), stream, &self.cx)?;
+        let mut k_norm_r_inv = Tensor::new_zeroed(
+            [batch_size * self.config.num_decoder_kv_heads],
+            ElementType::Float(FloatType::F32),
+            stream,
+            &self.cx,
+        )?;
+        self.qk_norm.rmsnorm_forward(
+            &k.reshaped([
+                batch_size * self.config.num_decoder_kv_heads,
+                self.config.head_dim,
+            ]),
+            &weights.k_norm_gamma.bf16_weights().view(),
+            &mut k_norm_result.reshaped_mut([
+                batch_size * self.config.num_decoder_kv_heads,
+                self.config.head_dim,
+            ]),
+            &mut k_norm_r_inv.view_mut(),
+            stream,
+        )?;
+
+        // --- Attention --- //
+        let q = q_norm_result.view();
+        let k = k_norm_result.view();
         let v = qkv_proj_result.sliced(
             1,
             self.config.head_dim
@@ -340,8 +457,10 @@ impl DecoderExecutor {
             pre_qkv_norm_r_inv,
             pre_qkv_norm_result,
             qkv_proj_result,
-            qk_norm_result,
-            qk_norm_r_inv,
+            q_norm_result,
+            q_norm_r_inv,
+            k_norm_result,
+            k_norm_r_inv,
             attn_result,
             attn_stats,
             o_proj_result,

@@ -160,6 +160,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "rand_distr 0.6.0",
+ "rand_xoshiro",
  "rayon",
  "serde",
  "skycuda",
@@ -1225,6 +1226,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xoshiro"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1422,7 +1432,10 @@ name = "sky-1"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "cleandl",
+ "rand 0.10.2",
+ "rand_distr 0.6.0",
  "serde",
  "skycuda",
  "skytens-core",

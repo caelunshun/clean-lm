@@ -1,12 +1,18 @@
 use std::ops::{Bound, RangeBounds};
 
+use bytemuck::Pod;
+use half::bf16;
+use rand::{Rng, RngExt, SeedableRng};
+use rand_distr::Distribution;
+use rand_xoshiro::Xoshiro128StarStar;
+use rayon::prelude::*;
 use skycuda::{
     device_memory::DeviceMemory,
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
 use skytens_core::{
-    data_type::ElementType,
+    data_type::{ElementType, FloatType, SIntType},
     shape::{Shape, Strides},
 };
 
@@ -41,6 +47,94 @@ impl Tensor {
             virt,
             cx: cx.clone(),
             storage,
+        })
+    }
+
+    /// Returns a tensor sampled from the given distribution and RNG.
+    ///
+    /// Requires a shape and element type that has no per-row padding.
+    pub fn from_distr<T: TensorElement>(
+        distr: impl Distribution<T> + Send + Sync,
+        rng: &mut impl Rng,
+        shape: impl Into<Shape>,
+        stream: &Stream,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let element_type = T::element_type();
+        let virt = VirtTensorView::new(shape, element_type);
+        assert!(
+            virt.is_contiguous(),
+            "sampling currently unimplemented for non-contiguous tensors"
+        );
+        let allocation_bytes = virt.required_bytes();
+
+        let mut host_memory = cx
+            .host_pinned_memory_pool()
+            .alloc_zeroed(allocation_bytes)?;
+        let data = bytemuck::cast_slice_mut::<u8, T>(host_memory.view_mut()?);
+
+        const CHUNK_SIZE: usize = 65536;
+        let num_chunks = data.len().div_ceil(CHUNK_SIZE);
+        let mut chunk_rngs = Vec::new();
+        let mut current_rng = Xoshiro128StarStar::from_rng(rng);
+        for _ in 0..num_chunks {
+            chunk_rngs.push(current_rng.clone());
+            current_rng.jump();
+        }
+
+        data.par_chunks_mut(CHUNK_SIZE)
+            .zip(&mut chunk_rngs)
+            .for_each(|(chunk, rng)| {
+                chunk.iter_mut().for_each(|x| {
+                    *x = rng.sample(&distr);
+                });
+            });
+
+        let mut device_memory = cx
+            .device_memory_pool()
+            .alloc_zeroed_on(allocation_bytes, stream)?;
+        stream.copy(&host_memory, &mut device_memory)?;
+
+        Ok(Self {
+            virt,
+            cx: cx.clone(),
+            storage: device_memory,
+        })
+    }
+
+    pub fn from_slice<T: TensorElement>(
+        slice: &[T],
+        shape: impl Into<Shape>,
+        stream: &Stream,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let element_type = T::element_type();
+        let virt = VirtTensorView::new(shape, element_type);
+        assert!(
+            virt.is_contiguous(),
+            "from_slice currently unimplemented for non-contiguous tensors"
+        );
+        let allocation_bytes = virt.required_bytes();
+        assert_eq!(allocation_bytes, size_of_val(slice));
+
+        let mut staging_memory = cx
+            .host_pinned_memory_pool()
+            .alloc_zeroed(allocation_bytes)?;
+        staging_memory
+            .view_mut()?
+            .copy_from_slice(bytemuck::cast_slice(slice));
+
+        let mut device_memory = cx
+            .device_memory_pool()
+            .alloc_zeroed_on(allocation_bytes, stream)?;
+        stream.copy(&staging_memory, &mut device_memory)?;
+
+        Ok(Self {
+            virt,
+            cx: cx.clone(),
+            storage: device_memory,
         })
     }
 
@@ -613,5 +707,33 @@ impl VirtTensorView {
     pub fn is_packed_row_major(&self) -> bool {
         self.strides
             == row_major_strides(self.shape, 8 / self.element_type.bits_per_element().min(8))
+    }
+}
+
+pub trait TensorElement: Pod + Send + Sync {
+    fn element_type() -> ElementType;
+}
+
+impl TensorElement for f32 {
+    fn element_type() -> ElementType {
+        ElementType::Float(FloatType::F32)
+    }
+}
+
+impl TensorElement for bf16 {
+    fn element_type() -> ElementType {
+        ElementType::Float(FloatType::Bf16)
+    }
+}
+
+impl TensorElement for i32 {
+    fn element_type() -> ElementType {
+        ElementType::SInt(SIntType::S32)
+    }
+}
+
+impl TensorElement for i64 {
+    fn element_type() -> ElementType {
+        ElementType::SInt(SIntType::S64)
     }
 }

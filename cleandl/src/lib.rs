@@ -10,4 +10,3 @@ pub mod tensor;
 pub mod context;
 pub mod kernel;
 pub mod operators;
-pub mod parameter;
