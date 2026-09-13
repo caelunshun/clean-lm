@@ -52,7 +52,7 @@ extern "C" __tile_global__ void online_softmax_stats_128(const __nv_bfloat16 *__
 // a single target label per row.
 // Requires logits pre-processed with online_softmax_stats kernel.
 // Loss must be pre-zeroed. This kernel will compute the mean across batch items.
-extern "C" __tile_global__ void cross_entropy_loss_fwd_128(const __nv_bfloat16 *__restrict__ logits,
+extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat16 *__restrict__ logits,
                                                            const float *__restrict__ stats, const int *__restrict__ labels,
                                                            float *__restrict__ out_loss, __nv_bfloat16 *__restrict__ out_logits_grad,
                                                            int batch_size, float recip_batch_size, int num_classes)

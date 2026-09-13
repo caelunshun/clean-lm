@@ -58,7 +58,7 @@ impl LossExecutor {
 
     /// `logits` and `out_logits_grad` have shape `[batch_size, num_classes]`,
     /// `stats` and `labels` shape `[batch_size]`, and `out_loss` is a scalar.
-    pub fn cross_entropy_loss_forward(
+    pub fn cross_entropy_loss_fwd_bwd(
         &self,
         logits: &TensorView<'_>,
         stats: &TensorView<'_>,
@@ -95,7 +95,7 @@ impl LossExecutor {
         // Atomic variable needs pre-zeroed.
         stream.fill(&mut out_loss.storage_mut(), 0u8)?;
 
-        let kernel = self.module.get_function("cross_entropy_loss_fwd_128")?;
+        let kernel = self.module.get_function("cross_entropy_loss_fwd_bwd_128")?;
 
         let logits_memory = logits.storage();
         let stats_memory = stats.storage();

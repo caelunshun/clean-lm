@@ -77,7 +77,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     cx.upload_to_device(&labels_host, labels.storage_mut(), &stream)?;
 
     loss_op.online_softmax_stats(&logits.view(), &mut stats.view_mut(), &stream)?;
-    loss_op.cross_entropy_loss_forward(
+    loss_op.cross_entropy_loss_fwd_bwd(
         &logits.view(),
         &stats.view(),
         &labels.view(),
