@@ -38,8 +38,10 @@ impl NormExecutor {
         };
 
         check_bf16_matrix(x, batch_size, inner_dim);
-        check_bf16_matrix(gamma, 1, inner_dim);
         check_bf16_matrix(&out_y.view(), batch_size, inner_dim);
+
+        assert_eq!(gamma.shape().dims_slice(), &[inner_dim]);
+        assert_eq!(gamma.element_type(), ElementType::Float(FloatType::Bf16));
 
         assert_eq!(out_r_inv.element_type(), ElementType::Float(FloatType::F32));
         assert_eq!(out_r_inv.shape(), Shape::new([batch_size]));
@@ -92,8 +94,10 @@ impl NormExecutor {
         if let Some(residual_gradient_stream) = residual_gradient_stream {
             check_bf16_matrix(residual_gradient_stream, batch_size, inner_dim);
         }
-        check_bf16_matrix(gamma, 1, inner_dim);
         check_bf16_matrix(&out_dx.view(), batch_size, inner_dim);
+
+        assert_eq!(gamma.shape().dims_slice(), &[inner_dim]);
+        assert_eq!(gamma.element_type(), ElementType::Float(FloatType::Bf16));
 
         assert_eq!(r_inv.element_type(), ElementType::Float(FloatType::F32));
         assert_eq!(r_inv.shape(), Shape::new([batch_size]));
@@ -103,7 +107,7 @@ impl NormExecutor {
             out_dgamma.element_type(),
             ElementType::Float(FloatType::F32)
         );
-        assert_eq!(out_dgamma.shape(), Shape::new([1, inner_dim]));
+        assert_eq!(out_dgamma.shape(), Shape::new([inner_dim]));
         assert!(out_dgamma.is_packed_row_major());
 
         let kernel_name = bwd_kernel_name(inner_dim)?;

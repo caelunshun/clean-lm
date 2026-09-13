@@ -9,7 +9,8 @@ __tile__ void rmsnorm_fwd_impl(
     const __nv_bfloat16 *__restrict__ gamma,
     __nv_bfloat16 *__restrict__ out,
     float *__restrict__ out_r_inv,
-    int batch_size)
+    int batch_size,
+    int row_stride)
 {
     ASSUME_ALIGNED(x);
     ASSUME_ALIGNED(gamma);

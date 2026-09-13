@@ -75,12 +75,12 @@ fn run_case(
     let prev_layer_output = upload(&prev_layer_output_host, matrix_shape)?;
     let dy = upload(&dy_host, matrix_shape)?;
     let residual_gradient_stream = upload(&residual_gradient_stream_host, matrix_shape)?;
-    let gamma = upload(&gamma_host, Shape::new([1, INNER_DIM]))?;
+    let gamma = upload(&gamma_host, Shape::new([INNER_DIM]))?;
 
     let mut y = Tensor::new_zeroed(matrix_shape, bf16_type, stream, cx)?;
     let mut r_inv = Tensor::new_zeroed(Shape::new([BATCH_SIZE]), f32_type, stream, cx)?;
     let mut dx = Tensor::new_zeroed(matrix_shape, bf16_type, stream, cx)?;
-    let mut dgamma = Tensor::new_zeroed(Shape::new([1, INNER_DIM]), f32_type, stream, cx)?;
+    let mut dgamma = Tensor::new_zeroed(Shape::new([INNER_DIM]), f32_type, stream, cx)?;
 
     let residual_gradient_stream_view = with_residuals.then(|| residual_gradient_stream.view());
 

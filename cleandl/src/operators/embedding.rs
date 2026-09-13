@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use skycuda::{module::Module, stream::Stream};
 use skytens_core::{
-    data_type::{ElementType, FloatType, UIntType},
+    data_type::{ElementType, FloatType, SIntType},
     shape::Shape,
 };
 
@@ -35,7 +35,7 @@ impl EmbeddingExecutor {
         );
         assert_eq!(
             token_indices.element_type(),
-            ElementType::UInt(UIntType::U32)
+            ElementType::SInt(SIntType::S32)
         );
         assert_eq!(
             out_embeddings.element_type(),
@@ -90,7 +90,7 @@ impl EmbeddingExecutor {
     ) -> anyhow::Result<()> {
         assert_eq!(
             token_indices.element_type(),
-            ElementType::UInt(UIntType::U32)
+            ElementType::SInt(SIntType::S32)
         );
         assert_eq!(dl_dout.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(dl_din.element_type(), ElementType::Float(FloatType::F32));

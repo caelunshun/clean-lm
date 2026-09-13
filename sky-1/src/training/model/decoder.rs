@@ -258,7 +258,7 @@ impl DecoderExecutor {
             &self.cx,
         )?;
         let mut pre_qkv_norm_result = Tensor::new_zeroed(
-            [batch_size],
+            [batch_size, self.config.hidden_size],
             ElementType::Float(FloatType::Bf16),
             stream,
             &self.cx,
