@@ -29,14 +29,14 @@ fn main() -> anyhow::Result<()> {
             num_decoder_q_heads: 32,
             num_decoder_kv_heads: 4,
             head_dim: 64,
-            max_batch_decoder_tokens: 32 * 1024,
-            max_num_sequences: 128,
-            max_decoder_seqlen: 4096,
+            max_batch_decoder_tokens: 8 * 1024,
+            max_num_sequences: 32,
+            max_decoder_seqlen: 2048,
             rope_base_freq: 10_000.0,
         },
         vocab_size: 65536,
         num_encoder_blocks: 0,
-        num_decoder_blocks: 2,
+        num_decoder_blocks: 1,
     };
 
     let weights = Sky1Weights::new_random(&config, &mut rand::rng(), stream, cx)?;

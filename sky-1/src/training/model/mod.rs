@@ -60,7 +60,7 @@ impl Sky1Weights {
                 .collect::<Result<Vec<_>, anyhow::Error>>()?,
             final_norm_gamma: Parameter::constant([config.blocks.hidden_size], 1.0, stream, cx)?,
             lm_head: Parameter::from_normal_distr(
-                [config.vocab_size, config.blocks.hidden_size],
+                [config.blocks.hidden_size, config.vocab_size],
                 0.0,
                 1.0 / (config.blocks.hidden_size as f32).sqrt(),
                 rng,
@@ -221,7 +221,7 @@ impl Sky1Executor {
             &self.cx,
         )?;
         let mut loss =
-            Tensor::new_zeroed([1], ElementType::Float(FloatType::F32), stream, &self.cx)?;
+            Tensor::new_zeroed([], ElementType::Float(FloatType::F32), stream, &self.cx)?;
         let mut logits_grad =
             Tensor::new_zeroed(logits.shape(), logits.element_type(), stream, &self.cx)?;
 
