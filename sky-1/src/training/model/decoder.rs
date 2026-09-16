@@ -614,7 +614,7 @@ impl DecoderExecutor {
 
         // --- FFN down --- //
 
-        let mut ffn_down_grad = Tensor::new_zeroed(
+        let mut ffn_down_dw = Tensor::new_zeroed(
             weights.ffn_down.shape(),
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -623,22 +623,22 @@ impl DecoderExecutor {
         self.ffn.backward_down_proj_wgrad(
             &saves.ffn_gate_activation_result.view(),
             dy,
-            &mut ffn_down_grad.view_mut(),
+            &mut ffn_down_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_down_grad.view(),
+            &ffn_down_dw.view(),
             &mut weights.ffn_down.gradients.view_mut(),
             stream,
         )?;
 
-        let mut dgate = Tensor::new_zeroed(
+        let mut ffn_gate_dy = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             ElementType::Float(FloatType::Bf16),
             stream,
             &self.cx,
         )?;
-        let mut dup = Tensor::new_zeroed(
+        let mut ffn_up_dy = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -649,13 +649,13 @@ impl DecoderExecutor {
             dy,
             &saves.ffn_gate_result.view(),
             &saves.ffn_up_result.view(),
-            &mut dgate.view_mut(),
-            &mut dup.view_mut(),
+            &mut ffn_gate_dy.view_mut(),
+            &mut ffn_up_dy.view_mut(),
             stream,
         )?;
 
         // --- FFN up ---
-        let mut ffn_up_gradient = Tensor::new_zeroed(
+        let mut ffn_up_dw = Tensor::new_zeroed(
             weights.ffn_up.shape(),
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -663,31 +663,31 @@ impl DecoderExecutor {
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
             &saves.o_proj_result.view(),
-            &dup.view(),
-            &mut ffn_up_gradient.view_mut(),
+            &ffn_up_dy.view(),
+            &mut ffn_up_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_up_gradient.view(),
+            &ffn_up_dw.view(),
             &mut weights.ffn_up.gradients.view_mut(),
             stream,
         )?;
 
-        let mut dup_in = Tensor::new_zeroed(
+        let mut ffn_up_dx = Tensor::new_zeroed(
             [batch_size, self.config.hidden_size],
             ElementType::Float(FloatType::Bf16),
             stream,
             &self.cx,
         )?;
         self.ffn.backward_up_proj_dgrad(
-            &dup.view(),
+            &ffn_up_dy.view(),
             &weights.ffn_up.bf16_weights().view(),
-            &mut dup_in.view_mut(),
+            &mut ffn_up_dx.view_mut(),
             stream,
         )?;
 
         // --- FFN gate ---
-        let mut ffn_gate_gradient = Tensor::new_zeroed(
+        let mut ffn_gate_dw = Tensor::new_zeroed(
             weights.ffn_gate.shape(),
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -695,50 +695,50 @@ impl DecoderExecutor {
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
             &saves.o_proj_result.view(),
-            &dgate.view(),
-            &mut ffn_gate_gradient.view_mut(),
+            &ffn_gate_dy.view(),
+            &mut ffn_gate_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_gate_gradient.view(),
+            &ffn_gate_dw.view(),
             &mut weights.ffn_gate.gradients.view_mut(),
             stream,
         )?;
 
-        let mut ffn_in_gradient = Tensor::new_zeroed(
+        let mut ffn_dx = Tensor::new_zeroed(
             saves.pre_ffn_norm_result.shape(),
             ElementType::Float(FloatType::Bf16),
             stream,
             &self.cx,
         )?;
         self.ffn.backward_gate_proj_dgrad(
-            &dgate.view(),
+            &ffn_gate_dy.view(),
             &weights.ffn_gate.bf16_weights().view(),
-            &dup_in.view(),
-            &mut ffn_in_gradient.view_mut(),
+            &ffn_up_dx.view(),
+            &mut ffn_dx.view_mut(),
             stream,
         )?;
 
         // --- FFN pre-norm --- //
-        let mut d_ffn_norm = Tensor::new_zeroed(
-            ffn_in_gradient.shape(),
-            ffn_in_gradient.element_type(),
+        let mut pre_ffn_norm_dx = Tensor::new_zeroed(
+            ffn_dx.shape(),
+            ffn_dx.element_type(),
             stream,
             &self.cx,
         )?;
         self.pre_ffn_norm.rmsnorm_backward(
             &saves.o_proj_result.view(),
-            &ffn_in_gradient.view(),
+            &ffn_dx.view(),
             Some(dy),
             &weights.pre_ffn_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_ffn_norm_r_inv.view(),
-            &mut d_ffn_norm.view_mut(),
+            &mut pre_ffn_norm_dx.view_mut(),
             &mut weights.pre_ffn_norm_gamma.gradients.view_mut(),
             stream,
         )?;
 
         // --- O-proj --- //
-        let mut o_proj_wgrad = Tensor::new_zeroed(
+        let mut o_proj_dw = Tensor::new_zeroed(
             weights.o_proj.bf16_weights().shape(),
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -746,26 +746,26 @@ impl DecoderExecutor {
         )?;
         self.o_proj.backward_wgrad(
             &saves.attn_result.view(),
-            &d_ffn_norm.view(),
-            &mut o_proj_wgrad.view_mut(),
+            &pre_ffn_norm_dx.view(),
+            &mut o_proj_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
-            &o_proj_wgrad.view(),
+            &o_proj_dw.view(),
             &mut weights.o_proj.gradients.view_mut(),
             stream,
         )?;
 
-        let mut d_o_proj = Tensor::new_zeroed(
+        let mut o_proj_dx = Tensor::new_zeroed(
             saves.attn_result.shape(),
             saves.attn_result.element_type(),
             stream,
             &self.cx,
         )?;
         self.o_proj.backward_dgrad(
-            &d_ffn_norm.view(),
+            &pre_ffn_norm_dx.view(),
             &weights.o_proj.bf16_weights().view(),
-            &mut d_o_proj.view_mut(),
+            &mut o_proj_dx.view_mut(),
             stream,
         )?;
 
@@ -819,7 +819,7 @@ impl DecoderExecutor {
                 self.config.num_decoder_q_heads,
                 self.config.head_dim,
             ]),
-            &d_o_proj.reshaped([
+            &o_proj_dx.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads,
                 self.config.head_dim,
@@ -947,7 +947,7 @@ impl DecoderExecutor {
         self.pre_qkv_norm.rmsnorm_backward(
             x,
             &qkv_ddata.view(),
-            Some(&d_ffn_norm.view()),
+            Some(&pre_ffn_norm_dx.view()),
             &weights.pre_qkv_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_qkv_norm_r_inv.view(),
             &mut pre_qkv_ddata.view_mut(),
