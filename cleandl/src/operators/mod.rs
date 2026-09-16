@@ -7,4 +7,5 @@ pub mod loss;
 pub mod matmul;
 pub mod norm;
 pub mod rope;
+pub mod gradient_accumulation;
 pub mod swiglu_ffn;

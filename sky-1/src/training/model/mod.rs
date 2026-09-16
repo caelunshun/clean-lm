@@ -4,6 +4,7 @@ use cleandl::{
     context::{Context, ResourceKey},
     operators::{
         embedding::EmbeddingExecutor,
+        gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
         loss::LossExecutor,
         norm::NormExecutor,
@@ -15,10 +16,7 @@ use serde::Serialize;
 use skycuda::stream::Stream;
 use skytens_core::data_type::{ElementType, FloatType};
 
-use crate::{
-    model::{BlocksConfig, Sky1Config},
-    training::parameter::Parameter,
-};
+use crate::{model::Sky1Config, training::parameter::Parameter};
 use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
 
 pub mod decoder;
@@ -80,6 +78,7 @@ pub struct Sky1Executor {
     final_norm: Arc<NormExecutor>,
     lm_head: Arc<LinearExecutor>,
     loss: Arc<LossExecutor>,
+    gradient_accumulation: Arc<GradientAccumulationExecutor>,
 }
 
 impl Sky1Executor {
@@ -119,12 +118,14 @@ impl ResourceKey for Sky1ExecutorKey {
             final_norm,
             lm_head,
             loss,
+            gradient_accumulation: GradientAccumulationExecutor::get(cx)?,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct Sky1SavedTensors {
+    embedding_output: Tensor,
     decoder: Vec<DecoderSavedTensors>,
     logits: Tensor,
     logits_grad: Tensor,
@@ -154,7 +155,7 @@ impl Sky1Executor {
             panic!()
         };
 
-        let mut x = Tensor::new_zeroed(
+        let mut embedding_output = Tensor::new_zeroed(
             [batch_size, self.config.blocks.hidden_size],
             ElementType::Float(FloatType::Bf16),
             stream,
@@ -163,7 +164,7 @@ impl Sky1Executor {
         self.embedding.embedding_lookup(
             &weights.embeddings.master_weights.view(),
             token_indices,
-            &mut x.view_mut(),
+            &mut embedding_output.view_mut(),
             stream,
         )?;
 
@@ -171,7 +172,7 @@ impl Sky1Executor {
         for decoder_block_weights in &weights.decoder_blocks {
             let block_input = match decoder_saves.last() {
                 Some(last) => last.output().view(),
-                None => x.view(),
+                None => embedding_output.view(),
             };
 
             let saves = self.decoder.train_forward(
@@ -237,10 +238,77 @@ impl Sky1Executor {
         )?;
 
         Ok(Sky1SavedTensors {
+            embedding_output,
             decoder: decoder_saves,
             logits: final_norm_result,
             logits_grad,
             loss,
         })
+    }
+
+    pub fn train_backward(
+        &self,
+        token_indices: &TensorView,
+        meta_tensors: &MetaTensors,
+        weights: &mut Sky1Weights,
+        saves: &Sky1SavedTensors,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        let mut lm_head_dw = Tensor::new_zeroed(
+            weights.lm_head.shape(),
+            ElementType::Float(FloatType::Bf16),
+            stream,
+            &self.cx,
+        )?;
+        self.lm_head.backward_wgrad(
+            &saves.decoder.last().unwrap().output().view(),
+            &saves.logits_grad.view(),
+            &mut lm_head_dw.view_mut(),
+            stream,
+        )?;
+        self.gradient_accumulation.add_contribution_to_gradient(
+            &lm_head_dw.view(),
+            &mut weights.lm_head.gradients.view_mut(),
+            stream,
+        )?;
+
+        let mut lm_head_ddata = Tensor::new_zeroed(
+            saves.decoder.last().unwrap().output().shape(),
+            ElementType::Float(FloatType::Bf16),
+            stream,
+            &self.cx,
+        )?;
+        self.lm_head.backward_dgrad(
+            &saves.logits_grad.view(),
+            &weights.lm_head.bf16_weights().view(),
+            &mut lm_head_ddata.view_mut(),
+            stream,
+        )?;
+
+        let mut dy = lm_head_ddata;
+        for i in (0..weights.decoder_blocks.len()).rev() {
+            let x = if i == 0 {
+                saves.embedding_output.view()
+            } else {
+                saves.decoder[i - 1].output().view()
+            };
+            dy = self.decoder.train_backward(
+                &dy.view(),
+                &x,
+                &mut weights.decoder_blocks[i],
+                &saves.decoder[i],
+                meta_tensors,
+                stream,
+            )?;
+        }
+
+        self.embedding.embedding_scatter_add(
+            token_indices,
+            &dy.view(),
+            &mut weights.embeddings.gradients.view_mut(),
+            stream,
+        )?;
+
+        Ok(())
     }
 }

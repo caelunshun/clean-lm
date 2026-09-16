@@ -29,7 +29,7 @@ impl AdamWExecutor {
         global_sum: &mut TensorViewMut<'_>,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        assert_eq!(gradient.element_type(), ElementType::Float(FloatType::Bf16));
+        assert_eq!(gradient.element_type(), ElementType::Float(FloatType::F32));
         assert_eq!(
             global_sum.element_type(),
             ElementType::Float(FloatType::F32)
@@ -80,7 +80,7 @@ impl AdamWExecutor {
         stream: &Stream,
     ) -> anyhow::Result<()> {
         assert!(train_step > 0);
-        assert_eq!(gradient.element_type(), ElementType::Float(FloatType::Bf16));
+        assert_eq!(gradient.element_type(), ElementType::Float(FloatType::F32));
         assert_eq!(
             gradient_l2_global_sum.element_type(),
             ElementType::Float(FloatType::F32)
@@ -110,7 +110,7 @@ impl AdamWExecutor {
 
         // Persistent kernel, grid size is min(occupancy, num tiles).
         let kernel = self.module.get_function(
-            "adamw_weight_update_clipped_bf16grad_f32master_bf16replica_4096_persistent",
+            "adamw_weight_update_clipped_f32grad_f32master_bf16replica_4096_persistent",
         )?;
         let num_tiles = n.div_ceil(4096);
         let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();

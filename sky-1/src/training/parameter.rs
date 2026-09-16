@@ -17,6 +17,10 @@ pub struct Parameter {
 }
 
 impl Parameter {
+    pub fn shape(&self) -> Shape {
+        self.bf16_weights_replica.shape()
+    }
+
     pub fn from_normal_distr(
         shape: impl Into<Shape>,
         mean: f32,

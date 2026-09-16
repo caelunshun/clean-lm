@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         num_decoder_blocks: 1,
     };
 
-    let weights = Sky1Weights::new_random(&config, &mut rand::rng(), stream, cx)?;
+    let mut weights = Sky1Weights::new_random(&config, &mut rand::rng(), stream, cx)?;
 
     // --- Dummy batch initialization --- //
     let token_indices = Tensor::from_distr(
@@ -109,6 +109,14 @@ fn main() -> anyhow::Result<()> {
         &labels.view(),
         &meta_tensors,
         &weights,
+        stream,
+    )?;
+
+    executor.train_backward(
+        &token_indices.view(),
+        &meta_tensors,
+        &mut weights,
+        &res,
         stream,
     )?;
 
