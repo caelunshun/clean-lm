@@ -322,16 +322,11 @@ impl DecoderExecutor {
         assert_eq!(hidden_size, self.config.hidden_size);
 
         // --- Attention pre-norm --- //
-        let mut pre_qkv_norm_r_inv = Tensor::new_zeroed(
-            [batch_size],
-            ElementType::Float(FloatType::F32),
-            stream,
-            &self.cx,
-        )?;
+        let mut pre_qkv_norm_r_inv =
+            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
         let mut pre_qkv_norm_result = Tensor::new_zeroed(
             [batch_size, self.config.hidden_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.pre_qkv_norm.rmsnorm_forward(
@@ -349,7 +344,6 @@ impl DecoderExecutor {
                 self.config.head_dim * self.config.num_decoder_q_heads,
             ],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.q_proj.forward(
@@ -365,7 +359,6 @@ impl DecoderExecutor {
                 self.config.head_dim * self.config.num_decoder_kv_heads,
             ],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.k_proj.forward(
@@ -381,7 +374,6 @@ impl DecoderExecutor {
                 self.config.head_dim * self.config.num_decoder_kv_heads,
             ],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.v_proj.forward(
@@ -454,7 +446,6 @@ impl DecoderExecutor {
         let mut attn_result = Tensor::new_zeroed(
             q_proj_result.shape(),
             q_proj_result.element_type(),
-            stream,
             &self.cx,
         )?;
         let mut attn_stats = Tensor::new_zeroed(
@@ -464,7 +455,6 @@ impl DecoderExecutor {
                 self.config.num_decoder_q_heads,
             ],
             ElementType::Float(FloatType::F32),
-            stream,
             &self.cx,
         )?;
         self.attention.forward_attn(
@@ -503,7 +493,7 @@ impl DecoderExecutor {
         )?;
 
         // --- O-proj --- //
-        let mut o_proj_result = Tensor::new_zeroed(x.shape(), x.element_type(), stream, &self.cx)?;
+        let mut o_proj_result = Tensor::new_zeroed(x.shape(), x.element_type(), &self.cx)?;
         self.o_proj.forward_with_residual(
             &attn_result.reshaped([
                 batch_size,
@@ -516,16 +506,11 @@ impl DecoderExecutor {
         )?;
 
         // --- FFN pre-norm --- //
-        let mut pre_ffn_norm_r_inv = Tensor::new_zeroed(
-            [batch_size],
-            ElementType::Float(FloatType::F32),
-            stream,
-            &self.cx,
-        )?;
+        let mut pre_ffn_norm_r_inv =
+            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
         let mut pre_ffn_norm_result = Tensor::new_zeroed(
             [batch_size, self.config.hidden_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.pre_ffn_norm.rmsnorm_forward(
@@ -540,7 +525,6 @@ impl DecoderExecutor {
         let mut ffn_up_result = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             x.element_type(),
-            stream,
             &self.cx,
         )?;
         self.ffn.forward_up_proj(
@@ -553,13 +537,11 @@ impl DecoderExecutor {
         let mut ffn_gate_result = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             x.element_type(),
-            stream,
             &self.cx,
         )?;
         let mut ffn_gate_activation_result = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             x.element_type(),
-            stream,
             &self.cx,
         )?;
         self.ffn.forward_gate_proj(
@@ -571,8 +553,7 @@ impl DecoderExecutor {
             stream,
         )?;
 
-        let mut ffn_down_result =
-            Tensor::new_zeroed(x.shape(), x.element_type(), stream, &self.cx)?;
+        let mut ffn_down_result = Tensor::new_zeroed(x.shape(), x.element_type(), &self.cx)?;
         self.ffn.forward_down_proj(
             &ffn_gate_activation_result.view(),
             &weights.ffn_down.bf16_weights().view(),
@@ -621,7 +602,6 @@ impl DecoderExecutor {
         let mut ffn_down_dw = Tensor::new_zeroed(
             weights.ffn_down.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_down_proj_wgrad(
@@ -639,13 +619,11 @@ impl DecoderExecutor {
         let mut ffn_gate_dy = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         let mut ffn_up_dy = Tensor::new_zeroed(
             [batch_size, self.config.ffn_intermediate_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_down_proj_dgrad(
@@ -662,7 +640,6 @@ impl DecoderExecutor {
         let mut ffn_up_dw = Tensor::new_zeroed(
             weights.ffn_up.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
@@ -680,7 +657,6 @@ impl DecoderExecutor {
         let mut ffn_up_dx = Tensor::new_zeroed(
             [batch_size, self.config.hidden_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_up_proj_dgrad(
@@ -694,7 +670,6 @@ impl DecoderExecutor {
         let mut ffn_gate_dw = Tensor::new_zeroed(
             weights.ffn_gate.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
@@ -712,7 +687,6 @@ impl DecoderExecutor {
         let mut ffn_dx = Tensor::new_zeroed(
             saves.pre_ffn_norm_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.ffn.backward_gate_proj_dgrad(
@@ -725,7 +699,7 @@ impl DecoderExecutor {
 
         // --- FFN pre-norm --- //
         let mut pre_ffn_norm_dx =
-            Tensor::new_zeroed(ffn_dx.shape(), ffn_dx.element_type(), stream, &self.cx)?;
+            Tensor::new_zeroed(ffn_dx.shape(), ffn_dx.element_type(), &self.cx)?;
         self.pre_ffn_norm.rmsnorm_backward(
             &saves.o_proj_result.view(),
             &ffn_dx.view(),
@@ -741,7 +715,6 @@ impl DecoderExecutor {
         let mut o_proj_dw = Tensor::new_zeroed(
             weights.o_proj.bf16_weights().shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.o_proj.backward_wgrad(
@@ -759,7 +732,6 @@ impl DecoderExecutor {
         let mut o_proj_dx = Tensor::new_zeroed(
             saves.attn_result.shape(),
             saves.attn_result.element_type(),
-            stream,
             &self.cx,
         )?;
         self.o_proj.backward_dgrad(
@@ -773,19 +745,16 @@ impl DecoderExecutor {
         let mut dq = Tensor::new_zeroed(
             saves.q_proj_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         let mut dk = Tensor::new_zeroed(
             saves.k_proj_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         let mut dv = Tensor::new_zeroed(
             saves.v_proj_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.attention.backward_attn(
@@ -847,7 +816,6 @@ impl DecoderExecutor {
         let mut dwq = Tensor::new_zeroed(
             weights.q_proj.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.q_proj.backward_wgrad(
@@ -864,7 +832,6 @@ impl DecoderExecutor {
         let mut q_ddata = Tensor::new_zeroed(
             saves.pre_qkv_norm_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.q_proj.backward_dgrad(
@@ -877,7 +844,6 @@ impl DecoderExecutor {
         let mut dwk = Tensor::new_zeroed(
             weights.k_proj.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.k_proj.backward_wgrad(
@@ -894,7 +860,6 @@ impl DecoderExecutor {
         let mut k_ddata = Tensor::new_zeroed(
             saves.pre_qkv_norm_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.kv_proj_dgrad_with_res.matmul(
@@ -908,7 +873,6 @@ impl DecoderExecutor {
         let mut dwv = Tensor::new_zeroed(
             weights.v_proj.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.v_proj.backward_wgrad(
@@ -925,7 +889,6 @@ impl DecoderExecutor {
         let mut qkv_ddata = Tensor::new_zeroed(
             saves.pre_qkv_norm_result.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.kv_proj_dgrad_with_res.matmul(
@@ -938,12 +901,8 @@ impl DecoderExecutor {
 
         // --- Pre-QKV norm --- //
 
-        let mut pre_qkv_ddata = Tensor::new_zeroed(
-            x.shape(),
-            ElementType::Float(FloatType::Bf16),
-            stream,
-            &self.cx,
-        )?;
+        let mut pre_qkv_ddata =
+            Tensor::new_zeroed(x.shape(), ElementType::Float(FloatType::Bf16), &self.cx)?;
         self.pre_qkv_norm.rmsnorm_backward(
             x,
             &qkv_ddata.view(),

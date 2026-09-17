@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
             max_reserved_free_bytes: 8 << 30,
         },
     )?;
-    let stream = cx.default_stream();
+    let stream = cx.default_compute_stream();
 
     let config = Sky1Config {
         blocks: BlocksConfig {

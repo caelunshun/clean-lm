@@ -29,15 +29,17 @@ impl Context {
         host_pinned_memory_options: HostPinnedMemoryPoolOptions,
     ) -> anyhow::Result<Self> {
         let cuda = Device::from_index(device_index)?;
-        let auxiliary_stream = cuda.create_stream()?;
 
         let device_memory_pool = cuda.create_device_memory_pool(device_memory_options)?;
         let host_pinned_memory_pool =
             cuda.create_host_pinned_memory_pool(host_pinned_memory_options)?;
 
         Ok(Self(Arc::new(Inner {
+            default_compute_stream: cuda.create_stream()?,
+            h2d_copy_stream: cuda.create_stream()?,
+            d2h_copy_stream: cuda.create_stream()?,
+            memset_stream: cuda.create_stream()?,
             cuda,
-            default_stream: auxiliary_stream,
             resource_cache: ReentrantMutex::new(RefCell::new(HashMap::new())),
             default_cudnn_contexts: ThreadLocal::new(),
             stream_cudnn_contexts: PerStreamResource::new(),
@@ -76,8 +78,20 @@ impl Context {
         &self.0.cuda
     }
 
-    pub fn default_stream(&self) -> &Stream {
-        &self.0.default_stream
+    pub fn default_compute_stream(&self) -> &Stream {
+        &self.0.default_compute_stream
+    }
+
+    pub fn h2d_copy_stream(&self) -> &Stream {
+        &self.0.h2d_copy_stream
+    }
+
+    pub fn d2h_copy_stream(&self) -> &Stream {
+        &self.0.d2h_copy_stream
+    }
+
+    pub fn memset_stream(&self) -> &Stream {
+        &self.0.memset_stream
     }
 
     pub fn device_memory_pool(&self) -> &DeviceMemoryPool {
@@ -110,11 +124,11 @@ impl Context {
         Ok(resource)
     }
 
-    /// cuDNN handle bound to the default stream, for graph construction.
+    /// cuDNN handle bound to the default compute stream, for graph construction.
     pub fn cudnn(&self) -> anyhow::Result<&CudnnHandle> {
         self.0
             .default_cudnn_contexts
-            .get_or_try(|| CudnnHandle::new(&self.0.default_stream))
+            .get_or_try(|| CudnnHandle::new(&self.0.default_compute_stream))
             .map_err(From::from)
     }
 
@@ -134,7 +148,10 @@ struct Inner {
     cuda: Device,
     device_memory_pool: DeviceMemoryPool,
     host_pinned_memory_pool: HostPinnedMemoryPool,
-    default_stream: Stream,
+    default_compute_stream: Stream,
+    h2d_copy_stream: Stream,
+    d2h_copy_stream: Stream,
+    memset_stream: Stream,
     default_cudnn_contexts: ThreadLocal<CudnnHandle>,
     stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,

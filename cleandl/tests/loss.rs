@@ -37,31 +37,22 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     let mut logits = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE, NUM_CLASSES]),
         ElementType::Float(FloatType::Bf16),
-        &stream,
         &cx,
     )?;
     let mut stats = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::Float(FloatType::F32),
-        &stream,
         &cx,
     )?;
     let mut labels = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::SInt(SIntType::S32),
-        &stream,
         &cx,
     )?;
-    let mut loss = Tensor::new_zeroed(
-        Shape::new([]),
-        ElementType::Float(FloatType::F32),
-        &stream,
-        &cx,
-    )?;
+    let mut loss = Tensor::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &cx)?;
     let mut logits_grad = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE, NUM_CLASSES]),
         ElementType::Float(FloatType::Bf16),
-        &stream,
         &cx,
     )?;
 

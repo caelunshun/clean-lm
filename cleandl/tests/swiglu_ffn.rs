@@ -46,14 +46,12 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     )?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, &stream, cx)?;
-    let mut up = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
-    let mut weight =
-        Tensor::new_zeroed([IN_FEATURES, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
-    let mut out_gate =
-        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
+    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, cx)?;
+    let mut up = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
+    let mut weight = Tensor::new_zeroed([IN_FEATURES, INTERMEDIATE_FEATURES], bf16_type, cx)?;
+    let mut out_gate = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
     let mut out_activation =
-        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, &stream, cx)?;
+        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (IN_FEATURES as f32).sqrt().recip();

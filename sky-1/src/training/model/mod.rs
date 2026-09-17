@@ -162,7 +162,6 @@ impl Sky1Executor {
         let mut embedding_output = Tensor::new_zeroed(
             [batch_size, self.config.blocks.hidden_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.embedding.embedding_lookup(
@@ -190,14 +189,10 @@ impl Sky1Executor {
 
         let output = decoder_saves.last().unwrap().output().view();
 
-        let mut final_norm_r_inv = Tensor::new_zeroed(
-            [batch_size],
-            ElementType::Float(FloatType::F32),
-            stream,
-            &self.cx,
-        )?;
+        let mut final_norm_r_inv =
+            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
         let mut final_norm_result =
-            Tensor::new_zeroed(output.shape(), output.element_type(), stream, &self.cx)?;
+            Tensor::new_zeroed(output.shape(), output.element_type(), &self.cx)?;
         self.final_norm.rmsnorm_forward(
             &output,
             &weights.final_norm_gamma.bf16_weights().view(),
@@ -209,7 +204,6 @@ impl Sky1Executor {
         let mut logits = Tensor::new_zeroed(
             [batch_size, self.config.vocab_size],
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.lm_head.forward(
@@ -219,16 +213,10 @@ impl Sky1Executor {
             stream,
         )?;
 
-        let mut loss_stats = Tensor::new_zeroed(
-            [batch_size],
-            ElementType::Float(FloatType::F32),
-            stream,
-            &self.cx,
-        )?;
-        let mut loss =
-            Tensor::new_zeroed([], ElementType::Float(FloatType::F32), stream, &self.cx)?;
-        let mut logits_grad =
-            Tensor::new_zeroed(logits.shape(), logits.element_type(), stream, &self.cx)?;
+        let mut loss_stats =
+            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
+        let mut loss = Tensor::new_zeroed([], ElementType::Float(FloatType::F32), &self.cx)?;
+        let mut logits_grad = Tensor::new_zeroed(logits.shape(), logits.element_type(), &self.cx)?;
 
         self.loss
             .online_softmax_stats(&logits.view(), &mut loss_stats.view_mut(), stream)?;
@@ -262,7 +250,6 @@ impl Sky1Executor {
         let mut lm_head_dw = Tensor::new_zeroed(
             weights.lm_head.shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.lm_head.backward_wgrad(
@@ -280,7 +267,6 @@ impl Sky1Executor {
         let mut lm_head_ddata = Tensor::new_zeroed(
             saves.decoder.last().unwrap().output().shape(),
             ElementType::Float(FloatType::Bf16),
-            stream,
             &self.cx,
         )?;
         self.lm_head.backward_dgrad(
@@ -293,7 +279,6 @@ impl Sky1Executor {
         let mut final_norm_ddata = Tensor::new_zeroed(
             lm_head_ddata.shape(),
             lm_head_ddata.element_type(),
-            stream,
             &self.cx,
         )?;
         self.final_norm.rmsnorm_backward(
@@ -341,8 +326,7 @@ impl Sky1Executor {
         train_step: u32,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        let mut grad_sum2 =
-            Tensor::new_zeroed([], ElementType::Float(FloatType::F32), stream, &self.cx)?;
+        let mut grad_sum2 = Tensor::new_zeroed([], ElementType::Float(FloatType::F32), &self.cx)?;
         for param in [
             &weights.embeddings,
             &weights.final_norm_gamma,

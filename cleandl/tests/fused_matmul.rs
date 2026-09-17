@@ -40,9 +40,9 @@ fn fused_matmul() -> anyhow::Result<()> {
     let stream = cx.cuda().create_stream()?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut a = Tensor::new_zeroed(Shape::new([M_ACTUAL, K]), bf16_type, &stream, &cx)?;
-    let mut b = Tensor::new_zeroed(Shape::new([K, N]), bf16_type, &stream, &cx)?;
-    let mut c = Tensor::new_zeroed(Shape::new([M_ACTUAL, N]), bf16_type, &stream, &cx)?;
+    let mut a = Tensor::new_zeroed(Shape::new([M_ACTUAL, K]), bf16_type, &cx)?;
+    let mut b = Tensor::new_zeroed(Shape::new([K, N]), bf16_type, &cx)?;
+    let mut c = Tensor::new_zeroed(Shape::new([M_ACTUAL, N]), bf16_type, &cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (K as f32).sqrt().recip();

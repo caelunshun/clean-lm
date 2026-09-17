@@ -31,7 +31,6 @@ impl Tensor {
     pub fn new_zeroed(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
-        stream: &Stream,
         cx: &Context,
     ) -> anyhow::Result<Self> {
         let shape = shape.into();
@@ -41,7 +40,7 @@ impl Tensor {
 
         let storage = cx
             .device_memory_pool()
-            .alloc_zeroed_on(allocation_bytes, stream)?;
+            .alloc_zeroed_on(allocation_bytes, cx.memset_stream())?;
 
         Ok(Self {
             virt,

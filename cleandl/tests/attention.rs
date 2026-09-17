@@ -59,56 +59,47 @@ fn attention() -> anyhow::Result<()> {
     let mut q = Tensor::new_zeroed(
         Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
         bf16_type,
-        &stream,
         &cx,
     )?;
     let mut k = Tensor::new_zeroed(
         Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
         bf16_type,
-        &stream,
         &cx,
     )?;
     let mut v = Tensor::new_zeroed(
         Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
         bf16_type,
-        &stream,
         &cx,
     )?;
     let mut out = Tensor::new_zeroed(
         Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
         bf16_type,
-        &stream,
         &cx,
     )?;
     let mut out_stats = Tensor::new_zeroed(
         Shape::new([num_sequences, max_seqlen, Q_HEADS]),
         ElementType::Float(FloatType::F32),
-        &stream,
         &cx,
     )?;
 
     let mut cu_seqlen_q_times_hd_times_qh = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
-        &stream,
         &cx,
     )?;
     let mut cu_seqlen_kv_times_hd_times_kvh = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
-        &stream,
         &cx,
     )?;
     let mut seqlen_q = Tensor::new_zeroed(
         Shape::new([num_sequences]),
         ElementType::SInt(SIntType::S32),
-        &stream,
         &cx,
     )?;
     let mut seqlen_kv = Tensor::new_zeroed(
         Shape::new([num_sequences]),
         ElementType::SInt(SIntType::S32),
-        &stream,
         &cx,
     )?;
 
