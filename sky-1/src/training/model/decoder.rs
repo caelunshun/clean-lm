@@ -529,7 +529,7 @@ impl DecoderExecutor {
             &self.cx,
         )?;
         self.pre_ffn_norm.rmsnorm_forward(
-            x,
+            &o_proj_result.view(),
             &weights.pre_ffn_norm_gamma.bf16_weights().view(),
             &mut pre_ffn_norm_result.view_mut(),
             &mut pre_ffn_norm_r_inv.view_mut(),
@@ -666,7 +666,7 @@ impl DecoderExecutor {
             &self.cx,
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
-            &saves.o_proj_result.view(),
+            &saves.pre_ffn_norm_result.view(),
             &ffn_up_dy.view(),
             &mut ffn_up_dw.view_mut(),
             stream,
@@ -698,7 +698,7 @@ impl DecoderExecutor {
             &self.cx,
         )?;
         self.ffn.backward_up_gate_proj_wgrad(
-            &saves.o_proj_result.view(),
+            &saves.pre_ffn_norm_result.view(),
             &ffn_gate_dy.view(),
             &mut ffn_gate_dw.view_mut(),
             stream,
@@ -898,8 +898,8 @@ impl DecoderExecutor {
             &self.cx,
         )?;
         self.kv_proj_dgrad_with_res.matmul(
-            &dq.view(),
-            &weights.q_proj.bf16_weights().view().transposed(0, 1),
+            &dk.view(),
+            &weights.k_proj.bf16_weights().view().transposed(0, 1),
             Some(&q_ddata.view()),
             &mut k_ddata.view_mut(),
             stream,

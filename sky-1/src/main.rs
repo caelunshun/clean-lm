@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
 
-        break;
+        //  break;
     }
 
     Ok(())

@@ -134,16 +134,12 @@ impl ResourceKey for Sky1ExecutorKey {
 pub struct Sky1SavedTensors {
     embedding_output: Tensor,
     decoder: Vec<DecoderSavedTensors>,
-    logits: Tensor,
+    final_norm_r_inv: Tensor,
     logits_grad: Tensor,
     loss: Tensor,
 }
 
 impl Sky1SavedTensors {
-    pub fn logits(&self) -> &Tensor {
-        &self.logits
-    }
-
     pub fn loss(&self) -> &Tensor {
         &self.loss
     }
@@ -247,7 +243,7 @@ impl Sky1Executor {
         Ok(Sky1SavedTensors {
             embedding_output,
             decoder: decoder_saves,
-            logits: final_norm_result,
+            final_norm_r_inv,
             logits_grad,
             loss,
         })
@@ -292,7 +288,24 @@ impl Sky1Executor {
             stream,
         )?;
 
-        let mut dy = lm_head_ddata;
+        let mut final_norm_ddata = Tensor::new_zeroed(
+            lm_head_ddata.shape(),
+            lm_head_ddata.element_type(),
+            stream,
+            &self.cx,
+        )?;
+        self.final_norm.rmsnorm_backward(
+            &saves.decoder.last().unwrap().output().view(),
+            &lm_head_ddata.view(),
+            None,
+            &weights.final_norm_gamma.bf16_weights_replica.view(),
+            &saves.final_norm_r_inv.view(),
+            &mut final_norm_ddata.view_mut(),
+            &mut weights.final_norm_gamma.gradients.view_mut(),
+            stream,
+        )?;
+
+        let mut dy = final_norm_ddata;
         for i in (0..weights.decoder_blocks.len()).rev() {
             let x = if i == 0 {
                 saves.embedding_output.view()

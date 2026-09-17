@@ -108,10 +108,6 @@ impl EmbeddingExecutor {
         };
         assert_eq!(dl_dout.shape(), Shape::new([num_tokens, embed_dim]));
 
-        // Since we use atomic adds to accumulate the gradients, we need to pre-memset
-        // dl_din to zero.
-        stream.fill(&mut dl_din.storage_mut(), 0u8)?;
-
         let kernel = self
             .module
             .get_function("embedding_scatter_add_bf16in_f32out_32x128")?;
