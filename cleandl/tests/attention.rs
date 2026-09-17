@@ -1,6 +1,8 @@
 use cleandl::{
     context::Context,
-    operators::attention::{AttentionConfig, AttentionExecutor, CuSeqlenTensors},
+    operators::attention::{
+        AttentionConfig, AttentionExecutor, AttentionForwardOutput, CuSeqlenTensors,
+    },
     tensor::Tensor,
 };
 use float_cmp::{ApproxEq, F32Margin};
@@ -71,17 +73,6 @@ fn attention() -> anyhow::Result<()> {
         bf16_type,
         &cx,
     )?;
-    let mut out = Tensor::new_zeroed(
-        Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
-        bf16_type,
-        &cx,
-    )?;
-    let mut out_stats = Tensor::new_zeroed(
-        Shape::new([num_sequences, max_seqlen, Q_HEADS]),
-        ElementType::Float(FloatType::F32),
-        &cx,
-    )?;
-
     let mut cu_seqlen_q_times_hd_times_qh = Tensor::new_zeroed(
         Shape::new([num_sequences + 1]),
         ElementType::SInt(SIntType::S64),
@@ -147,7 +138,7 @@ fn attention() -> anyhow::Result<()> {
         cx.upload_to_device(&seqlens_host, tensor.storage_mut(), &stream)?;
     }
 
-    executor.forward_attn(
+    let AttentionForwardOutput { out, .. } = executor.forward_attn(
         &q.view(),
         &k.view(),
         &v.view(),
@@ -157,8 +148,6 @@ fn attention() -> anyhow::Result<()> {
         },
         &seqlen_q.view(),
         &seqlen_kv.view(),
-        &mut out.view_mut(),
-        &mut out_stats.view_mut(),
         &stream,
     )?;
 

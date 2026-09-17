@@ -1,4 +1,8 @@
-use cleandl::{context::Context, operators::norm::NormExecutor, tensor::Tensor};
+use cleandl::{
+    context::Context,
+    operators::norm::{NormExecutor, RmsNormForwardOutput},
+    tensor::Tensor,
+};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
@@ -77,31 +81,22 @@ fn run_case(
     let residual_gradient_stream = upload(&residual_gradient_stream_host, matrix_shape)?;
     let gamma = upload(&gamma_host, Shape::new([INNER_DIM]))?;
 
-    let mut y = Tensor::new_zeroed(matrix_shape, bf16_type, cx)?;
-    let mut r_inv = Tensor::new_zeroed(Shape::new([BATCH_SIZE]), f32_type, cx)?;
-    let mut dx = Tensor::new_zeroed(matrix_shape, bf16_type, cx)?;
     let mut dgamma = Tensor::new_zeroed(Shape::new([INNER_DIM]), f32_type, cx)?;
 
     let residual_gradient_stream_view = with_residuals.then(|| residual_gradient_stream.view());
 
-    norm.rmsnorm_forward(
-        &prev_layer_output.view(),
-        &gamma.view(),
-        &mut y.view_mut(),
-        &mut r_inv.view_mut(),
-        stream,
-    )?;
+    let RmsNormForwardOutput { y, r_inv } =
+        norm.rmsnorm_forward(&prev_layer_output.view(), &gamma.view(), stream)?;
 
     // The kernel accumulates dgamma atomically.
     stream.fill(&mut dgamma.view_mut().storage_mut(), 0u8)?;
 
-    norm.rmsnorm_backward(
+    let dx = norm.rmsnorm_backward(
         &prev_layer_output.view(),
         &dy.view(),
         residual_gradient_stream_view.as_ref(),
         &gamma.view(),
         &r_inv.view(),
-        &mut dx.view_mut(),
         &mut dgamma.view_mut(),
         stream,
     )?;

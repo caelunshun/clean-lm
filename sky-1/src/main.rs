@@ -43,19 +43,21 @@ fn main() -> anyhow::Result<()> {
         num_decoder_blocks: 1,
     };
 
-    let mut weights = Sky1Weights::new_random(&config, &mut StdRng::seed_from_u64(66), stream, cx)?;
+    let mut rng = StdRng::seed_from_u64(66);
+
+    let mut weights = Sky1Weights::new_random(&config, &mut rng, stream, cx)?;
 
     // --- Dummy batch initialization --- //
     let token_indices = Tensor::from_distr(
         Uniform::<i32>::new(0, config.vocab_size as i32)?,
-        &mut rand::rng(),
+        &mut rng,
         [config.blocks.max_batch_decoder_tokens],
         stream,
         cx,
     )?;
     let labels = Tensor::from_distr(
         Uniform::<i32>::new(0, config.vocab_size as i32)?,
-        &mut rand::rng(),
+        &mut rng,
         [config.blocks.max_batch_decoder_tokens],
         stream,
         cx,

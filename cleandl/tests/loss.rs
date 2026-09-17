@@ -1,4 +1,8 @@
-use cleandl::{context::Context, operators::loss::LossExecutor, tensor::Tensor};
+use cleandl::{
+    context::Context,
+    operators::loss::{CrossEntropyLossOutput, LossExecutor},
+    tensor::Tensor,
+};
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -39,20 +43,9 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
-    let mut stats = Tensor::new_zeroed(
-        Shape::new([BATCH_SIZE]),
-        ElementType::Float(FloatType::F32),
-        &cx,
-    )?;
     let mut labels = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::SInt(SIntType::S32),
-        &cx,
-    )?;
-    let mut loss = Tensor::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &cx)?;
-    let mut logits_grad = Tensor::new_zeroed(
-        Shape::new([BATCH_SIZE, NUM_CLASSES]),
-        ElementType::Float(FloatType::Bf16),
         &cx,
     )?;
 
@@ -67,13 +60,11 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     cx.upload_to_device(&logits_host, logits.storage_mut(), &stream)?;
     cx.upload_to_device(&labels_host, labels.storage_mut(), &stream)?;
 
-    loss_op.online_softmax_stats(&logits.view(), &mut stats.view_mut(), &stream)?;
-    loss_op.cross_entropy_loss_fwd_bwd(
+    let stats = loss_op.online_softmax_stats(&logits.view(), &stream)?;
+    let CrossEntropyLossOutput { loss, logits_grad } = loss_op.cross_entropy_loss_fwd_bwd(
         &logits.view(),
         &stats.view(),
         &labels.view(),
-        &mut loss.view_mut(),
-        &mut logits_grad.view_mut(),
         &stream,
     )?;
 

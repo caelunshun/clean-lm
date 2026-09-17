@@ -1,6 +1,6 @@
 use cleandl::{
     context::Context,
-    operators::swiglu_ffn::{SwiGluConfig, SwiGluFfnExecutor},
+    operators::swiglu_ffn::{GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
     tensor::Tensor,
 };
 use faer::Mat;
@@ -49,9 +49,6 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, cx)?;
     let mut up = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
     let mut weight = Tensor::new_zeroed([IN_FEATURES, INTERMEDIATE_FEATURES], bf16_type, cx)?;
-    let mut out_gate = Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
-    let mut out_activation =
-        Tensor::new_zeroed([BATCH_SIZE, INTERMEDIATE_FEATURES], bf16_type, cx)?;
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (IN_FEATURES as f32).sqrt().recip();
@@ -69,14 +66,10 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     cx.upload_to_device(&weight_host, weight.storage_mut(), &stream)?;
     cx.upload_to_device(&up_host, up.storage_mut(), &stream)?;
 
-    executor.forward_gate_proj(
-        &data.view(),
-        &up.view(),
-        &weight.view(),
-        &mut out_gate.view_mut(),
-        &mut out_activation.view_mut(),
-        &stream,
-    )?;
+    let GateProjForwardOutput {
+        gate: out_gate,
+        activation: out_activation,
+    } = executor.forward_gate_proj(&data.view(), &up.view(), &weight.view(), &stream)?;
 
     // Read the results back to the host.
     let gate_staging = cx.download_from_device(out_gate.storage(), &stream)?;

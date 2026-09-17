@@ -11,7 +11,7 @@ use skytens_core::{
 use crate::{
     context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{TensorView, TensorViewMut, VirtTensorView},
+    tensor::{Tensor, TensorView, VirtTensorView},
 };
 
 /// Matmul executor with optional residual add.
@@ -19,6 +19,7 @@ use crate::{
 pub struct MatmulExecutor {
     #[allow(unused)]
     config: MatmulConfig,
+    cx: Context,
     graph: ExecutableCudnnGraph,
     a: TensorId,
     b: TensorId,
@@ -31,20 +32,22 @@ impl MatmulExecutor {
         cx.get_or_create_resource(config)
     }
 
+    /// Returns the product as a freshly allocated row-major bf16 tensor `[m, n]`.
     pub fn matmul(
         &self,
         a: &TensorView<'_>,
         b: &TensorView<'_>,
         residual: Option<&TensorView>,
-        out: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         let &[m, k] = a.shape().dims_slice() else {
             panic!()
         };
         let &[_, n] = b.shape().dims_slice() else {
             panic!()
         };
+
+        let mut out = Tensor::new_zeroed([m, n], ElementType::Float(FloatType::Bf16), &self.cx)?;
 
         let mut inputs = vec![
             (self.a, a.reshaped([1, m, k])),
@@ -61,7 +64,7 @@ impl MatmulExecutor {
             &mut [(self.out, out.reshaped_mut([1, m, n]))],
             stream,
         )?;
-        Ok(())
+        Ok(out)
     }
 }
 
@@ -127,6 +130,7 @@ impl ResourceKey for MatmulConfig {
 
         Ok(MatmulExecutor {
             config: self.clone(),
+            cx: cx.clone(),
             residual: residual.map(|r| r.uid()),
             graph: graph.build()?,
             a,

@@ -7,7 +7,7 @@ use skytens_core::data_type::{ElementType, FloatType, SIntType};
 use crate::{
     context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{TensorView, TensorViewMut, VirtTensorView},
+    tensor::{Tensor, TensorView, VirtTensorView},
 };
 
 /// Various cumulative sequence length tensors
@@ -28,6 +28,7 @@ pub struct CuSeqlenTensors<'a> {
 #[derive(Debug)]
 pub struct AttentionExecutor {
     config: AttentionConfig,
+    cx: Context,
     forward_graph: ExecutableCudnnGraph,
     forward_input_cu_seqlen_q_times_hd_times_qh: TensorId,
     forward_input_cu_seqlen_kv_times_hd_times_kvh: TensorId,
@@ -54,13 +55,29 @@ pub struct AttentionExecutor {
     backward_output_dv: TensorId,
 }
 
+/// Outputs of [`AttentionExecutor::forward_attn`].
+#[derive(Debug)]
+pub struct AttentionForwardOutput {
+    /// Attention output, row-major bf16 `[T, H, D]` like `q`.
+    pub out: Tensor,
+    /// Softmax stats, row-major f32 `[max_num_sequences, max_q_seqlen, q_heads]`.
+    pub stats: Tensor,
+}
+
+/// Outputs of [`AttentionExecutor::backward_attn`].
+#[derive(Debug)]
+pub struct AttentionBackwardOutput {
+    pub dq: Tensor,
+    pub dk: Tensor,
+    pub dv: Tensor,
+}
+
 impl AttentionExecutor {
     pub fn get(config: AttentionConfig, cx: &Context) -> anyhow::Result<Arc<Self>> {
         cx.get_or_create_resource(config)
     }
 
-    /// Q, K, V, O expected as row-major bf16 [T, H, D].
-    /// Stats expected as row-major f32 [T, H].
+    /// Q, K, V expected as row-major bf16 [T, H, D].
     /// `seqlen_*` expected as s32 [B].
     #[allow(clippy::too_many_arguments)]
     pub fn forward_attn(
@@ -71,11 +88,21 @@ impl AttentionExecutor {
         cu_seqlens: &CuSeqlenTensors<'_>,
         seqlen_q: &TensorView<'_>,
         seqlen_kv: &TensorView<'_>,
-        out: &mut TensorViewMut<'_>,
-        out_stats: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AttentionForwardOutput> {
         let b = self.config.max_num_sequences;
+
+        let mut out = Tensor::new_zeroed(q.shape(), q.element_type(), &self.cx)?;
+        let mut out_stats = Tensor::new_zeroed(
+            [
+                self.config.max_num_sequences,
+                self.config.max_q_seqlen,
+                self.config.q_heads,
+            ],
+            ElementType::Float(FloatType::F32),
+            &self.cx,
+        )?;
+
         self.forward_graph.execute(
             &[
                 (self.forward_input_q, q),
@@ -118,11 +145,14 @@ impl AttentionExecutor {
             ],
             stream,
         )?;
-        Ok(())
+        Ok(AttentionForwardOutput {
+            out,
+            stats: out_stats,
+        })
     }
 
-    /// Q, K, V, O, dO, dQ, dK, dV expected as row-major bf16 [T, H, D].
-    /// Stats expected as row-major f32 [T, H].
+    /// Q, K, V, O, dO expected as row-major bf16 [T, H, D].
+    /// Stats expected as returned by [`Self::forward_attn`].
     /// `seqlen_*` expected as s32 [B].
     #[allow(clippy::too_many_arguments)]
     pub fn backward_attn(
@@ -136,12 +166,14 @@ impl AttentionExecutor {
         out: &TensorView<'_>,
         out_grad: &TensorView<'_>,
         stats: &TensorView<'_>,
-        grad_q: &mut TensorViewMut<'_>,
-        grad_k: &mut TensorViewMut<'_>,
-        grad_v: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<AttentionBackwardOutput> {
         let b = self.config.max_num_sequences;
+
+        let mut grad_q = Tensor::new_zeroed(q.shape(), q.element_type(), &self.cx)?;
+        let mut grad_k = Tensor::new_zeroed(k.shape(), k.element_type(), &self.cx)?;
+        let mut grad_v = Tensor::new_zeroed(v.shape(), v.element_type(), &self.cx)?;
+
         self.backward_graph.execute(
             &[
                 (self.backward_input_q, q),
@@ -188,7 +220,11 @@ impl AttentionExecutor {
             ],
             stream,
         )?;
-        Ok(())
+        Ok(AttentionBackwardOutput {
+            dq: grad_q,
+            dk: grad_k,
+            dv: grad_v,
+        })
     }
 }
 
@@ -396,6 +432,7 @@ impl ResourceKey for AttentionConfig {
 
         Ok(AttentionExecutor {
             config: self.clone(),
+            cx: cx.clone(),
             forward_graph,
             forward_input_cu_seqlen_q_times_hd_times_qh,
             forward_input_cu_seqlen_kv_times_hd_times_kvh,

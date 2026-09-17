@@ -10,12 +10,22 @@ use skytens_core::{
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
-    tensor::{TensorView, TensorViewMut},
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 
 #[derive(Debug)]
 pub struct NormExecutor {
+    cx: Context,
     module: Arc<Module>,
+}
+
+/// Outputs of [`NormExecutor::rmsnorm_forward`].
+#[derive(Debug)]
+pub struct RmsNormForwardOutput {
+    /// Normalized activations, same shape as `x`.
+    pub y: Tensor,
+    /// Per-row inverse RMS, saved for the backward pass.
+    pub r_inv: Tensor,
 }
 
 impl NormExecutor {
@@ -24,55 +34,65 @@ impl NormExecutor {
     }
 
     /// Computes `RMSNorm(x) * gamma`
-    #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_forward(
         &self,
         x: &TensorView<'_>,
         gamma: &TensorView<'_>,
-        out_y: &mut TensorViewMut<'_>,
-        out_r_inv: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RmsNormForwardOutput> {
         let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
         };
 
         check_bf16_matrix(x, batch_size, inner_dim);
-        check_bf16_matrix(&out_y.view(), batch_size, inner_dim);
 
         assert_eq!(gamma.shape().dims_slice(), &[inner_dim]);
         assert_eq!(gamma.element_type(), ElementType::Float(FloatType::Bf16));
 
-        assert_eq!(out_r_inv.element_type(), ElementType::Float(FloatType::F32));
-        assert_eq!(out_r_inv.shape(), Shape::new([batch_size]));
-        assert!(out_r_inv.is_packed_row_major());
+        let mut out_y = Tensor::new_zeroed(
+            Shape::new([batch_size, inner_dim]),
+            ElementType::Float(FloatType::Bf16),
+            &self.cx,
+        )?;
+        let mut out_r_inv = Tensor::new_zeroed(
+            Shape::new([batch_size]),
+            ElementType::Float(FloatType::F32),
+            &self.cx,
+        )?;
 
         let kernel_name = fwd_kernel_name(inner_dim)?;
         let kernel = self.module.get_function(kernel_name)?;
 
         let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
-        let x_memory = x.storage();
-        let gamma_memory = gamma.storage();
-        let mut out_y_memory = out_y.storage_mut();
-        let mut out_r_inv_memory = out_r_inv.storage_mut();
+        {
+            let x_memory = x.storage();
+            let gamma_memory = gamma.storage();
+            let out_y_memory = out_y.storage_mut();
+            let out_r_inv_memory = out_r_inv.storage_mut();
 
-        let mut launch = stream.launch_builder(&kernel);
-        launch.arg(x_memory)?;
-        launch
-            .arg(gamma_memory)?
-            .arg(&mut out_y_memory)?
-            .arg(&mut out_r_inv_memory)?
-            .arg(i32::try_from(batch_size)?)?;
+            let mut launch = stream.launch_builder(&kernel);
+            launch
+                .arg(x_memory)?
+                .arg(gamma_memory)?
+                .arg(out_y_memory)?
+                .arg(out_r_inv_memory)?
+                .arg(i32::try_from(batch_size)?)?;
 
-        unsafe {
-            launch.launch(occupancy as u32, 1, 1)?;
+            unsafe {
+                launch.launch(occupancy as u32, 1, 1)?;
+            }
         }
 
-        Ok(())
+        Ok(RmsNormForwardOutput {
+            y: out_y,
+            r_inv: out_r_inv,
+        })
     }
 
-    /// Backward pass for [`Self::rms_prenorm_forward`]. `out_dgamma` must be pre-zeroed
+    /// Backward pass for [`Self::rmsnorm_forward`], returning `dx`.
+    ///
+    /// `out_dgamma` is accumulated into by the kernel, so it must be pre-zeroed.
     #[allow(clippy::too_many_arguments)]
     pub fn rmsnorm_backward(
         &self,
@@ -81,10 +101,9 @@ impl NormExecutor {
         residual_gradient_stream: Option<&TensorView<'_>>,
         gamma: &TensorView<'_>,
         r_inv: &TensorView<'_>,
-        out_dx: &mut TensorViewMut<'_>,
         out_dgamma: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
         };
@@ -94,7 +113,6 @@ impl NormExecutor {
         if let Some(residual_gradient_stream) = residual_gradient_stream {
             check_bf16_matrix(residual_gradient_stream, batch_size, inner_dim);
         }
-        check_bf16_matrix(&out_dx.view(), batch_size, inner_dim);
 
         assert_eq!(gamma.shape().dims_slice(), &[inner_dim]);
         assert_eq!(gamma.element_type(), ElementType::Float(FloatType::Bf16));
@@ -110,38 +128,46 @@ impl NormExecutor {
         assert_eq!(out_dgamma.shape(), Shape::new([inner_dim]));
         assert!(out_dgamma.is_packed_row_major());
 
+        let mut out_dx = Tensor::new_zeroed(
+            Shape::new([batch_size, inner_dim]),
+            ElementType::Float(FloatType::Bf16),
+            &self.cx,
+        )?;
+
         let kernel_name = bwd_kernel_name(inner_dim)?;
         let kernel = self.module.get_function(kernel_name)?;
 
         let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
 
-        let x_memory = x.storage();
-        let dy_memory = dy.storage();
-        let residual_gradient_stream_memory = residual_gradient_stream.map(|t| t.storage());
-        let gamma_memory = gamma.storage();
-        let r_inv_memory = r_inv.storage();
-        let mut out_dx_memory = out_dx.storage_mut();
-        let mut out_dgamma_memory = out_dgamma.storage_mut();
+        {
+            let x_memory = x.storage();
+            let dy_memory = dy.storage();
+            let residual_gradient_stream_memory = residual_gradient_stream.map(|t| t.storage());
+            let gamma_memory = gamma.storage();
+            let r_inv_memory = r_inv.storage();
+            let out_dx_memory = out_dx.storage_mut();
+            let out_dgamma_memory = out_dgamma.storage_mut();
 
-        let mut launch = stream.launch_builder(&kernel);
-        launch.arg(x_memory)?;
-        launch.arg(dy_memory)?;
-        match residual_gradient_stream_memory {
-            Some(memory) => launch.arg(memory)?,
-            None => launch.arg(NULL_POINTER)?,
-        };
-        launch
-            .arg(gamma_memory)?
-            .arg(r_inv_memory)?
-            .arg(&mut out_dx_memory)?
-            .arg(&mut out_dgamma_memory)?
-            .arg(i32::try_from(batch_size)?)?;
-        // Block dim and smem are overriden by TileIR.
-        unsafe {
-            launch.launch(occupancy as u32, 1, 1)?;
+            let mut launch = stream.launch_builder(&kernel);
+            launch.arg(x_memory)?;
+            launch.arg(dy_memory)?;
+            match residual_gradient_stream_memory {
+                Some(memory) => launch.arg(memory)?,
+                None => launch.arg(NULL_POINTER)?,
+            };
+            launch
+                .arg(gamma_memory)?
+                .arg(r_inv_memory)?
+                .arg(out_dx_memory)?
+                .arg(out_dgamma_memory)?
+                .arg(i32::try_from(batch_size)?)?;
+            // Block dim and smem are overriden by TileIR.
+            unsafe {
+                launch.launch(occupancy as u32, 1, 1)?;
+            }
         }
 
-        Ok(())
+        Ok(out_dx)
     }
 }
 
@@ -175,6 +201,7 @@ impl ResourceKey for NormExecutorKey {
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         Ok(NormExecutor {
+            cx: cx.clone(),
             module: cx.get_or_create_resource(include_cubins!("../../cutile-kernels/norm"))?,
         })
     }

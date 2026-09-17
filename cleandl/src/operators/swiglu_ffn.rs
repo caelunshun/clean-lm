@@ -9,7 +9,7 @@ use crate::{
     context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
-    tensor::{TensorView, TensorViewMut, VirtTensorView},
+    tensor::{Tensor, TensorView, VirtTensorView},
 };
 
 /// SwiGLU FFN forward and backward pass executor.
@@ -20,6 +20,7 @@ use crate::{
 #[derive(Debug)]
 pub struct SwiGluFfnExecutor {
     config: SwiGluConfig,
+    cx: Context,
     fwd_up_proj: Arc<MatmulExecutor>,
     fwd_down_proj: Arc<MatmulExecutor>,
 
@@ -49,6 +50,22 @@ pub struct SwiGluFfnExecutor {
     bwd_down_proj_dgrad_out_dup: TensorId,
 }
 
+/// Outputs of [`SwiGluFfnExecutor::forward_gate_proj`].
+#[derive(Debug)]
+pub struct GateProjForwardOutput {
+    /// Gate projection, before the activation.
+    pub gate: Tensor,
+    /// `swish(gate) * up`, the input to the down projection.
+    pub activation: Tensor,
+}
+
+/// Outputs of [`SwiGluFfnExecutor::backward_down_proj_dgrad`].
+#[derive(Debug)]
+pub struct DownProjDgradOutput {
+    pub dgate: Tensor,
+    pub dup: Tensor,
+}
+
 impl SwiGluFfnExecutor {
     pub fn get(config: SwiGluConfig, cx: &Context) -> anyhow::Result<Arc<Self>> {
         cx.get_or_create_resource(config)
@@ -58,14 +75,14 @@ impl SwiGluFfnExecutor {
         self.config
     }
 
+    /// Returns the up projection `[batch_size, intermediate_features]`.
     pub fn forward_up_proj(
         &self,
         data: &TensorView<'_>,
         weight: &TensorView<'_>,
-        out_up: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
-        self.fwd_up_proj.matmul(data, weight, None, out_up, stream)
+    ) -> anyhow::Result<Tensor> {
+        self.fwd_up_proj.matmul(data, weight, None, stream)
     }
 
     /// Gate projection fused with swish + hadamard product.
@@ -74,10 +91,11 @@ impl SwiGluFfnExecutor {
         data: &TensorView<'_>,
         up: &TensorView<'_>,
         weight: &TensorView<'_>,
-        out_gate: &mut TensorViewMut<'_>,
-        out_activation: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<GateProjForwardOutput> {
+        let mut out_gate = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
+        let mut out_activation = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
+
         self.fwd_fused_gate_graph.execute(
             &[
                 (self.fwd_fused_gate_data, &data.unsqueezed()),
@@ -92,32 +110,37 @@ impl SwiGluFfnExecutor {
                 ),
             ],
             stream,
-        )
+        )?;
+
+        Ok(GateProjForwardOutput {
+            gate: out_gate,
+            activation: out_activation,
+        })
     }
 
+    /// Returns the FFN output `[batch_size, out_features]`, with the residual added.
     pub fn forward_down_proj(
         &self,
         activation: &TensorView<'_>,
         weight: &TensorView<'_>,
         residual: &TensorView<'_>,
-        out: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.fwd_down_proj
-            .matmul(activation, weight, Some(residual), out, stream)
+            .matmul(activation, weight, Some(residual), stream)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn backward_down_proj_dgrad(
         &self,
         weight: &TensorView<'_>,
         dy: &TensorView<'_>,
         gate: &TensorView<'_>,
         up: &TensorView<'_>,
-        out_dgate: &mut TensorViewMut<'_>,
-        out_dup: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<DownProjDgradOutput> {
+        let mut out_dgate = Tensor::new_zeroed(gate.shape(), gate.element_type(), &self.cx)?;
+        let mut out_dup = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
+
         self.bwd_down_proj_dgrad_graph.execute(
             &[
                 (
@@ -136,50 +159,60 @@ impl SwiGluFfnExecutor {
                 (self.bwd_down_proj_dgrad_out_dup, out_dup.unsqueezed_mut()),
             ],
             stream,
-        )
+        )?;
+
+        Ok(DownProjDgradOutput {
+            dgate: out_dgate,
+            dup: out_dup,
+        })
     }
 
+    /// Returns the down-projection weight gradient
+    /// `[intermediate_features, out_features]`.
     pub fn backward_down_proj_wgrad(
         &self,
         activation: &TensorView<'_>,
         dy: &TensorView<'_>,
-        out_dweight: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.bwd_down_proj_wgrad
-            .matmul(&activation.transposed(0, 1), dy, None, out_dweight, stream)
+            .matmul(&activation.transposed(0, 1), dy, None, stream)
     }
 
+    /// Returns an up- or gate-projection weight gradient
+    /// `[in_features, intermediate_features]`.
     pub fn backward_up_gate_proj_wgrad(
         &self,
         data: &TensorView<'_>,
         dout: &TensorView<'_>,
-        out_dweight: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.bwd_up_gate_proj_wgrad
-            .matmul(&data.transposed(0, 1), dout, None, out_dweight, stream)
+            .matmul(&data.transposed(0, 1), dout, None, stream)
     }
 
+    /// Returns the up-projection data gradient `[batch_size, in_features]`.
     pub fn backward_up_proj_dgrad(
         &self,
         dout: &TensorView<'_>,
         weight: &TensorView<'_>,
-        out_ddata: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.bwd_up_proj_dgrad
-            .matmul(dout, &weight.transposed(0, 1), None, out_ddata, stream)
+            .matmul(dout, &weight.transposed(0, 1), None, stream)
     }
 
+    /// Returns the total FFN data gradient `[batch_size, in_features]`, summing the
+    /// gate-projection dgrad with `ddata_up`.
     pub fn backward_gate_proj_dgrad(
         &self,
         dout: &TensorView<'_>,
         weight: &TensorView<'_>,
         ddata_up: &TensorView<'_>,
-        out_dffn: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
+        let mut out_dffn = Tensor::new_zeroed(ddata_up.shape(), ddata_up.element_type(), &self.cx)?;
+
         self.bwd_gate_proj_dgrad_graph.execute(
             &[
                 (self.bwd_gate_proj_dgrad_dgate, &dout.unsqueezed()),
@@ -192,7 +225,7 @@ impl SwiGluFfnExecutor {
             &mut [(self.bwd_gate_proj_dgrad_out_dffn, out_dffn.unsqueezed_mut())],
             stream,
         )?;
-        Ok(())
+        Ok(out_dffn)
     }
 }
 
@@ -417,6 +450,7 @@ impl ResourceKey for SwiGluConfig {
 
         Ok(SwiGluFfnExecutor {
             config: *self,
+            cx: cx.clone(),
             fwd_up_proj,
             fwd_down_proj,
             fwd_fused_gate_graph,

@@ -4,20 +4,22 @@ use cleandl::{
     context::{Context, ResourceKey},
     operators::{
         adamw::AdamWExecutor,
-        attention::{AttentionConfig, AttentionExecutor, CuSeqlenTensors},
+        attention::{
+            AttentionBackwardOutput, AttentionConfig, AttentionExecutor, AttentionForwardOutput,
+            CuSeqlenTensors,
+        },
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
         matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
-        norm::NormExecutor,
+        norm::{NormExecutor, RmsNormForwardOutput},
         rope::{RopeConfig, RopeExecutor},
-        swiglu_ffn::{SwiGluConfig, SwiGluFfnExecutor},
+        swiglu_ffn::{DownProjDgradOutput, GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
     },
     tensor::{Tensor, TensorView},
 };
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
-use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
@@ -27,7 +29,6 @@ use crate::{
 #[derive(Debug)]
 pub struct DecoderExecutor {
     config: BlocksConfig,
-    cx: Context,
     pre_qkv_norm: Arc<NormExecutor>,
     q_proj: Arc<LinearExecutor>,
     k_proj: Arc<LinearExecutor>,
@@ -146,7 +147,6 @@ impl ResourceKey for DecoderExecutorKey {
 
         Ok(DecoderExecutor {
             config: self.config.clone(),
-            cx: cx.clone(),
             pre_qkv_norm,
             q_proj,
             k_proj,
@@ -322,64 +322,31 @@ impl DecoderExecutor {
         assert_eq!(hidden_size, self.config.hidden_size);
 
         // --- Attention pre-norm --- //
-        let mut pre_qkv_norm_r_inv =
-            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut pre_qkv_norm_result = Tensor::new_zeroed(
-            [batch_size, self.config.hidden_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.pre_qkv_norm.rmsnorm_forward(
+        let RmsNormForwardOutput {
+            y: pre_qkv_norm_result,
+            r_inv: pre_qkv_norm_r_inv,
+        } = self.pre_qkv_norm.rmsnorm_forward(
             x,
             &weights.pre_qkv_norm_gamma.bf16_weights().view(),
-            &mut pre_qkv_norm_result.view_mut(),
-            &mut pre_qkv_norm_r_inv.view_mut(),
             stream,
         )?;
 
         // --- QKV projection --- //
-        let mut q_proj_result = Tensor::new_zeroed(
-            [
-                batch_size,
-                self.config.head_dim * self.config.num_decoder_q_heads,
-            ],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.q_proj.forward(
+        let q_proj_result = self.q_proj.forward(
             &pre_qkv_norm_result.view(),
             &weights.q_proj.bf16_weights().view(),
-            &mut q_proj_result.view_mut(),
             stream,
         )?;
 
-        let mut k_proj_result = Tensor::new_zeroed(
-            [
-                batch_size,
-                self.config.head_dim * self.config.num_decoder_kv_heads,
-            ],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.k_proj.forward(
+        let k_proj_result = self.k_proj.forward(
             &pre_qkv_norm_result.view(),
             &weights.k_proj.bf16_weights().view(),
-            &mut k_proj_result.view_mut(),
             stream,
         )?;
 
-        let mut v_proj_result = Tensor::new_zeroed(
-            [
-                batch_size,
-                self.config.head_dim * self.config.num_decoder_kv_heads,
-            ],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.v_proj.forward(
+        let v_proj_result = self.v_proj.forward(
             &pre_qkv_norm_result.view(),
             &weights.v_proj.bf16_weights().view(),
-            &mut v_proj_result.view_mut(),
             stream,
         )?;
 
@@ -443,21 +410,10 @@ impl DecoderExecutor {
         //     self.config.head_dim
         //         * (self.config.num_decoder_q_heads + self.config.num_decoder_kv_heads)..,
         // );
-        let mut attn_result = Tensor::new_zeroed(
-            q_proj_result.shape(),
-            q_proj_result.element_type(),
-            &self.cx,
-        )?;
-        let mut attn_stats = Tensor::new_zeroed(
-            [
-                self.config.max_num_sequences,
-                self.config.max_decoder_seqlen,
-                self.config.num_decoder_q_heads,
-            ],
-            ElementType::Float(FloatType::F32),
-            &self.cx,
-        )?;
-        self.attention.forward_attn(
+        let AttentionForwardOutput {
+            out: attn_result,
+            stats: attn_stats,
+        } = self.attention.forward_attn(
             &q_proj_result.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads,
@@ -483,82 +439,51 @@ impl DecoderExecutor {
             },
             &meta_tensors.decoder_seqlen.view(),
             &meta_tensors.decoder_seqlen.view(),
-            &mut attn_result.reshaped_mut([
-                batch_size,
-                self.config.num_decoder_q_heads,
-                self.config.head_dim,
-            ]),
-            &mut attn_stats.view_mut(),
             stream,
         )?;
 
         // --- O-proj --- //
-        let mut o_proj_result = Tensor::new_zeroed(x.shape(), x.element_type(), &self.cx)?;
-        self.o_proj.forward_with_residual(
+        let o_proj_result = self.o_proj.forward_with_residual(
             &attn_result.reshaped([
                 batch_size,
                 self.config.head_dim * self.config.num_decoder_q_heads,
             ]),
             &weights.o_proj.bf16_weights().view(),
             x,
-            &mut o_proj_result.view_mut(),
             stream,
         )?;
 
         // --- FFN pre-norm --- //
-        let mut pre_ffn_norm_r_inv =
-            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut pre_ffn_norm_result = Tensor::new_zeroed(
-            [batch_size, self.config.hidden_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.pre_ffn_norm.rmsnorm_forward(
+        let RmsNormForwardOutput {
+            y: pre_ffn_norm_result,
+            r_inv: pre_ffn_norm_r_inv,
+        } = self.pre_ffn_norm.rmsnorm_forward(
             &o_proj_result.view(),
             &weights.pre_ffn_norm_gamma.bf16_weights().view(),
-            &mut pre_ffn_norm_result.view_mut(),
-            &mut pre_ffn_norm_r_inv.view_mut(),
             stream,
         )?;
 
         // --- FFN --- //
-        let mut ffn_up_result = Tensor::new_zeroed(
-            [batch_size, self.config.ffn_intermediate_size],
-            x.element_type(),
-            &self.cx,
-        )?;
-        self.ffn.forward_up_proj(
+        let ffn_up_result = self.ffn.forward_up_proj(
             &pre_ffn_norm_result.view(),
             &weights.ffn_up.bf16_weights().view(),
-            &mut ffn_up_result.view_mut(),
             stream,
         )?;
 
-        let mut ffn_gate_result = Tensor::new_zeroed(
-            [batch_size, self.config.ffn_intermediate_size],
-            x.element_type(),
-            &self.cx,
-        )?;
-        let mut ffn_gate_activation_result = Tensor::new_zeroed(
-            [batch_size, self.config.ffn_intermediate_size],
-            x.element_type(),
-            &self.cx,
-        )?;
-        self.ffn.forward_gate_proj(
+        let GateProjForwardOutput {
+            gate: ffn_gate_result,
+            activation: ffn_gate_activation_result,
+        } = self.ffn.forward_gate_proj(
             &pre_ffn_norm_result.view(),
             &ffn_up_result.view(),
             &weights.ffn_gate.bf16_weights().view(),
-            &mut ffn_gate_result.view_mut(),
-            &mut ffn_gate_activation_result.view_mut(),
             stream,
         )?;
 
-        let mut ffn_down_result = Tensor::new_zeroed(x.shape(), x.element_type(), &self.cx)?;
-        self.ffn.forward_down_proj(
+        let ffn_down_result = self.ffn.forward_down_proj(
             &ffn_gate_activation_result.view(),
             &weights.ffn_down.bf16_weights().view(),
             &o_proj_result.view(),
-            &mut ffn_down_result.view_mut(),
             stream,
         )?;
 
@@ -596,18 +521,14 @@ impl DecoderExecutor {
         let &[batch_size, _] = dy.shape().dims_slice() else {
             panic!()
         };
+        let q_features = self.config.head_dim * self.config.num_decoder_q_heads;
+        let kv_features = self.config.head_dim * self.config.num_decoder_kv_heads;
 
         // --- FFN down --- //
 
-        let mut ffn_down_dw = Tensor::new_zeroed(
-            weights.ffn_down.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_down_proj_wgrad(
+        let ffn_down_dw = self.ffn.backward_down_proj_wgrad(
             &saves.ffn_gate_activation_result.view(),
             dy,
-            &mut ffn_down_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
@@ -616,36 +537,21 @@ impl DecoderExecutor {
             stream,
         )?;
 
-        let mut ffn_gate_dy = Tensor::new_zeroed(
-            [batch_size, self.config.ffn_intermediate_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        let mut ffn_up_dy = Tensor::new_zeroed(
-            [batch_size, self.config.ffn_intermediate_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_down_proj_dgrad(
+        let DownProjDgradOutput {
+            dgate: ffn_gate_dy,
+            dup: ffn_up_dy,
+        } = self.ffn.backward_down_proj_dgrad(
             &weights.ffn_down.bf16_weights().view(),
             dy,
             &saves.ffn_gate_result.view(),
             &saves.ffn_up_result.view(),
-            &mut ffn_gate_dy.view_mut(),
-            &mut ffn_up_dy.view_mut(),
             stream,
         )?;
 
         // --- FFN up ---
-        let mut ffn_up_dw = Tensor::new_zeroed(
-            weights.ffn_up.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_up_gate_proj_wgrad(
+        let ffn_up_dw = self.ffn.backward_up_gate_proj_wgrad(
             &saves.pre_ffn_norm_result.view(),
             &ffn_up_dy.view(),
-            &mut ffn_up_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
@@ -654,28 +560,16 @@ impl DecoderExecutor {
             stream,
         )?;
 
-        let mut ffn_up_dx = Tensor::new_zeroed(
-            [batch_size, self.config.hidden_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_up_proj_dgrad(
+        let ffn_up_dx = self.ffn.backward_up_proj_dgrad(
             &ffn_up_dy.view(),
             &weights.ffn_up.bf16_weights().view(),
-            &mut ffn_up_dx.view_mut(),
             stream,
         )?;
 
         // --- FFN gate ---
-        let mut ffn_gate_dw = Tensor::new_zeroed(
-            weights.ffn_gate.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_up_gate_proj_wgrad(
+        let ffn_gate_dw = self.ffn.backward_up_gate_proj_wgrad(
             &saves.pre_ffn_norm_result.view(),
             &ffn_gate_dy.view(),
-            &mut ffn_gate_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
@@ -684,80 +578,43 @@ impl DecoderExecutor {
             stream,
         )?;
 
-        let mut ffn_dx = Tensor::new_zeroed(
-            saves.pre_ffn_norm_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.ffn.backward_gate_proj_dgrad(
+        let ffn_dx = self.ffn.backward_gate_proj_dgrad(
             &ffn_gate_dy.view(),
             &weights.ffn_gate.bf16_weights().view(),
             &ffn_up_dx.view(),
-            &mut ffn_dx.view_mut(),
             stream,
         )?;
 
         // --- FFN pre-norm --- //
-        let mut pre_ffn_norm_dx =
-            Tensor::new_zeroed(ffn_dx.shape(), ffn_dx.element_type(), &self.cx)?;
-        self.pre_ffn_norm.rmsnorm_backward(
+        let pre_ffn_norm_dx = self.pre_ffn_norm.rmsnorm_backward(
             &saves.o_proj_result.view(),
             &ffn_dx.view(),
             Some(dy),
             &weights.pre_ffn_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_ffn_norm_r_inv.view(),
-            &mut pre_ffn_norm_dx.view_mut(),
             &mut weights.pre_ffn_norm_gamma.gradients.view_mut(),
             stream,
         )?;
 
         // --- O-proj --- //
-        let mut o_proj_dw = Tensor::new_zeroed(
-            weights.o_proj.bf16_weights().shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.o_proj.backward_wgrad(
-            &saves.attn_result.view(),
-            &pre_ffn_norm_dx.view(),
-            &mut o_proj_dw.view_mut(),
-            stream,
-        )?;
+        let attn_result = saves.attn_result.reshaped([batch_size, q_features]);
+        let o_proj_dw =
+            self.o_proj
+                .backward_wgrad(&attn_result, &pre_ffn_norm_dx.view(), stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &o_proj_dw.view(),
             &mut weights.o_proj.gradients.view_mut(),
             stream,
         )?;
 
-        let mut o_proj_dx = Tensor::new_zeroed(
-            saves.attn_result.shape(),
-            saves.attn_result.element_type(),
-            &self.cx,
-        )?;
-        self.o_proj.backward_dgrad(
+        let o_proj_dx = self.o_proj.backward_dgrad(
             &pre_ffn_norm_dx.view(),
             &weights.o_proj.bf16_weights().view(),
-            &mut o_proj_dx.view_mut(),
             stream,
         )?;
 
         // --- Attention --- //
-        let mut dq = Tensor::new_zeroed(
-            saves.q_proj_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        let mut dk = Tensor::new_zeroed(
-            saves.k_proj_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        let mut dv = Tensor::new_zeroed(
-            saves.v_proj_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.attention.backward_attn(
+        let AttentionBackwardOutput { dq, dk, dv } = self.attention.backward_attn(
             &saves.q_proj_result.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads,
@@ -783,133 +640,70 @@ impl DecoderExecutor {
             },
             &meta_tensors.decoder_seqlen.view(),
             &meta_tensors.decoder_seqlen.view(),
-            &saves.attn_result.reshaped([
-                batch_size,
-                self.config.num_decoder_q_heads,
-                self.config.head_dim,
-            ]),
+            &saves.attn_result.view(),
             &o_proj_dx.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads,
                 self.config.head_dim,
             ]),
             &saves.attn_stats.view(),
-            &mut dq.reshaped_mut([
-                batch_size,
-                self.config.num_decoder_q_heads,
-                self.config.head_dim,
-            ]),
-            &mut dk.reshaped_mut([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &mut dv.reshaped_mut([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
             stream,
         )?;
+        let dq = dq.reshaped([batch_size, q_features]);
+        let dk = dk.reshaped([batch_size, kv_features]);
+        let dv = dv.reshaped([batch_size, kv_features]);
 
         // --- QKV-proj --- //
-        let mut dwq = Tensor::new_zeroed(
-            weights.q_proj.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.q_proj.backward_wgrad(
-            &saves.pre_qkv_norm_result.view(),
-            &dq.view(),
-            &mut dwq.view_mut(),
-            stream,
-        )?;
+        let dwq = self
+            .q_proj
+            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dq, stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &dwq.view(),
             &mut weights.q_proj.gradients.view_mut(),
             stream,
         )?;
-        let mut q_ddata = Tensor::new_zeroed(
-            saves.pre_qkv_norm_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.q_proj.backward_dgrad(
-            &dq.view(),
-            &weights.q_proj.bf16_weights().view(),
-            &mut q_ddata.view_mut(),
-            stream,
-        )?;
+        let q_ddata =
+            self.q_proj
+                .backward_dgrad(&dq, &weights.q_proj.bf16_weights().view(), stream)?;
 
-        let mut dwk = Tensor::new_zeroed(
-            weights.k_proj.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.k_proj.backward_wgrad(
-            &saves.pre_qkv_norm_result.view(),
-            &dk.view(),
-            &mut dwk.view_mut(),
-            stream,
-        )?;
+        let dwk = self
+            .k_proj
+            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dk, stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &dwk.view(),
             &mut weights.k_proj.gradients.view_mut(),
             stream,
         )?;
-        let mut k_ddata = Tensor::new_zeroed(
-            saves.pre_qkv_norm_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.kv_proj_dgrad_with_res.matmul(
-            &dk.view(),
+        let k_ddata = self.kv_proj_dgrad_with_res.matmul(
+            &dk,
             &weights.k_proj.bf16_weights().view().transposed(0, 1),
             Some(&q_ddata.view()),
-            &mut k_ddata.view_mut(),
             stream,
         )?;
 
-        let mut dwv = Tensor::new_zeroed(
-            weights.v_proj.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.v_proj.backward_wgrad(
-            &saves.pre_qkv_norm_result.view(),
-            &dv.view(),
-            &mut dwv.view_mut(),
-            stream,
-        )?;
+        let dwv = self
+            .v_proj
+            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dv, stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &dwv.view(),
             &mut weights.v_proj.gradients.view_mut(),
             stream,
         )?;
-        let mut qkv_ddata = Tensor::new_zeroed(
-            saves.pre_qkv_norm_result.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.kv_proj_dgrad_with_res.matmul(
-            &dv.view(),
+        let qkv_ddata = self.kv_proj_dgrad_with_res.matmul(
+            &dv,
             &weights.v_proj.bf16_weights().view().transposed(0, 1),
             Some(&k_ddata.view()),
-            &mut qkv_ddata.view_mut(),
             stream,
         )?;
 
         // --- Pre-QKV norm --- //
 
-        let mut pre_qkv_ddata =
-            Tensor::new_zeroed(x.shape(), ElementType::Float(FloatType::Bf16), &self.cx)?;
-        self.pre_qkv_norm.rmsnorm_backward(
+        let pre_qkv_ddata = self.pre_qkv_norm.rmsnorm_backward(
             x,
             &qkv_ddata.view(),
             Some(&pre_ffn_norm_dx.view()),
             &weights.pre_qkv_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_qkv_norm_r_inv.view(),
-            &mut pre_qkv_ddata.view_mut(),
             &mut weights.pre_qkv_norm_gamma.gradients.view_mut(),
             stream,
         )?;

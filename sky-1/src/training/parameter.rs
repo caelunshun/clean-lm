@@ -51,16 +51,8 @@ impl Parameter {
         stream: &Stream,
         cx: &Context,
     ) -> anyhow::Result<Self> {
-        let mut bf16_weights_replica = Tensor::new_zeroed(
-            initial_master_weights.shape(),
-            ElementType::Float(FloatType::Bf16),
-            cx,
-        )?;
-        ConversionExecutor::get(cx)?.f32_to_bf16(
-            &initial_master_weights.view(),
-            &mut bf16_weights_replica.view_mut(),
-            stream,
-        )?;
+        let bf16_weights_replica =
+            ConversionExecutor::get(cx)?.f32_to_bf16(&initial_master_weights.view(), stream)?;
 
         let adam_m = Tensor::new_zeroed(
             initial_master_weights.shape(),

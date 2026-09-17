@@ -6,7 +6,7 @@ use skycuda::stream::Stream;
 use crate::{
     context::{Context, ResourceKey},
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
-    tensor::{TensorView, TensorViewMut},
+    tensor::{Tensor, TensorView},
 };
 
 #[derive(Debug)]
@@ -26,47 +26,47 @@ impl LinearExecutor {
         self.config
     }
 
+    /// Returns the output activations `[batch_size, out_features]`.
     pub fn forward(
         &self,
         data: &TensorView<'_>,
         weight: &TensorView<'_>,
-        out: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
-        self.fwd.matmul(data, weight, None, out, stream)
+    ) -> anyhow::Result<Tensor> {
+        self.fwd.matmul(data, weight, None, stream)
     }
 
+    /// Returns the output activations `[batch_size, out_features]`.
     pub fn forward_with_residual(
         &self,
         data: &TensorView,
         weight: &TensorView,
         residual: &TensorView,
-        out: &mut TensorViewMut,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
-        self.fwd.matmul(data, weight, Some(residual), out, stream)
+    ) -> anyhow::Result<Tensor> {
+        self.fwd.matmul(data, weight, Some(residual), stream)
     }
 
+    /// Returns the data gradient `[batch_size, in_features]`.
     pub fn backward_dgrad(
         &self,
         dy: &TensorView<'_>,
         weight: &TensorView<'_>,
-        out_ddata: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.bwd_dgrad
-            .matmul(dy, &weight.transposed(0, 1), None, out_ddata, stream)
+            .matmul(dy, &weight.transposed(0, 1), None, stream)
     }
 
+    /// Returns the weight gradient `[in_features, out_features]`.
     pub fn backward_wgrad(
         &self,
         data: &TensorView<'_>,
         dy: &TensorView<'_>,
-        out_dweight: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Tensor> {
         self.bwd_wgrad
-            .matmul(&data.transposed(0, 1), dy, None, out_dweight, stream)
+            .matmul(&data.transposed(0, 1), dy, None, stream)
     }
 }
 

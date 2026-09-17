@@ -7,8 +7,8 @@ use cleandl::{
         embedding::EmbeddingExecutor,
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
-        loss::LossExecutor,
-        norm::NormExecutor,
+        loss::{CrossEntropyLossOutput, LossExecutor},
+        norm::{NormExecutor, RmsNormForwardOutput},
     },
     tensor::{Tensor, TensorView},
 };
@@ -75,6 +75,7 @@ impl Sky1Weights {
 
 #[derive(Debug)]
 pub struct Sky1Executor {
+    #[expect(unused)]
     config: Sky1Config,
     cx: Context,
     embedding: Arc<EmbeddingExecutor>,
@@ -155,19 +156,9 @@ impl Sky1Executor {
         weights: &Sky1Weights,
         stream: &Stream,
     ) -> anyhow::Result<Sky1SavedTensors> {
-        let &[batch_size] = token_indices.shape().dims_slice() else {
-            panic!()
-        };
-
-        let mut embedding_output = Tensor::new_zeroed(
-            [batch_size, self.config.blocks.hidden_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.embedding.embedding_lookup(
+        let embedding_output = self.embedding.embedding_lookup(
             &weights.embeddings.master_weights.view(),
             token_indices,
-            &mut embedding_output.view_mut(),
             stream,
         )?;
 
@@ -189,43 +180,26 @@ impl Sky1Executor {
 
         let output = decoder_saves.last().unwrap().output().view();
 
-        let mut final_norm_r_inv =
-            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut final_norm_result =
-            Tensor::new_zeroed(output.shape(), output.element_type(), &self.cx)?;
-        self.final_norm.rmsnorm_forward(
+        let RmsNormForwardOutput {
+            y: final_norm_result,
+            r_inv: final_norm_r_inv,
+        } = self.final_norm.rmsnorm_forward(
             &output,
             &weights.final_norm_gamma.bf16_weights().view(),
-            &mut final_norm_result.view_mut(),
-            &mut final_norm_r_inv.view_mut(),
             stream,
         )?;
 
-        let mut logits = Tensor::new_zeroed(
-            [batch_size, self.config.vocab_size],
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.lm_head.forward(
+        let logits = self.lm_head.forward(
             &final_norm_result.view(),
             &weights.lm_head.bf16_weights().view(),
-            &mut logits.view_mut(),
             stream,
         )?;
 
-        let mut loss_stats =
-            Tensor::new_zeroed([batch_size], ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut loss = Tensor::new_zeroed([], ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut logits_grad = Tensor::new_zeroed(logits.shape(), logits.element_type(), &self.cx)?;
-
-        self.loss
-            .online_softmax_stats(&logits.view(), &mut loss_stats.view_mut(), stream)?;
-        self.loss.cross_entropy_loss_fwd_bwd(
+        let loss_stats = self.loss.online_softmax_stats(&logits.view(), stream)?;
+        let CrossEntropyLossOutput { loss, logits_grad } = self.loss.cross_entropy_loss_fwd_bwd(
             &logits.view(),
             &loss_stats.view(),
             labels,
-            &mut loss.view_mut(),
-            &mut logits_grad.view_mut(),
             stream,
         )?;
 
@@ -247,15 +221,9 @@ impl Sky1Executor {
         saves: &Sky1SavedTensors,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        let mut lm_head_dw = Tensor::new_zeroed(
-            weights.lm_head.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.lm_head.backward_wgrad(
+        let lm_head_dw = self.lm_head.backward_wgrad(
             &saves.final_norm_result.view(),
             &saves.logits_grad.view(),
-            &mut lm_head_dw.view_mut(),
             stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
@@ -264,30 +232,18 @@ impl Sky1Executor {
             stream,
         )?;
 
-        let mut lm_head_ddata = Tensor::new_zeroed(
-            saves.decoder.last().unwrap().output().shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        self.lm_head.backward_dgrad(
+        let lm_head_ddata = self.lm_head.backward_dgrad(
             &saves.logits_grad.view(),
             &weights.lm_head.bf16_weights().view(),
-            &mut lm_head_ddata.view_mut(),
             stream,
         )?;
 
-        let mut final_norm_ddata = Tensor::new_zeroed(
-            lm_head_ddata.shape(),
-            lm_head_ddata.element_type(),
-            &self.cx,
-        )?;
-        self.final_norm.rmsnorm_backward(
+        let final_norm_ddata = self.final_norm.rmsnorm_backward(
             &saves.decoder.last().unwrap().output().view(),
             &lm_head_ddata.view(),
             None,
             &weights.final_norm_gamma.bf16_weights_replica.view(),
             &saves.final_norm_r_inv.view(),
-            &mut final_norm_ddata.view_mut(),
             &mut weights.final_norm_gamma.gradients.view_mut(),
             stream,
         )?;
