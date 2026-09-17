@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cleandl::{
     context::{Context, ResourceKey},
     operators::{
+        adamw::AdamWExecutor,
         embedding::EmbeddingExecutor,
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
@@ -16,7 +17,10 @@ use serde::Serialize;
 use skycuda::stream::Stream;
 use skytens_core::data_type::{ElementType, FloatType};
 
-use crate::{model::Sky1Config, training::parameter::Parameter};
+use crate::{
+    model::Sky1Config,
+    training::{config::TrainingConfig, parameter::Parameter},
+};
 use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
 
 pub mod decoder;
@@ -79,6 +83,7 @@ pub struct Sky1Executor {
     lm_head: Arc<LinearExecutor>,
     loss: Arc<LossExecutor>,
     gradient_accumulation: Arc<GradientAccumulationExecutor>,
+    optimizer: Arc<AdamWExecutor>,
 }
 
 impl Sky1Executor {
@@ -109,6 +114,7 @@ impl ResourceKey for Sky1ExecutorKey {
             cx,
         )?;
         let loss = LossExecutor::get(cx)?;
+        let optimizer = AdamWExecutor::get(cx)?;
 
         Ok(Sky1Executor {
             config: self.config.clone(),
@@ -119,6 +125,7 @@ impl ResourceKey for Sky1ExecutorKey {
             lm_head,
             loss,
             gradient_accumulation: GradientAccumulationExecutor::get(cx)?,
+            optimizer,
         })
     }
 }
@@ -308,6 +315,67 @@ impl Sky1Executor {
             &mut weights.embeddings.gradients.view_mut(),
             stream,
         )?;
+
+        Ok(())
+    }
+
+    pub fn weight_update(
+        &self,
+        weights: &mut Sky1Weights,
+        config: &TrainingConfig,
+        train_step: u32,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        let mut grad_sum2 =
+            Tensor::new_zeroed([], ElementType::Float(FloatType::F32), stream, &self.cx)?;
+        for param in [
+            &weights.embeddings,
+            &weights.final_norm_gamma,
+            &weights.lm_head,
+        ] {
+            self.optimizer.gradient_l2_norm_reduction(
+                &param.gradients.view(),
+                &mut grad_sum2.view_mut(),
+                stream,
+            )?;
+        }
+        for block in &weights.decoder_blocks {
+            self.decoder.visit_gradients(block, |gradient| {
+                self.optimizer.gradient_l2_norm_reduction(
+                    gradient,
+                    &mut grad_sum2.view_mut(),
+                    stream,
+                )
+            })?;
+        }
+
+        for param in [
+            &mut weights.embeddings,
+            &mut weights.final_norm_gamma,
+            &mut weights.lm_head,
+        ] {
+            self.optimizer.adamw_weight_update(
+                &param.gradients.view(),
+                &grad_sum2.view(),
+                &mut param.master_weights.view_mut(),
+                &mut param.bf16_weights_replica.view_mut(),
+                &mut param.adam_m.view_mut(),
+                &mut param.adam_v.view_mut(),
+                config.adam_beta1,
+                config.adam_beta2,
+                config.weight_decay,
+                config.max_gradient_norm,
+                config.lr,
+                train_step,
+                stream,
+            )?;
+            stream.fill(&mut param.gradients.storage_mut(), 0u8)?;
+        }
+
+        for decoder in &mut weights.decoder_blocks {
+            self.decoder
+                .weight_update(decoder, &grad_sum2.view(), config, train_step, stream)?;
+        }
 
         Ok(())
     }

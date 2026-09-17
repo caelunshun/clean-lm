@@ -1,8 +1,12 @@
 use cleandl::{context::Context, tensor::Tensor};
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::Uniform;
 use sky_1::{
     model::{BlocksConfig, Sky1Config},
-    training::model::{MetaTensors, Sky1Executor, Sky1Weights},
+    training::{
+        config::TrainingConfig,
+        model::{MetaTensors, Sky1Executor, Sky1Weights},
+    },
 };
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
@@ -29,8 +33,8 @@ fn main() -> anyhow::Result<()> {
             num_decoder_q_heads: 32,
             num_decoder_kv_heads: 4,
             head_dim: 64,
-            max_batch_decoder_tokens: 8 * 1024,
-            max_num_sequences: 32,
+            max_batch_decoder_tokens: 4 * 1024,
+            max_num_sequences: 16,
             max_decoder_seqlen: 2048,
             rope_base_freq: 10_000.0,
         },
@@ -39,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         num_decoder_blocks: 1,
     };
 
-    let mut weights = Sky1Weights::new_random(&config, &mut rand::rng(), stream, cx)?;
+    let mut weights = Sky1Weights::new_random(&config, &mut StdRng::seed_from_u64(66), stream, cx)?;
 
     // --- Dummy batch initialization --- //
     let token_indices = Tensor::from_distr(
@@ -103,29 +107,44 @@ fn main() -> anyhow::Result<()> {
         )?,
     };
 
+    let training_config = TrainingConfig {
+        adam_beta1: 0.9,
+        adam_beta2: 0.95,
+        weight_decay: 0.1,
+        max_gradient_norm: 10.0,
+        lr: 3e-4,
+    };
+
     let executor = Sky1Executor::get(config.clone(), cx)?;
-    let res = executor.train_forward(
-        &token_indices.view(),
-        &labels.view(),
-        &meta_tensors,
-        &weights,
-        stream,
-    )?;
 
-    executor.train_backward(
-        &token_indices.view(),
-        &meta_tensors,
-        &mut weights,
-        &res,
-        stream,
-    )?;
+    for train_step in 1..=10000 {
+        let res = executor.train_forward(
+            &token_indices.view(),
+            &labels.view(),
+            &meta_tensors,
+            &weights,
+            stream,
+        )?;
 
-    let loss = bytemuck::cast_slice::<u8, f32>(
-        cx.download_from_device(res.loss().storage(), stream)?
-            .view()?,
-    )[0];
+        executor.train_backward(
+            &token_indices.view(),
+            &meta_tensors,
+            &mut weights,
+            &res,
+            stream,
+        )?;
 
-    dbg!(loss);
+        let loss = bytemuck::cast_slice::<u8, f32>(
+            cx.download_from_device(res.loss().storage(), stream)?
+                .view()?,
+        )[0];
+
+        dbg!(loss);
+
+        executor.weight_update(&mut weights, &training_config, train_step, stream)?;
+
+        break;
+    }
 
     Ok(())
 }

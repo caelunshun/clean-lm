@@ -42,7 +42,7 @@ impl AdamWExecutor {
 
         let kernel = self
             .module
-            .get_function("gradient_l2_norm_reduction_bf16_16384")?;
+            .get_function("gradient_l2_norm_reduction_f32_16384")?;
         let gradient_memory = gradient.storage();
         let mut global_sum_memory = global_sum.storage_mut();
         let mut launch = stream.launch_builder(&kernel);
@@ -113,7 +113,7 @@ impl AdamWExecutor {
             "adamw_weight_update_clipped_f32grad_f32master_bf16replica_4096_persistent",
         )?;
         let num_tiles = n.div_ceil(4096);
-        let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
+        let occupancy = kernel.max_active_blocks_per_sm(128, 0)? * stream.device().sm_count();
 
         let grid_size = occupancy.min(num_tiles) as u32;
 

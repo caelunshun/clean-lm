@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cleandl::{
     context::{Context, ResourceKey},
     operators::{
+        adamw::AdamWExecutor,
         attention::{AttentionConfig, AttentionExecutor, CuSeqlenTensors},
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
@@ -20,7 +21,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
-    training::{model::MetaTensors, parameter::Parameter},
+    training::{config::TrainingConfig, model::MetaTensors, parameter::Parameter},
 };
 
 #[derive(Debug)]
@@ -40,6 +41,7 @@ pub struct DecoderExecutor {
     pre_ffn_norm: Arc<NormExecutor>,
     ffn: Arc<SwiGluFfnExecutor>,
     gradient_accumulation: Arc<GradientAccumulationExecutor>,
+    optimizer: Arc<AdamWExecutor>,
 }
 
 impl DecoderExecutor {
@@ -140,6 +142,7 @@ impl ResourceKey for DecoderExecutorKey {
         )?;
 
         let gradient_accumulation = GradientAccumulationExecutor::get(cx)?;
+        let optimizer = AdamWExecutor::get(cx)?;
 
         Ok(DecoderExecutor {
             config: self.config.clone(),
@@ -156,6 +159,7 @@ impl ResourceKey for DecoderExecutorKey {
             pre_ffn_norm,
             ffn,
             gradient_accumulation,
+            optimizer,
         })
     }
 }
@@ -720,12 +724,8 @@ impl DecoderExecutor {
         )?;
 
         // --- FFN pre-norm --- //
-        let mut pre_ffn_norm_dx = Tensor::new_zeroed(
-            ffn_dx.shape(),
-            ffn_dx.element_type(),
-            stream,
-            &self.cx,
-        )?;
+        let mut pre_ffn_norm_dx =
+            Tensor::new_zeroed(ffn_dx.shape(), ffn_dx.element_type(), stream, &self.cx)?;
         self.pre_ffn_norm.rmsnorm_backward(
             &saves.o_proj_result.view(),
             &ffn_dx.view(),
@@ -956,5 +956,66 @@ impl DecoderExecutor {
         )?;
 
         Ok(pre_qkv_ddata)
+    }
+
+    pub fn visit_gradients(
+        &self,
+        weights: &DecoderWeights,
+        mut callback: impl FnMut(&TensorView) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        for param in [
+            &weights.pre_qkv_norm_gamma,
+            &weights.q_proj,
+            &weights.k_proj,
+            &weights.v_proj,
+            &weights.o_proj,
+            &weights.pre_ffn_norm_gamma,
+            &weights.ffn_up,
+            &weights.ffn_gate,
+            &weights.ffn_down,
+        ] {
+            callback(&param.gradients.view())?;
+        }
+        Ok(())
+    }
+
+    pub fn weight_update(
+        &self,
+        weights: &mut DecoderWeights,
+        gradients_sum2: &TensorView,
+        config: &TrainingConfig,
+        train_step: u32,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        for param in [
+            &mut weights.pre_qkv_norm_gamma,
+            &mut weights.q_proj,
+            &mut weights.k_proj,
+            &mut weights.v_proj,
+            &mut weights.o_proj,
+            &mut weights.pre_ffn_norm_gamma,
+            &mut weights.ffn_up,
+            &mut weights.ffn_gate,
+            &mut weights.ffn_down,
+        ] {
+            self.optimizer.adamw_weight_update(
+                &param.gradients.view(),
+                gradients_sum2,
+                &mut param.master_weights.view_mut(),
+                &mut param.bf16_weights_replica.view_mut(),
+                &mut param.adam_m.view_mut(),
+                &mut param.adam_v.view_mut(),
+                config.adam_beta1,
+                config.adam_beta2,
+                config.weight_decay,
+                config.max_gradient_norm,
+                config.lr,
+                train_step,
+                stream,
+            )?;
+            stream.fill(&mut param.gradients.storage_mut(), 0u8)?;
+        }
+
+        Ok(())
     }
 }

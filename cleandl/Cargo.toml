@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 parking_lot = "0.12"
 wide = "1.7"
+bytesize = "2.7"
 
 [dev-dependencies]
 float-cmp = "0.10"
