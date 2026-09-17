@@ -135,6 +135,7 @@ pub struct Sky1SavedTensors {
     embedding_output: Tensor,
     decoder: Vec<DecoderSavedTensors>,
     final_norm_r_inv: Tensor,
+    final_norm_result: Tensor,
     logits_grad: Tensor,
     loss: Tensor,
 }
@@ -244,6 +245,7 @@ impl Sky1Executor {
             embedding_output,
             decoder: decoder_saves,
             final_norm_r_inv,
+            final_norm_result,
             logits_grad,
             loss,
         })
@@ -264,7 +266,7 @@ impl Sky1Executor {
             &self.cx,
         )?;
         self.lm_head.backward_wgrad(
-            &saves.decoder.last().unwrap().output().view(),
+            &saves.final_norm_result.view(),
             &saves.logits_grad.view(),
             &mut lm_head_dw.view_mut(),
             stream,
