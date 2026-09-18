@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
             num_decoder_q_heads: 32,
             num_decoder_kv_heads: 4,
             head_dim: 64,
-            max_batch_decoder_tokens: 4 * 1024,
+            max_batch_decoder_tokens: 32 * 1024,
             max_num_sequences: 16,
             max_decoder_seqlen: 2048,
             rope_base_freq: 10_000.0,
@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
 
-        //  break;
+        break;
     }
 
     Ok(())

@@ -19,6 +19,8 @@ use skycuda::{
 use skycuda_cudnn::CudnnHandle;
 use thread_local::ThreadLocal;
 
+use crate::disk_cache::DiskCache;
+
 #[derive(Debug, Clone)]
 pub struct Context(Arc<Inner>);
 
@@ -45,6 +47,7 @@ impl Context {
             stream_cudnn_contexts: PerStreamResource::new(),
             device_memory_pool,
             host_pinned_memory_pool,
+            disk_cache: DiskCache::new()?,
         })))
     }
 
@@ -138,6 +141,10 @@ impl Context {
             .stream_cudnn_contexts
             .get_or_create(stream, || CudnnHandle::new(stream).map_err(From::from))
     }
+
+    pub fn disk_cache(&self) -> &DiskCache {
+        &self.0.disk_cache
+    }
 }
 
 type Resource = Arc<dyn Any + Send + Sync>;
@@ -155,6 +162,7 @@ struct Inner {
     default_cudnn_contexts: ThreadLocal<CudnnHandle>,
     stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
+    disk_cache: DiskCache,
 }
 
 pub trait ResourceKey: Serialize + 'static {
