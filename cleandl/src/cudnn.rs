@@ -1,5 +1,9 @@
 use std::{collections::HashMap, fmt};
 
+use bumpalo::Bump;
+use rand::{RngExt, SeedableRng};
+use rand_xoshiro::Xoroshiro128StarStar;
+use serde::{Deserialize, Serialize};
 use skycuda::{
     device_memory::DeviceMemory,
     host_pinned_memory::HostPinnedMemory,
@@ -7,7 +11,8 @@ use skycuda::{
     stream::Stream,
 };
 use skycuda_cudnn::{
-    BuiltGraph, DataType, GraphBuilder, HeurMode, Tensor, TensorAttributes, TensorId,
+    BuildPlanPolicy, BuiltGraph, DataType, GraphBuilder, HeurMode, Tensor, TensorAttributes,
+    TensorId,
 };
 use skytens_core::{
     data_type::{ElementType, FloatType, SIntType, UIntType},
@@ -16,6 +21,7 @@ use skytens_core::{
 
 use crate::{
     context::Context,
+    disk_cache::DiskCacheKey,
     tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
@@ -139,7 +145,12 @@ impl<'a> CudnnGraphBuilder<'a> {
 
     pub fn build(self) -> anyhow::Result<ExecutableCudnnGraph> {
         self.cx.cuda().set_as_current()?;
-        let graph = self.graph.build(&[HeurMode::A, HeurMode::B])?;
+        let graph = self
+            .graph
+            .build_with_policy(&[HeurMode::A, HeurMode::B], BuildPlanPolicy::All)?;
+
+        // Autotune.
+        let best_plan = autotune(&graph, &self.cx)?;
 
         let mut tensor_virt_descs = HashMap::new();
         for req in graph.all_tensor_requirements() {
@@ -177,8 +188,109 @@ impl<'a> CudnnGraphBuilder<'a> {
             graph,
             tensor_virt_descs,
             scalars,
+            best_plan,
         })
     }
+}
+
+fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
+    let serialized_graph = serde_json::from_str(&graph.to_json()?)?;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CudnnAutotuningCacheKey {
+        graph: serde_json::Value,
+    }
+
+    #[typetag::serde]
+    impl DiskCacheKey for CudnnAutotuningCacheKey {}
+
+    cx.disk_cache().get_or_create(
+        &CudnnAutotuningCacheKey {
+            graph: serialized_graph,
+        },
+        || {
+            let mut workspace = cx
+                .device_memory_pool()
+                .alloc_zeroed_on(graph.max_workspace_size(), cx.memset_stream())?;
+
+            let memories_allocator = Bump::new();
+            let mut memory_ptrs_for_drop = Vec::new();
+
+            let cudnn = &*cx.cudnn()?;
+
+            let mut dummy_variant_pack = graph.new_variant_pack(cudnn);
+
+            for tensor_requirement in graph.all_tensor_requirements() {
+                if tensor_requirement.is_ragged() {
+                    // Can't autotune ragged layouts for now; fall back
+                    // to heuristic's choice.
+                    return Ok(0);
+                }
+
+                // Need to allocate inside an Option so we can manually drop (as Bump won't
+                // drop these for us).
+                let memory =
+                    memories_allocator.alloc(Some(cx.device_memory_pool().alloc_zeroed_on(
+                        tensor_requirement.min_len().unwrap(),
+                        cx.memset_stream(),
+                    )?));
+
+                let data = Xoroshiro128StarStar::seed_from_u64(66)
+                    .random_iter::<u8>()
+                    .take(tensor_requirement.min_len().unwrap())
+                    .collect::<Vec<_>>();
+                cx.upload_to_device(&data, memory.as_mut().unwrap(), cx.h2d_copy_stream())?;
+
+                memory_ptrs_for_drop.push(memory as *mut Option<DeviceMemory>);
+                if tensor_requirement.is_output() {
+                    dummy_variant_pack
+                        .add_mut(tensor_requirement.uid(), memory.as_mut().unwrap())?;
+                } else {
+                    dummy_variant_pack.add(tensor_requirement.uid(), memory.as_ref().unwrap())?;
+                }
+            }
+
+            let mut best_plan_idx = 0;
+            let mut best_plan_time = None;
+            for plan in graph.plans() {
+                let time = crate::autotuning::measure_kernel(
+                    |_| unsafe {
+                        graph.execute_plan_at_index(
+                            &dummy_variant_pack,
+                            &mut workspace,
+                            plan.index(),
+                        )?;
+                        Ok(())
+                    },
+                    &plan.name(),
+                    cx,
+                )?;
+                if best_plan_time.is_none() || time < best_plan_time.unwrap() {
+                    best_plan_idx = plan.index();
+                    best_plan_time = Some(time);
+                }
+            }
+            tracing::info!(
+                "winning plan: {} with knobs: {:?}",
+                graph.plans().nth(best_plan_idx).unwrap().name(),
+                graph
+                    .plans()
+                    .nth(best_plan_idx)
+                    .unwrap()
+                    .engine_config()?
+                    .knobs
+            );
+
+            drop(dummy_variant_pack);
+            for memory_to_drop in memory_ptrs_for_drop {
+                unsafe {
+                    (&mut *memory_to_drop).take();
+                }
+            }
+
+            Ok(best_plan_idx)
+        },
+    )
 }
 
 pub struct ExecutableCudnnGraph {
@@ -186,6 +298,7 @@ pub struct ExecutableCudnnGraph {
     graph: BuiltGraph,
     tensor_virt_descs: HashMap<TensorId, ExpectedVirtDesc>,
     scalars: Vec<(TensorId, HostPinnedMemory)>,
+    best_plan: usize,
 }
 
 impl fmt::Debug for ExecutableCudnnGraph {
@@ -323,13 +436,15 @@ impl ExecutableCudnnGraph {
             variant_pack.add(*id, memory)?;
         }
 
-        let mut workspace = self
-            .cx
-            .device_memory_pool()
-            .alloc_zeroed_on(self.graph.workspace_size_for(&variant_pack)?, stream)?;
+        let mut workspace = self.cx.device_memory_pool().alloc_zeroed_on(
+            self.graph
+                .workspace_size_at_index_for(self.best_plan, &variant_pack)?,
+            stream,
+        )?;
 
         unsafe {
-            self.graph.execute(&variant_pack, &mut workspace)?;
+            self.graph
+                .execute_plan_at_index(&variant_pack, &mut workspace, self.best_plan)?;
         }
 
         Ok(())

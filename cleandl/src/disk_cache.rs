@@ -1,7 +1,7 @@
 use std::{
     fmt::Debug,
     fs::{self, File},
-    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
 };
 
 use anyhow::Context;
@@ -56,8 +56,11 @@ impl DiskCache {
         file_guard.lock()?;
         let res = (|| {
             file_guard.seek(SeekFrom::Start(0))?;
+            let mut file_contents = String::new();
+            file_guard.read_to_string(&mut file_contents)?;
+
             let mut on_disk_cache: FastHashMap<String, String> =
-                serde_json::from_reader(BufReader::new(&mut *file_guard))?;
+                serde_json::from_str(&file_contents).unwrap_or_default();
             if let Some(val) = on_disk_cache.get(&key_json) {
                 return serde_json::from_str(val).map_err(From::from);
             }
@@ -66,9 +69,10 @@ impl DiskCache {
             let value = create()?;
             on_disk_cache.insert(key_json, serde_json::to_string(&value)?);
 
+            file_guard.seek(SeekFrom::Start(0))?;
             file_guard.set_len(0)?;
             let mut buf_writer = BufWriter::new(&mut *file_guard);
-            serde_json::to_writer(&mut buf_writer, &on_disk_cache)?;
+            serde_json::to_writer_pretty(&mut buf_writer, &on_disk_cache)?;
             buf_writer.flush()?;
             drop(buf_writer);
 

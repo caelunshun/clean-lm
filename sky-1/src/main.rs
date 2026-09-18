@@ -1,4 +1,5 @@
 use cleandl::{context::Context, tensor::Tensor};
+use mimalloc::MiMalloc;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::Uniform;
 use sky_1::{
@@ -13,8 +14,13 @@ use skycuda::{
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 
+#[global_allocator]
+static ALLOCATOR: MiMalloc = MiMalloc;
+
 // Temporary testbed code
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let cx = &Context::new(
         0,
         DeviceMemoryPoolOptions {
@@ -144,8 +150,6 @@ fn main() -> anyhow::Result<()> {
         dbg!(loss);
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
-
-        break;
     }
 
     Ok(())
