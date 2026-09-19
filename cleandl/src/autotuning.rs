@@ -18,13 +18,13 @@ pub fn measure_kernel(
     let stream = cx.default_compute_stream();
 
     // One warmup iteration e.g. for JIT caches.
-    submit_measured_work(&stream)?;
+    submit_measured_work(stream)?;
     stream.block_on()?;
 
     // Obtain initial estimate of kernel runtime from a few measurements.
     let start = stream.record_timed_event()?;
     for _ in 0..ESTIMATE_MEASUREMENTS {
-        submit_measured_work(&stream)?;
+        submit_measured_work(stream)?;
     }
     let elapsed = stream.record_timed_event()?.elapsed_since(&start)?;
     let approx_kernel_duration = elapsed / ESTIMATE_MEASUREMENTS;
@@ -33,7 +33,7 @@ pub fn measure_kernel(
         .as_nanos()
         .div_ceil(approx_kernel_duration.as_nanos());
     for _ in 0..warmup_invocations {
-        submit_measured_work(&stream)?;
+        submit_measured_work(stream)?;
     }
 
     let measured_invocations = MIN_MEASURE_DURATION
@@ -41,7 +41,7 @@ pub fn measure_kernel(
         .div_ceil(approx_kernel_duration.as_nanos()) as u32;
     let start = stream.record_timed_event()?;
     for _ in 0..measured_invocations {
-        submit_measured_work(&stream)?;
+        submit_measured_work(stream)?;
     }
     let elapsed = stream.record_timed_event()?.elapsed_since(&start)?;
 

@@ -1,3 +1,5 @@
+use std::env;
+
 use cleandl::{context::Context, tensor::Tensor};
 use mimalloc::MiMalloc;
 use rand::{SeedableRng, rngs::StdRng};
@@ -29,6 +31,7 @@ fn main() -> anyhow::Result<()> {
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 8 << 30,
         },
+        env::var("CLEANDL_AUTOTUNE").is_ok(),
     )?;
     let stream = cx.default_compute_stream();
 

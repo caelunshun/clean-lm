@@ -37,6 +37,7 @@ fn adamw_weight_update() -> anyhow::Result<()> {
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
+        false,
     )?;
     let stream = cx.cuda().create_stream()?;
     let adamw = AdamWExecutor::get(&cx)?;

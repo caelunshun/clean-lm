@@ -216,7 +216,7 @@ fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
             let memories_allocator = Bump::new();
             let mut memory_ptrs_for_drop = Vec::new();
 
-            let cudnn = &*cx.cudnn()?;
+            let cudnn = &cx.cudnn()?;
 
             let mut dummy_variant_pack = graph.new_variant_pack(cudnn);
 

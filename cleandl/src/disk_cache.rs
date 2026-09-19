@@ -1,7 +1,7 @@
 use std::{
     fmt::Debug,
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
 };
 
 use anyhow::Context;
@@ -24,6 +24,7 @@ impl DiskCache {
 
         let cache_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .read(true)
             .open(dirs.cache_dir().join("cache.json"))?;

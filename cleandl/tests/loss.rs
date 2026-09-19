@@ -34,6 +34,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
+        false,
     )?;
     let stream = cx.cuda().create_stream()?;
     let loss_op = LossExecutor::get(&cx)?;

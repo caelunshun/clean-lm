@@ -29,6 +29,7 @@ impl Context {
         device_index: u32,
         device_memory_options: DeviceMemoryPoolOptions,
         host_pinned_memory_options: HostPinnedMemoryPoolOptions,
+        enable_autotuning: bool,
     ) -> anyhow::Result<Self> {
         let cuda = Device::from_index(device_index)?;
 
@@ -48,6 +49,7 @@ impl Context {
             device_memory_pool,
             host_pinned_memory_pool,
             disk_cache: DiskCache::new()?,
+            enable_autotuning,
         })))
     }
 
@@ -145,6 +147,10 @@ impl Context {
     pub fn disk_cache(&self) -> &DiskCache {
         &self.0.disk_cache
     }
+
+    pub fn is_autotuning_enabled(&self) -> bool {
+        self.0.enable_autotuning
+    }
 }
 
 type Resource = Arc<dyn Any + Send + Sync>;
@@ -163,6 +169,7 @@ struct Inner {
     stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
     disk_cache: DiskCache,
+    enable_autotuning: bool,
 }
 
 pub trait ResourceKey: Serialize + 'static {
