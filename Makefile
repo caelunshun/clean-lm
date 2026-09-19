@@ -1,5 +1,5 @@
 CU_FILES := $(wildcard cleandl/cutile-kernels/*.cu)
-ARCHS := sm89 sm90a sm100f sm120f
+ARCHS := sm89 sm90a sm100a sm103a sm107a sm120a sm121a
 
 TARGETS := $(foreach arch,$(ARCHS),$(CU_FILES:.cu=.$(arch).sass))
 TEMPS := $(foreach arch,$(ARCHS),$(CU_FILES:.cu=.$(arch).cubin))

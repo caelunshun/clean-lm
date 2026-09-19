@@ -26,10 +26,10 @@ fn main() -> anyhow::Result<()> {
     let cx = &Context::new(
         0,
         DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 256 << 30,
+            max_reserved_free_bytes: 1024 << 30,
         },
         HostPinnedMemoryPoolOptions {
-            max_reserved_free_bytes: 8 << 30,
+            max_reserved_free_bytes: 256 << 30,
         },
         env::var("CLEANDL_AUTOTUNE").is_ok(),
     )?;
@@ -42,9 +42,9 @@ fn main() -> anyhow::Result<()> {
             num_decoder_q_heads: 32,
             num_decoder_kv_heads: 4,
             head_dim: 64,
-            max_batch_decoder_tokens: 32 * 1024,
-            max_num_sequences: 16,
-            max_decoder_seqlen: 2048,
+            max_batch_decoder_tokens: 128 * 1024,
+            max_num_sequences: 32,
+            max_decoder_seqlen: 4096,
             rope_base_freq: 10_000.0,
         },
         vocab_size: 65536,
@@ -153,6 +153,8 @@ fn main() -> anyhow::Result<()> {
         dbg!(loss);
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
+
+        break;
     }
 
     Ok(())

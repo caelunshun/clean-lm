@@ -145,12 +145,21 @@ impl<'a> CudnnGraphBuilder<'a> {
 
     pub fn build(self) -> anyhow::Result<ExecutableCudnnGraph> {
         self.cx.cuda().set_as_current()?;
+
+        let policy = if self.cx.is_autotuning_enabled() {
+            BuildPlanPolicy::All
+        } else {
+            BuildPlanPolicy::HeuristicsChoice
+        };
         let graph = self
             .graph
-            .build_with_policy(&[HeurMode::A, HeurMode::B], BuildPlanPolicy::All)?;
+            .build_with_policy(&[HeurMode::A, HeurMode::B], policy)?;
 
-        // Autotune.
-        let best_plan = autotune(&graph, &self.cx)?;
+        let best_plan = if self.cx.is_autotuning_enabled() {
+            autotune(&graph, &self.cx)?
+        } else {
+            0
+        };
 
         let mut tensor_virt_descs = HashMap::new();
         for req in graph.all_tensor_requirements() {
@@ -209,6 +218,7 @@ fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
             graph: serialized_graph,
         },
         || {
+            dbg!();
             let mut workspace = cx
                 .device_memory_pool()
                 .alloc_zeroed_on(graph.max_workspace_size(), cx.memset_stream())?;

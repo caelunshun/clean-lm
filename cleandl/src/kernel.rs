@@ -10,8 +10,11 @@ macro_rules! include_cubins {
         $crate::kernel::Cubins {
             sm89: include_bytes!(concat!($base_path, ".sm89.cubin")),
             sm90a: include_bytes!(concat!($base_path, ".sm90a.cubin")),
-            sm100f: include_bytes!(concat!($base_path, ".sm100f.cubin")),
-            sm120f: include_bytes!(concat!($base_path, ".sm120f.cubin")),
+            sm100a: include_bytes!(concat!($base_path, ".sm100a.cubin")),
+            sm103a: include_bytes!(concat!($base_path, ".sm103a.cubin")),
+            sm107a: include_bytes!(concat!($base_path, ".sm107a.cubin")),
+            sm120a: include_bytes!(concat!($base_path, ".sm120a.cubin")),
+            sm121a: include_bytes!(concat!($base_path, ".sm121a.cubin")),
         }
     };
 }
@@ -20,8 +23,11 @@ macro_rules! include_cubins {
 pub struct Cubins<'a> {
     pub sm89: &'a [u8],
     pub sm90a: &'a [u8],
-    pub sm100f: &'a [u8],
-    pub sm120f: &'a [u8],
+    pub sm100a: &'a [u8],
+    pub sm103a: &'a [u8],
+    pub sm107a: &'a [u8],
+    pub sm120a: &'a [u8],
+    pub sm121a: &'a [u8],
 }
 
 impl ResourceKey for Cubins<'static> {
@@ -34,8 +40,11 @@ impl ResourceKey for Cubins<'static> {
         ) {
             (8, 9) => self.sm89,
             (9, 0) => self.sm90a,
-            (10, _) => self.sm100f,
-            (12, _) => self.sm120f,
+            (10, 0) => self.sm100a,
+            (10, 3) => self.sm103a,
+            (10, 7) => self.sm107a,
+            (12, 0) => self.sm120a,
+            (12, 1) => self.sm121a,
             (major, minor) => bail!("unsupported sm version {major}.{minor}"),
         };
 
