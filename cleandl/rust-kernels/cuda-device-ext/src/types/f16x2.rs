@@ -3,6 +3,8 @@
 //! Packed `f16x2`.
 
 use crate::types::f16::f16;
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use cuda_device::convert;
 use cuda_device::f16x2 as raw;
 
@@ -18,7 +20,7 @@ use cuda_device::f16x2 as raw;
 /// Every operator except [`Div`](core::ops::Div) is a single device
 /// instruction.
 #[repr(transparent)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub struct f16x2(u32);
 
 impl f16x2 {

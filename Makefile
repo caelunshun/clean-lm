@@ -42,7 +42,7 @@ $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULE,$(arch),sm_$(patsubst sm%,%,$(ar
 define RUST_ARCH_RULE
 $$(RUST_KERNEL_OUT).$(1).ptx: $$(shell find $$(RUST_KERNEL_DIR)/src -name '*.rs') $$(RUST_KERNEL_DIR)/Cargo.toml
 	mkdir -p $$(RUST_KERNEL_OUT).$(1).d
-	cd $$(RUST_KERNEL_DIR) && CUDA_OXIDE_PTX_DIR=$$(abspath $$(RUST_KERNEL_OUT).$(1).d) cargo oxide build --arch $(2)
+	cd $$(RUST_KERNEL_DIR) && CUDA_OXIDE_PTX_DIR=$$(abspath $$(RUST_KERNEL_OUT).$(1).d) cargo oxide build -v --arch $(2)
 	cat $$(RUST_KERNEL_OUT).$(1).d/*.ptx > $$@
 
 $$(RUST_KERNEL_OUT).$(1).cubin: $$(RUST_KERNEL_OUT).$(1).ptx

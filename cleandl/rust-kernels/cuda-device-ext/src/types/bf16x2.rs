@@ -3,6 +3,8 @@
 //! Packed `bf16x2`.
 
 use crate::types::bf16::bf16;
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use cuda_device::bf16x2 as raw;
 use cuda_device::convert;
 
@@ -18,7 +20,7 @@ use cuda_device::convert;
 /// Every operator except [`Div`](core::ops::Div) is a single device
 /// instruction.
 #[repr(transparent)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub struct bf16x2(u32);
 
 impl bf16x2 {

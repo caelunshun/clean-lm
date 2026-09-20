@@ -2,6 +2,8 @@
 
 //! Scalar `bf16`.
 
+use bytemuck::Pod;
+use bytemuck::Zeroable;
 use cuda_device::bf16 as raw;
 use cuda_device::convert;
 
@@ -15,7 +17,7 @@ use cuda_device::convert;
 ///
 /// Arithmetic widens to `f32` and rounds back.
 #[repr(transparent)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub struct bf16(u16);
 
 impl bf16 {

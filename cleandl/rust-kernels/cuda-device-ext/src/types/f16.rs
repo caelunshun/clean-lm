@@ -3,6 +3,7 @@
 //! Scalar `f16`.
 
 use crate::primitive::Half;
+use bytemuck::{Pod, Zeroable};
 use cuda_device::f16 as raw;
 
 /// One IEEE binary16 value, carried as the `u16` bit pattern
@@ -17,7 +18,7 @@ use cuda_device::f16 as raw;
 /// Arithmetic widens to `f32` and rounds back; see the crate docs for why, and
 /// prefer [`crate::f16x2`] when more than one value is in flight.
 #[repr(transparent)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 pub struct f16(u16);
 
 impl f16 {

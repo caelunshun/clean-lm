@@ -1,13 +1,26 @@
 #![no_std]
-#![feature(min_adt_const_params, const_param_ty_trait)]
-#![allow(incomplete_features)]
+#![feature(
+    min_adt_const_params,
+    const_param_ty_trait,
+    impl_trait_in_assoc_type,
+    pointer_is_aligned_to,
+    loop_hints,
+    trusted_len
+)]
+#![allow(incomplete_features, clippy::implied_bounds_in_impls)]
 
-use core::{marker::ConstParamTy_, slice};
+use core::{
+    hint::{self, assert_unchecked},
+    iter::TrustedLen,
+    marker::ConstParamTy_,
+};
 
 use cuda_device::uniform::block_dim_x;
-use cuda_device_ext::{bf16, bf16x2};
+use cuda_macros::device;
 
 pub mod norm;
+pub mod smem_ring;
+pub mod view;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PrefetchMode {
@@ -20,38 +33,48 @@ impl ConstParamTy_ for PrefetchMode {}
 
 const WARP_SIZE: usize = 32;
 
+#[inline(always)]
 fn num_warps() -> usize {
-    block_dim_x().get() as usize / 32
-}
-
-unsafe fn as_aligned_slice<T>(s: &[T]) -> &[u128] {
-    const {
-        assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
-    }
+    let num_warps = block_dim_x().get() as usize / 32;
     unsafe {
-        slice::from_raw_parts(
-            s.as_ptr().cast(),
-            s.len() / (size_of::<u128>() / size_of::<T>()),
-        )
+        assert_unchecked(num_warps > 0);
     }
+    num_warps
 }
 
-unsafe fn as_aligned_slice_mut<T>(s: &mut [T]) -> &mut [u128] {
-    const {
-        assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
-    }
+#[inline(always)]
+fn lane_id() -> usize {
+    let id = cuda_device::warp::lane_id() as usize;
     unsafe {
-        slice::from_raw_parts_mut(
-            s.as_mut_ptr().cast(),
-            s.len() / (size_of::<u128>() / size_of::<T>()),
-        )
+        hint::assert_unchecked(id < 32);
     }
+    id
 }
 
-unsafe fn as_bf16x2_slice(s: &[bf16]) -> &[bf16x2] {
-    unsafe { slice::from_raw_parts(s.as_ptr().cast(), s.len() / 2) }
-}
+/// Takes zip of 2 iterators that should have the same length
+/// (else behavior is unspecified but not UB). Then invokes the callback.
+///
+/// This method seems to optimize/unroll better than using `for (a, b) in a.into_iter().zip(b)`.
+#[device]
+fn zip2_for_each<A, B, AI, BI, F>(a: AI, b: BI, mut f: F)
+where
+    AI: IntoIterator<Item = A, IntoIter: ExactSizeIterator + TrustedLen>,
+    BI: IntoIterator<Item = B, IntoIter: ExactSizeIterator + TrustedLen>,
+    F: FnMut(A, B),
+{
+    let mut a = a.into_iter();
+    let mut b = b.into_iter();
 
-unsafe fn as_bf16x2_slice_mut(s: &mut [bf16]) -> &mut [bf16x2] {
-    unsafe { slice::from_raw_parts_mut(s.as_mut_ptr().cast(), s.len() / 2) }
+    assert_eq!(a.len(), b.len());
+    let n = a.len();
+
+    let mut i = 0;
+    #[llvm_unroll]
+    while i < n {
+        let a_val = unsafe { a.next().unwrap_unchecked() };
+        let b_val = unsafe { b.next().unwrap_unchecked() };
+
+        f(a_val, b_val);
+        i += 1;
+    }
 }

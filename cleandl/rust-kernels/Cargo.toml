@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
-cuda-macros = { git = "https://github.com/NVlabs/cuda-oxide", default-features = false }
+cuda-device = { git = "https://github.com/caelunshun/cuda-oxide" }
+cuda-macros = { git = "https://github.com/caelunshun/cuda-oxide", default-features = false }
 cuda-device-ext = { path = "cuda-device-ext" }
+bytemuck = { version = "1.25", features = ["must_cast"] }
