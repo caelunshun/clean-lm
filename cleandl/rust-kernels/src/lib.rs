@@ -13,10 +13,12 @@ use core::{
     marker::ConstParamTy_,
 };
 
-use cuda_device::uniform::block_dim_x;
+use cuda_device::uniform::{block_dim_x, block_dim_y, block_dim_z};
 
-pub mod norm;
-pub mod smem_ring;
+// pub mod norm;
+// pub mod smem_ring;
+pub mod partition;
+pub mod testbed;
 pub mod view;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -29,11 +31,11 @@ enum PrefetchMode {
 }
 impl ConstParamTy_ for PrefetchMode {}
 
-const WARP_SIZE: usize = 32;
+const WARP_SIZE: u32 = 32;
 
 #[inline(always)]
-fn num_warps() -> usize {
-    let num_warps = block_dim_x().get() as usize / 32;
+fn num_warps() -> u32 {
+    let num_warps = block_dim_x().get() * block_dim_y().get() * block_dim_z().get() / WARP_SIZE;
     unsafe {
         assert_unchecked(num_warps > 0);
     }
@@ -41,8 +43,8 @@ fn num_warps() -> usize {
 }
 
 #[inline(always)]
-fn lane_id() -> usize {
-    let id = cuda_device::warp::lane_id() as usize;
+fn lane_id() -> u32 {
+    let id = cuda_device::warp::lane_id();
     unsafe {
         hint::assert_unchecked(id < 32);
     }
