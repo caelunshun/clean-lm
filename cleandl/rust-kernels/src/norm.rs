@@ -1,4 +1,4 @@
-use core::{hint::assert_unchecked, slice};
+use core::slice;
 
 use cuda_device::{
     DynamicSharedArray, async_copy,
@@ -15,9 +15,8 @@ use crate::{
     smem_ring::StagingBufferRing,
     view::{
         AlignedView, AlignedViewMut, PartitionU128Chunks, PartitionWithinWarpCoalesced,
-        elements_per_u128,
+        elements_per_u128, for_each_zip2,
     },
-    zip2_for_each,
 };
 
 /// Template for fast RMSNorm where the vector size
@@ -74,7 +73,7 @@ fn rmsnorm_bf16_warp_persistent<
 
         // Fetch gamma into SMEM using one warp.
         if warp_id() == 0 {
-            zip2_for_each(
+            for_each_zip2(
                 smem_gamma.partition_iter(PartitionWithinWarpCoalesced),
                 gmem_gamma.partition_iter(PartitionWithinWarpCoalesced),
                 |mut dst, src| {
@@ -92,7 +91,7 @@ fn rmsnorm_bf16_warp_persistent<
         for (slot, row) in row_iter.clone().take(PREFETCH_STAGES).enumerate() {
             let gmem_row = gmem_x.slice(row * stride..).slice(..INNER_SIZE);
 
-            zip2_for_each(
+            for_each_zip2(
                 smem_ring
                     .slot_mut(slot)
                     .partition_iter(PartitionWithinWarpCoalesced),
@@ -114,7 +113,7 @@ fn rmsnorm_bf16_warp_persistent<
             async_copy::cp_async_wait_group(prefetch_stages_minus_one);
 
             let slot = iteration % PREFETCH_STAGES;
-            zip2_for_each(
+            for_each_zip2(
                 x.partition_iter(PartitionU128Chunks),
                 smem_ring
                     .slot(slot)
@@ -129,7 +128,7 @@ fn rmsnorm_bf16_warp_persistent<
             if next_row_idx < num_vectors {
                 let gmem_next_row =
                     gmem_x.slice(stride * next_row_idx..stride * next_row_idx + INNER_SIZE);
-                zip2_for_each(
+                for_each_zip2(
                     smem_ring
                         .slot_mut(slot)
                         .partition_iter(PartitionWithinWarpCoalesced),
@@ -154,7 +153,7 @@ fn rmsnorm_bf16_warp_persistent<
             let r_inv = rsqrt_approx_ftz_f32(thr_sum2 + 1e-6);
 
             make_register_view!(gamma, bf16, ELEMENTS_PER_THREAD);
-            zip2_for_each(
+            for_each_zip2(
                 gamma.partition_iter(PartitionU128Chunks),
                 smem_gamma.partition_iter(PartitionWithinWarpCoalesced),
                 |mut dst, src| {
@@ -162,13 +161,13 @@ fn rmsnorm_bf16_warp_persistent<
                 },
             );
 
-            zip2_for_each(&mut x, &gamma, |x, gamma| {
+            for (x, gamma) in (&mut x).into_iter().zip(&gamma) {
                 *x = bf16::from_f32(x.to_f32() * gamma.to_f32() * r_inv);
-            });
+            }
 
             // Store to GMEM.
             let mut gmem_row = gmem_y.slice_mut(row_idx * stride..row_idx * stride + INNER_SIZE);
-            zip2_for_each(
+            for_each_zip2(
                 x.partition_iter(PartitionU128Chunks),
                 gmem_row.partition_iter(PartitionWithinWarpCoalesced),
                 |src, mut dst| {

@@ -2,21 +2,22 @@ use core::{
     hint::assert_unchecked,
     iter::TrustedLen,
     marker::PhantomData,
-    mem::transmute,
     ops::{Index, IndexMut, Range, RangeBounds},
     slice,
 };
 
 use bytemuck::Pod;
 use cuda_device::{Barrier, async_copy, tma};
+use cuda_macros::device;
 
-use crate::lane_id;
+use crate::{WARP_SIZE, lane_id};
 
 /// 128-bit-aligned view into a buffer.
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub struct AlignedView<'a, T> {
-    view: &'a [T],
+    view: &'a [u128],
+    _marker: PhantomData<&'a T>,
 }
 
 impl<'a, T> AlignedView<'a, T>
@@ -26,7 +27,8 @@ where
     #[inline(always)]
     pub fn new(view: &'a [u128]) -> Self {
         Self {
-            view: bytemuck::must_cast_slice(view),
+            view,
+            _marker: PhantomData,
         }
     }
 
@@ -60,38 +62,64 @@ where
             core::ops::Bound::Unbounded => self.num_elements(),
         };
 
-        assert!(start.is_multiple_of(elements_per_u128::<T>()));
-        assert!(end.is_multiple_of(elements_per_u128::<T>()));
-
         Self {
-            view: &self.view[start..end],
+            view: &self.view[start / elements_per_u128::<T>()..end / elements_per_u128::<T>()],
+            _marker: PhantomData,
         }
     }
 
     /// Length in _elements_.
     #[inline(always)]
     pub fn num_elements(&self) -> usize {
-        self.view.len()
+        self.view.len() * elements_per_u128::<T>()
     }
 
     #[inline(always)]
     pub fn as_u128_slice(&self) -> &[u128] {
-        unsafe {
-            slice::from_raw_parts(
-                self.view.as_ptr().cast(),
-                self.view.len() / elements_per_u128::<T>(),
-            )
-        }
+        self.view
     }
 
     #[inline(always)]
-    pub fn partition_iter<P: PartitionViewIter<T>>(
-        &self,
+    pub(crate) fn partition_iter<'b, P: PartitionViewIter<T>>(
+        &'b self,
         partition: P,
-    ) -> impl Iterator<Item = AlignedView<'a, T>> + ExactSizeIterator + TrustedLen {
-        partition
-            .partition(self.num_elements())
-            .map(move |range| self.slice(range))
+    ) -> impl IterWithLen<Item = AlignedView<'b, T>>
+    where
+        'a: 'b,
+    {
+        let ranges = partition.partition(self.as_u128_slice().len());
+
+        struct Iter<'a, T, RI> {
+            view: AlignedView<'a, T>,
+            ranges: RI,
+        }
+
+        impl<'a, T, RI> IterWithLen for Iter<'a, T, RI>
+        where
+            T: Pod,
+            RI: RangeIter,
+        {
+            type Item = AlignedView<'a, T>;
+
+            fn len(&self) -> usize {
+                self.ranges.len()
+            }
+
+            unsafe fn get_unchecked(&mut self, i: usize) -> AlignedView<'a, T> {
+                unsafe {
+                    let range = self.ranges.get_unchecked(i);
+                    AlignedView {
+                        view: &self.view.view[range.start..range.end],
+                        _marker: PhantomData,
+                    }
+                }
+            }
+        }
+
+        Iter::<T, _> {
+            view: *self,
+            ranges,
+        }
     }
 
     #[inline(always)]
@@ -101,25 +129,31 @@ where
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[T] {
-        self.view
+        bytemuck::must_cast_slice(self.view)
     }
 }
 
-impl<'a, T> Index<usize> for AlignedView<'a, T> {
+impl<'a, T> Index<usize> for AlignedView<'a, T>
+where
+    T: Pod,
+{
     type Output = T;
 
     #[inline(always)]
     fn index(&self, index: usize) -> &Self::Output {
-        &self.view[index]
+        &self.as_slice()[index]
     }
 }
 
-impl<'a, T> Index<u32> for AlignedView<'a, T> {
+impl<'a, T> Index<u32> for AlignedView<'a, T>
+where
+    T: Pod,
+{
     type Output = T;
 
     #[inline(always)]
     fn index(&self, index: u32) -> &Self::Output {
-        &self.view[index as usize]
+        &self.as_slice()[index as usize]
     }
 }
 
@@ -131,15 +165,17 @@ where
     type IntoIter = impl Iterator<Item = T> + ExactSizeIterator + TrustedLen;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.view.iter().copied()
+        bytemuck::must_cast_slice::<u128, T>(self.view)
+            .iter()
+            .copied()
     }
 }
 
 /// 128-bit-aligned view into a mutable buffer.
 #[repr(C)]
 pub struct AlignedViewMut<'a, T> {
-    ptr: *mut T,
-    num_elements: usize,
+    ptr: *mut u128,
+    len: usize,
     _lifetime: PhantomData<&'a mut T>,
 }
 
@@ -150,8 +186,8 @@ where
     #[inline(always)]
     pub fn new(view: &'a mut [u128]) -> Self {
         Self {
-            ptr: view.as_mut_ptr().cast(),
-            num_elements: view.len() * elements_per_u128::<T>(),
+            ptr: view.as_mut_ptr(),
+            len: view.len(),
             _lifetime: PhantomData,
         }
     }
@@ -197,13 +233,13 @@ where
         assert!(start.is_multiple_of(elements_per_u128::<T>()));
         assert!(end.is_multiple_of(elements_per_u128::<T>()));
 
-        assert!(start <= self.num_elements);
-        assert!(end <= self.num_elements);
+        assert!(start <= self.num_elements());
+        assert!(end <= self.num_elements());
         assert!(start <= end);
 
         AlignedViewMut {
-            ptr: unsafe { self.ptr.add(start) },
-            num_elements: end - start,
+            ptr: unsafe { self.ptr.add(start / elements_per_u128::<T>()) },
+            len: end / elements_per_u128::<T>() - start / elements_per_u128::<T>(),
             _lifetime: PhantomData,
         }
     }
@@ -211,39 +247,61 @@ where
     #[inline(always)]
     pub fn as_view(&self) -> AlignedView<'_, T> {
         AlignedView {
-            view: unsafe { slice::from_raw_parts(self.ptr, self.num_elements) },
+            view: unsafe { slice::from_raw_parts(self.ptr, self.len) },
+            _marker: PhantomData,
         }
     }
 
     /// Length in _elements_.
     #[inline(always)]
     pub fn num_elements(&self) -> usize {
-        self.num_elements
+        self.len * elements_per_u128::<T>()
     }
 
     #[inline(always)]
-    pub fn partition_iter<'i, P: PartitionViewIter<T>>(
-        &'i mut self,
+    pub(crate) fn partition_iter<'b, P: PartitionViewIter<T>>(
+        &'b mut self,
         partitioner: P,
-    ) -> impl Iterator<Item = AlignedViewMut<'i, T>> + ExactSizeIterator + TrustedLen {
-        partitioner
-            .partition(self.num_elements())
-            .map(move |range| {
-                let surrogate = self.slice_mut(range);
-                // lifetime laundering
-                // https://doc.rust-lang.org/nightly/src/core/slice/iter.rs.html#2011
-                unsafe { transmute::<AlignedViewMut<'_, T>, AlignedViewMut<'i, T>>(surrogate) }
-            })
+    ) -> impl IterWithLen<Item = AlignedViewMut<'b, T>>
+    where
+        'a: 'b,
+    {
+        let ranges = partitioner.partition(self.len);
+
+        struct Iter<'a, 'b, T, RI> {
+            view: &'b mut AlignedViewMut<'a, T>,
+            ranges: RI,
+        }
+
+        impl<'a, 'b, T, RI> IterWithLen for Iter<'a, 'b, T, RI>
+        where
+            T: Pod,
+            RI: RangeIter,
+        {
+            type Item = AlignedViewMut<'b, T>;
+
+            fn len(&self) -> usize {
+                self.ranges.len()
+            }
+
+            unsafe fn get_unchecked(&mut self, i: usize) -> AlignedViewMut<'b, T> {
+                unsafe {
+                    let range = self.ranges.get_unchecked(i);
+                    AlignedViewMut {
+                        ptr: self.view.ptr.add(range.start),
+                        len: range.end - range.start,
+                        _lifetime: PhantomData,
+                    }
+                }
+            }
+        }
+
+        Iter::<T, _> { view: self, ranges }
     }
 
     #[inline(always)]
     pub fn as_u128_slice_mut(&mut self) -> &mut [u128] {
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.ptr.cast(),
-                self.num_elements / elements_per_u128::<T>(),
-            )
-        }
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     #[inline(always)]
@@ -330,17 +388,22 @@ where
 
     #[inline(always)]
     pub fn num_bytes(&self) -> usize {
-        size_of::<T>() * self.num_elements
+        size_of::<T>() * self.num_elements()
+    }
+
+    #[inline(always)]
+    pub fn as_u128_slice(&self) -> &[u128] {
+        unsafe { slice::from_raw_parts(self.ptr, self.len) }
     }
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.ptr, self.num_elements) }
+        bytemuck::must_cast_slice(self.as_u128_slice())
     }
 
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.num_elements) }
+        bytemuck::must_cast_slice_mut(self.as_u128_slice_mut())
     }
 }
 
@@ -397,25 +460,32 @@ where
     }
 }
 
-impl<'a, T> Index<usize> for AlignedViewMut<'a, T> {
+impl<'a, T> Index<usize> for AlignedViewMut<'a, T>
+where
+    T: Pod,
+{
     type Output = T;
 
     #[inline(always)]
     fn index(&self, index: usize) -> &Self::Output {
-        assert!(index < self.num_elements);
-        unsafe { &*self.ptr.add(index) }
+        &self.as_slice()[index]
     }
 }
 
-impl<'a, T> IndexMut<usize> for AlignedViewMut<'a, T> {
+impl<'a, T> IndexMut<usize> for AlignedViewMut<'a, T>
+where
+    T: Pod,
+{
     #[inline(always)]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        assert!(index < self.num_elements);
-        unsafe { &mut *self.ptr.add(index) }
+        &mut self.as_mut_slice()[index]
     }
 }
 
-impl<'a, T> Index<u32> for AlignedViewMut<'a, T> {
+impl<'a, T> Index<u32> for AlignedViewMut<'a, T>
+where
+    T: Pod,
+{
     type Output = T;
 
     #[inline(always)]
@@ -424,7 +494,10 @@ impl<'a, T> Index<u32> for AlignedViewMut<'a, T> {
     }
 }
 
-impl<'a, T> IndexMut<u32> for AlignedViewMut<'a, T> {
+impl<'a, T> IndexMut<u32> for AlignedViewMut<'a, T>
+where
+    T: Pod,
+{
     #[inline(always)]
     fn index_mut(&mut self, index: u32) -> &mut Self::Output {
         &mut self[index as usize]
@@ -435,12 +508,12 @@ impl<'a, T> IndexMut<u32> for AlignedViewMut<'a, T> {
 ///
 /// # Safety
 /// SlicesIter must yield slices with no overlap.
-pub unsafe trait PartitionViewIter<T> {
+pub(crate) unsafe trait PartitionViewIter<T> {
     /// Iterates the slices assigned to this thread.
-    /// Units of the range are elements and should be 128-bit-aligned
-    /// (see AlignedView::slice)
-    type SlicesIter: Iterator<Item = Range<usize>> + ExactSizeIterator + TrustedLen;
+    /// Units of the range are _128-bit values_, not elements.
+    type SlicesIter: RangeIter;
 
+    /// `view_len` has units of _128-bit values_, not elements.
     fn partition(self, view_len: usize) -> Self::SlicesIter;
 }
 
@@ -449,41 +522,70 @@ pub unsafe trait PartitionViewIter<T> {
 /// that thread 0 gets 128-bit slices [0, 32, 64, ..], thread 1 gets [1, 33, 65, ..], etc.
 /// This allows loads and stores operating on the partitioned slices to be fully coalesced.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub struct PartitionWithinWarpCoalesced;
+pub(crate) struct PartitionWithinWarpCoalesced;
 
-unsafe impl<T> PartitionViewIter<T> for PartitionWithinWarpCoalesced {
-    type SlicesIter = impl Iterator<Item = Range<usize>> + ExactSizeIterator + TrustedLen;
+unsafe impl<T> PartitionViewIter<T> for PartitionWithinWarpCoalesced
+where
+    T: 'static,
+{
+    type SlicesIter = impl RangeIter;
 
     #[inline(always)]
     fn partition(self, view_len: usize) -> Self::SlicesIter {
-        let stride = 32 * elements_per_u128::<T>();
-        assert!(view_len.is_multiple_of(stride));
-        let n = view_len / stride;
+        assert!(view_len.is_multiple_of(WARP_SIZE));
+        let n = view_len / WARP_SIZE;
         let lane_id = lane_id();
-        (0..n).map(move |i| {
-            let start = lane_id * elements_per_u128::<T>() + i * stride;
-            let end = start + elements_per_u128::<T>();
-            start..end
-        })
+
+        struct Iter<U> {
+            n: usize,
+            lane_id: usize,
+            _marker: PhantomData<U>,
+        }
+        impl<U> RangeIter for Iter<U>
+        where
+            U: 'static,
+        {
+            fn len(&self) -> usize {
+                self.n
+            }
+
+            unsafe fn get_unchecked(&self, i: usize) -> Range<usize> {
+                let start = self.lane_id + i * WARP_SIZE;
+                start..start + 1
+            }
+        }
+
+        Iter::<T> {
+            n,
+            lane_id,
+            _marker: PhantomData,
+        }
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub struct PartitionU128Chunks;
+pub(crate) struct PartitionU128Chunks;
 
 unsafe impl<T> PartitionViewIter<T> for PartitionU128Chunks {
-    type SlicesIter = impl Iterator<Item = Range<usize>> + ExactSizeIterator + TrustedLen;
+    type SlicesIter = impl RangeIter;
 
     #[inline(always)]
     fn partition(self, view_len: usize) -> Self::SlicesIter {
-        let stride = elements_per_u128::<T>();
-        let n = view_len / stride;
-        (0..n).map(move |i| {
-            // If we don't recompute this inside the loop, rustc_codegen_cuda crashes
-            // in MIR constant lowering. ¯\_(ツ)_/¯
-            let stride = elements_per_u128::<T>();
-            i * stride..(i + 1) * stride
-        })
+        struct Iter {
+            n: usize,
+        }
+
+        impl RangeIter for Iter {
+            fn len(&self) -> usize {
+                self.n
+            }
+
+            unsafe fn get_unchecked(&self, i: usize) -> Range<usize> {
+                i..i + 1
+            }
+        }
+
+        Iter { n: view_len }
     }
 }
 
@@ -493,4 +595,47 @@ pub fn elements_per_u128<T>() -> usize {
         assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
     }
     size_of::<u128>() / size_of::<T>()
+}
+
+#[allow(clippy::len_without_is_empty)]
+pub(crate) trait RangeIter: 'static {
+    fn len(&self) -> usize;
+    unsafe fn get_unchecked(&self, i: usize) -> Range<usize>;
+}
+
+pub(crate) trait IterWithLen {
+    type Item;
+
+    fn len(&self) -> usize;
+    unsafe fn get_unchecked(&mut self, i: usize) -> Self::Item;
+}
+
+#[allow(dead_code)]
+#[device]
+pub(crate) fn for_each<T, I: IterWithLen<Item = T>, F: FnMut(T)>(mut iter: I, mut f: F) {
+    #[llvm_unroll]
+    for i in 0..iter.len() {
+        f(unsafe { iter.get_unchecked(i) });
+    }
+}
+
+#[device]
+pub(crate) fn for_each_zip2<
+    A,
+    B,
+    IA: IterWithLen<Item = A>,
+    IB: IterWithLen<Item = B>,
+    F: FnMut(A, B),
+>(
+    mut iter_a: IA,
+    mut iter_b: IB,
+    mut f: F,
+) {
+    assert_eq!(iter_a.len(), iter_b.len());
+    #[llvm_unroll]
+    for i in 0..iter_a.len() {
+        f(unsafe { iter_a.get_unchecked(i) }, unsafe {
+            iter_b.get_unchecked(i)
+        });
+    }
 }
