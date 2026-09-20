@@ -1,5 +1,5 @@
 [workspace]
-members = ["cleandl", "sky-1"]
+members = ["cleandl", "sky-1", "cleandl/rust-kernels", "cleandl/rust-kernels/cuda-device-ext"]
 resolver = "3"
 
 [profile.dev.package.'*']

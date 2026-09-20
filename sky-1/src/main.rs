@@ -153,8 +153,6 @@ fn main() -> anyhow::Result<()> {
         dbg!(loss);
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
-
-        break;
     }
 
     Ok(())

@@ -1,0 +1,11 @@
+# required for cuda-oxide
+[toolchain]
+channel = "nightly-2026-08-28"
+components = [
+    "rust-src",
+    "rustc-dev",
+    "rust-analyzer",
+    "clippy",
+    "rustfmt",
+    "llvm-tools",
+]

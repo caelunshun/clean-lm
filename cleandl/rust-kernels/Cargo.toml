@@ -1,0 +1,9 @@
+[package]
+name = "cleandl-kernels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide" }
+cuda-macros = { git = "https://github.com/NVlabs/cuda-oxide", default-features = false }
+cuda-device-ext = { path = "cuda-device-ext" }
