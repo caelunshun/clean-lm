@@ -11,7 +11,8 @@ use cuda_device_ext::{bf16, bf16x2};
 use cuda_macros::{kernel, launch_bounds};
 
 use crate::{
-    PrefetchMode, WARP_SIZE, as_aligned_slice, as_aligned_slice_mut, as_bf16x2_slice, num_warps,
+    PrefetchMode, WARP_SIZE, as_aligned_slice, as_aligned_slice_mut, as_bf16x2_slice,
+    as_bf16x2_slice_mut, num_warps,
 };
 
 /// Template for fast RMSNorm where the vector size
@@ -35,18 +36,18 @@ fn rmsnorm_bf16_warp_persistent<
     x: &[bf16],
     gamma: &[bf16],
     y: &mut [bf16],
-    r_inv: &mut [bf16],
+    r_inv_buf: &mut [bf16],
     num_vectors: usize,
     stride: usize,
 ) {
     unsafe {
-        const TRANSACTION_THREAD_ELEMENTS: usize = 8;
-        const ELEMENTS_PER_TRANSACTION: usize = TRANSACTION_THREAD_ELEMENTS * WARP_SIZE;
+        const ELEMENTS_PER_LOAD_PER_THREAD: usize = 8;
+        const ELEMENTS_PER_LOAD_PER_WARP: usize = ELEMENTS_PER_LOAD_PER_THREAD * WARP_SIZE;
 
         const {
             // Required for fully vectorized loads.
             assert!(PREFETCH_STAGES > 0);
-            assert!(INNER_SIZE.is_multiple_of(ELEMENTS_PER_TRANSACTION));
+            assert!(INNER_SIZE.is_multiple_of(ELEMENTS_PER_LOAD_PER_WARP));
             assert!(ELEMENTS_PER_THREAD == INNER_SIZE / WARP_SIZE);
         }
 
@@ -54,20 +55,16 @@ fn rmsnorm_bf16_warp_persistent<
         let smem_gamma = slice::from_raw_parts_mut(smem, INNER_SIZE);
         let smem_buffer = smem.add(INNER_SIZE);
 
-        let get_buffer_slot =
-            |slot: usize| smem_buffer.add(INNER_SIZE * (warp_id() as usize + slot * num_warps()));
-        let get_thread_buffer_slot = |slot: usize| {
-            slice::from_raw_parts(
-                get_buffer_slot(slot).add(lane_id() as usize * ELEMENTS_PER_THREAD),
-                ELEMENTS_PER_THREAD,
-            )
+        let get_buffer_slot = |slot: usize| {
+            let ptr = smem_buffer.add(INNER_SIZE * (warp_id() as usize + slot * num_warps()));
+            slice::from_raw_parts_mut(ptr, INNER_SIZE)
         };
 
         // Fetch gamma into SMEM using one warp.
         if warp_id() == 0 {
-            for i in 0..INNER_SIZE / ELEMENTS_PER_TRANSACTION {
-                let offset =
-                    lane_id() as usize * TRANSACTION_THREAD_ELEMENTS + i * ELEMENTS_PER_TRANSACTION;
+            for i in 0..INNER_SIZE / ELEMENTS_PER_LOAD_PER_WARP {
+                let offset = lane_id() as usize * ELEMENTS_PER_LOAD_PER_THREAD
+                    + i * ELEMENTS_PER_LOAD_PER_WARP;
                 async_copy::cp_async_cg_16(
                     smem_gamma.as_mut_ptr().add(offset).cast(),
                     gamma.as_ptr().add(offset).cast(),
@@ -83,11 +80,11 @@ fn rmsnorm_bf16_warp_persistent<
         // Initial load pipeline fill for each warp.
         for (slot, row) in row_iter.clone().take(PREFETCH_STAGES).enumerate() {
             let dst = get_buffer_slot(slot);
-            for i in 0..INNER_SIZE / ELEMENTS_PER_TRANSACTION {
-                let offset =
-                    lane_id() as usize * TRANSACTION_THREAD_ELEMENTS + i * ELEMENTS_PER_TRANSACTION;
+            for i in 0..INNER_SIZE / ELEMENTS_PER_LOAD_PER_WARP {
+                let offset = lane_id() as usize * ELEMENTS_PER_LOAD_PER_THREAD
+                    + i * ELEMENTS_PER_LOAD_PER_WARP;
                 async_copy::cp_async_cg_16(
-                    dst.add(offset).cast(),
+                    dst.as_mut_ptr().add(offset).cast(),
                     x.as_ptr().add(stride * row + offset).cast(),
                 );
             }
@@ -96,15 +93,35 @@ fn rmsnorm_bf16_warp_persistent<
 
         sync_threads();
 
-        for (slot, row_idx) in row_iter.enumerate() {
+        for (iter, row_idx) in row_iter.clone().enumerate() {
             let mut thr_row: [bf16; ELEMENTS_PER_THREAD] = [bf16::ZERO; _];
 
             let prefetch_stages_minus_one = const { (PREFETCH_STAGES as u32).saturating_sub(1) };
             async_copy::cp_async_wait_group(prefetch_stages_minus_one);
 
-            let slot = slot % PREFETCH_STAGES;
-            let thread_buffer = get_thread_buffer_slot(slot);
-            as_aligned_slice_mut(&mut thr_row).copy_from_slice(as_aligned_slice(thread_buffer));
+            let slot = iter % PREFETCH_STAGES;
+            let slot_ptr = get_buffer_slot(slot);
+
+            for i in 0..ELEMENTS_PER_THREAD / ELEMENTS_PER_LOAD_PER_THREAD {
+                let idx = lane_id() as usize + i * ELEMENTS_PER_LOAD_PER_WARP;
+                as_aligned_slice_mut(&mut thr_row[idx..])[0] =
+                    as_aligned_slice(&slot_ptr[idx..])[0];
+            }
+
+            // Done with buffer slot; prefetch next row.
+            if let Some(next_row_idx) = row_iter.clone().nth(iter + PREFETCH_STAGES) {
+                let dst = get_buffer_slot(slot);
+                warp::sync_mask(u32::MAX);
+                for i in 0..INNER_SIZE / ELEMENTS_PER_LOAD_PER_WARP {
+                    let offset = lane_id() as usize * ELEMENTS_PER_LOAD_PER_THREAD
+                        + i * ELEMENTS_PER_LOAD_PER_WARP;
+                    async_copy::cp_async_cg_16(
+                        dst.as_mut_ptr().add(offset).cast(),
+                        x.as_ptr().add(stride * next_row_idx + offset).cast(),
+                    );
+                }
+                async_copy::cp_async_commit_group();
+            }
 
             let mut thr_sum2 = 0.0f32;
             for bf16_pair in as_bf16x2_slice(&thr_row) {
@@ -120,6 +137,33 @@ fn rmsnorm_bf16_warp_persistent<
             let r_inv = rsqrt_approx_ftz_f32(thr_sum2 + 1e-6);
 
             let mut thr_gamma = [bf16::ZERO; ELEMENTS_PER_THREAD];
+            for i in 0..ELEMENTS_PER_THREAD / ELEMENTS_PER_LOAD_PER_THREAD {
+                let idx = lane_id() as usize + i * ELEMENTS_PER_LOAD_PER_WARP;
+                as_aligned_slice_mut(&mut thr_gamma[idx..])[0] =
+                    as_aligned_slice(&smem_gamma[idx..])[0];
+            }
+
+            for (val, &gamma) in as_bf16x2_slice_mut(&mut thr_row)
+                .iter_mut()
+                .zip(as_bf16x2_slice(&thr_gamma))
+            {
+                let (v1, v2) = val.to_f32_pair();
+                let (g1, g2) = gamma.to_f32_pair();
+
+                let y1 = v1 * r_inv * g1;
+                let y2 = v2 * r_inv * g2;
+                *val = bf16x2::from_f32_pair(y1, y2);
+            }
+
+            // Write to GMEM.
+            for i in 0..ELEMENTS_PER_THREAD / ELEMENTS_PER_LOAD_PER_THREAD {
+                let idx = lane_id() as usize + i * ELEMENTS_PER_LOAD_PER_WARP;
+                as_aligned_slice_mut(&mut y[idx..])[0] = as_aligned_slice(&thr_row[idx..])[0];
+            }
+
+            if lane_id() == 0 {
+                r_inv_buf[row_idx] = bf16::from_f32(r_inv);
+            }
         }
     }
 }
