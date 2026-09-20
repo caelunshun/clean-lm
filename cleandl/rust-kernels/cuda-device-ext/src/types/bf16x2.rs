@@ -105,6 +105,12 @@ impl bf16x2 {
         Self(convert::cvt_rz_bf16x2_f32(lo, hi))
     }
 
+    #[must_use]
+    #[inline(always )]
+    pub fn to_bf16_pair(self) -> (bf16, bf16) {
+        (self.lo(), self.hi()) 
+    }
+
     /// Narrows and packs two `f32` values with round-to-nearest-even, clamping
     /// negatives to zero.
     #[must_use]

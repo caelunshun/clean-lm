@@ -12,7 +12,6 @@ macro_rules! include_cubins {
             sm90a: include_bytes!(concat!($base_path, ".sm90a.cubin")),
             sm100a: include_bytes!(concat!($base_path, ".sm100a.cubin")),
             sm103a: include_bytes!(concat!($base_path, ".sm103a.cubin")),
-            sm107a: include_bytes!(concat!($base_path, ".sm107a.cubin")),
             sm120a: include_bytes!(concat!($base_path, ".sm120a.cubin")),
             sm121a: include_bytes!(concat!($base_path, ".sm121a.cubin")),
         }
@@ -25,7 +24,6 @@ pub struct Cubins<'a> {
     pub sm90a: &'a [u8],
     pub sm100a: &'a [u8],
     pub sm103a: &'a [u8],
-    pub sm107a: &'a [u8],
     pub sm120a: &'a [u8],
     pub sm121a: &'a [u8],
 }
@@ -42,7 +40,6 @@ impl ResourceKey for Cubins<'static> {
             (9, 0) => self.sm90a,
             (10, 0) => self.sm100a,
             (10, 3) => self.sm103a,
-            (10, 7) => self.sm107a,
             (12, 0) => self.sm120a,
             (12, 1) => self.sm121a,
             (major, minor) => bail!("unsupported sm version {major}.{minor}"),

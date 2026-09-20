@@ -3,8 +3,14 @@ name = "cleandl-kernels"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(cuda_arch_specific, values("89", "90", "100", "103", "107", "120", "121"))',
+] }
+
 [dependencies]
 cuda-device = { git = "https://github.com/caelunshun/cuda-oxide" }
 cuda-macros = { git = "https://github.com/caelunshun/cuda-oxide", default-features = false }
 cuda-device-ext = { path = "cuda-device-ext" }
 bytemuck = { version = "1.25", features = ["must_cast"] }
+cfg-if = "1"

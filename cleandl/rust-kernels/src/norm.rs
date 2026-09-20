@@ -1,23 +1,14 @@
-use core::slice;
-
 use cuda_device::{
-    DynamicSharedArray, async_copy,
+    DynamicSharedArray, async_copy, blockIdx_x,
+    cooperative_groups::{ThreadGroup, this_thread_block},
     float::rsqrt_approx_ftz_f32,
-    sync_threads,
     uniform::grid_dim_x,
     warp::{self, warp_id},
 };
-use cuda_device_ext::bf16;
-use cuda_macros::{kernel, launch_bounds};
+use cuda_device_ext::{bf16, bf16x2};
+use cuda_macros::{device, kernel, launch_bounds};
 
-use crate::{
-    PrefetchMode, WARP_SIZE, lane_id, make_register_view, num_warps,
-    smem_ring::StagingBufferRing,
-    view::{
-        AlignedView, AlignedViewMut, PartitionU128Chunks, PartitionWithinWarpCoalesced,
-        elements_per_u128, for_each_zip2,
-    },
-};
+use crate::{WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id};
 
 /// Template for fast RMSNorm where the vector size
 /// is small enough to fit within a single warp's registers, enabling
@@ -31,167 +22,186 @@ use crate::{
 ///
 /// Uses dynamic shared memory. Gamma is cached at the beginning of dynamic shared memory.
 /// The rest holds prefetch buffers.
+#[device]
 fn rmsnorm_bf16_warp_persistent<
     const INNER_SIZE: usize,
     const ELEMENTS_PER_THREAD: usize,
     const PREFETCH_STAGES: usize,
-    const PREFETCH_MODE: PrefetchMode,
+    const NUM_WARPS: usize,
 >(
     gmem_x: *const bf16,
     gmem_gamma: *const bf16,
     gmem_y: *mut bf16,
     gmem_r_inv: *mut f32,
-    num_vectors: usize,
+    num_vectors: u32,
 ) {
     unsafe {
-        const ELEMENTS_PER_LOAD_PER_THREAD: usize = 8;
-        const ELEMENTS_PER_LOAD_PER_WARP: usize = ELEMENTS_PER_LOAD_PER_THREAD * WARP_SIZE;
+        let smem_base = DynamicSharedArray::<bf16, 128>::get();
+        let smem_gamma = smem_base;
+        let get_smem_slot = |i| smem_base.add((i + 1) * INNER_SIZE * NUM_WARPS);
 
-        const {
-            // Required for fully vectorized loads.
-            assert!(PREFETCH_STAGES > 0);
-            assert!(INNER_SIZE.is_multiple_of(ELEMENTS_PER_LOAD_PER_WARP));
-            assert!(ELEMENTS_PER_THREAD == INNER_SIZE / WARP_SIZE);
-        }
-
-        let stride = INNER_SIZE;
-
-        let gmem_x = AlignedView::from_ptr(gmem_x, num_vectors * stride);
-        let gmem_gamma = AlignedView::from_ptr(gmem_gamma, INNER_SIZE);
-        let mut gmem_y = AlignedViewMut::from_ptr(gmem_y, num_vectors * stride);
-        let gmem_r_inv = slice::from_raw_parts_mut(gmem_r_inv, num_vectors);
-
-        let smem = slice::from_raw_parts_mut(
-            DynamicSharedArray::<u128>::get(),
-            INNER_SIZE / elements_per_u128::<bf16>() * (PREFETCH_STAGES + 1),
-        );
-        let (smem_gamma, smem_staging) =
-            smem.split_at_mut(INNER_SIZE / elements_per_u128::<bf16>());
-        let mut smem_gamma = AlignedViewMut::<bf16>::new(smem_gamma);
-        let mut smem_ring =
-            StagingBufferRing::<bf16>::new(smem_staging, INNER_SIZE, PREFETCH_STAGES);
-
-        // Fetch gamma into SMEM using one warp.
+        // Warp 0 copies gamma into SMEM.
         if warp_id() == 0 {
-            for_each_zip2(
-                smem_gamma.partition_iter(PartitionWithinWarpCoalesced),
-                gmem_gamma.partition_iter(PartitionWithinWarpCoalesced),
-                |mut dst, src| {
-                    dst.async_copy_from_cg(src);
-                },
+            collective_async_copy_g2s_128bit(
+                gmem_gamma,
+                smem_gamma,
+                INNER_SIZE as u32,
+                this_thread_block().tiled_partition::<32>(),
             );
             async_copy::cp_async_commit_group();
             async_copy::cp_async_wait_all();
         }
+        this_thread_block().sync();
 
-        let cta_stride = grid_dim_x().get() as usize * num_warps();
-        let row_iter = (warp_id() as usize..num_vectors).step_by(cta_stride);
-
-        // Initial load pipeline fill for each warp.
-        for (slot, row) in row_iter.clone().take(PREFETCH_STAGES).enumerate() {
-            let gmem_row = gmem_x.slice(row * stride..).slice(..INNER_SIZE);
-
-            for_each_zip2(
-                smem_ring
-                    .slot_mut(slot)
-                    .partition_iter(PartitionWithinWarpCoalesced),
-                gmem_row.partition_iter(PartitionWithinWarpCoalesced),
-                |mut dst, src| {
-                    dst.async_copy_from_cg(src);
-                },
+        let do_prefetch = |row_idx: u32, slot_index: u32| {
+            let dst =
+                get_smem_slot(slot_index as usize).add((INNER_SIZE as u32 * warp_id()) as usize);
+            let src = gmem_x.add(row_idx as usize * INNER_SIZE);
+            collective_async_copy_g2s_128bit(
+                src,
+                dst,
+                INNER_SIZE as u32,
+                this_thread_block().tiled_partition::<32>(),
             );
-
             async_copy::cp_async_commit_group();
+        };
+
+        let cta_stride = NUM_WARPS as u32 * grid_dim_x().get();
+        let first_row = warp_id() + blockIdx_x() * NUM_WARPS as u32;
+
+        // Initial pipeline fill.
+        #[llvm_unroll]
+        for i in 0..PREFETCH_STAGES as u32 {
+            let row_idx = first_row + i * cta_stride;
+            if row_idx < num_vectors {
+                do_prefetch(row_idx, i);
+            }
         }
 
-        sync_threads();
+        let mut row_idx = first_row;
+        let mut i = 0;
+        while row_idx < num_vectors {
+            let slot_idx = i as u32 % PREFETCH_STAGES as u32;
 
-        for (iteration, row_idx) in row_iter.clone().enumerate() {
-            make_register_view!(x, bf16, ELEMENTS_PER_THREAD);
+            // Wait for our SMEM slot to be ready.
+            let pipeline_depth_minus_one = const { PREFETCH_STAGES as u32 - 1 };
+            async_copy::cp_async_wait_group(pipeline_depth_minus_one);
 
-            let prefetch_stages_minus_one = const { PREFETCH_STAGES as u32 - 1 };
-            async_copy::cp_async_wait_group(prefetch_stages_minus_one);
+            // Copy row and gamma from SMEM into registers.
+            let mut thr_x = [bf16::ZERO; { INNER_SIZE / WARP_SIZE as usize }];
+            let mut thr_gamma = [bf16::ZERO; { INNER_SIZE / WARP_SIZE as usize }];
 
-            let slot = iteration % PREFETCH_STAGES;
-            for_each_zip2(
-                x.partition_iter(PartitionU128Chunks),
-                smem_ring
-                    .slot(slot)
-                    .partition_iter(PartitionWithinWarpCoalesced),
-                |mut dst, src| {
-                    dst.copy_from(src);
-                },
-            );
+            let chunks_per_thread = INNER_SIZE as u32 / WARP_SIZE / elements_per_u128::<bf16>();
+            #[llvm_unroll]
+            for j in 0..chunks_per_thread {
+                let src = get_smem_slot(slot_idx as usize)
+                    .add((warp_id() * INNER_SIZE as u32) as usize)
+                    .add(
+                        (lane_id() * elements_per_u128::<bf16>()
+                            + j * elements_per_u128::<bf16>() * WARP_SIZE)
+                            as usize,
+                    );
+                let dst = thr_x
+                    .as_mut_ptr()
+                    .add((j * elements_per_u128::<bf16>()) as usize);
+                dst.cast::<u128>().write(src.cast::<u128>().read());
 
-            // Prefetch next row for this slot.
-            let next_row_idx = row_idx + cta_stride * PREFETCH_STAGES;
-            if next_row_idx < num_vectors {
-                let gmem_next_row =
-                    gmem_x.slice(stride * next_row_idx..stride * next_row_idx + INNER_SIZE);
-                for_each_zip2(
-                    smem_ring
-                        .slot_mut(slot)
-                        .partition_iter(PartitionWithinWarpCoalesced),
-                    gmem_next_row.partition_iter(PartitionWithinWarpCoalesced),
-                    |mut dst, src| {
-                        dst.async_copy_from_cg(src);
-                    },
+                let src = smem_gamma.add(
+                    (lane_id() * elements_per_u128::<bf16>()
+                        + j * elements_per_u128::<bf16>() * WARP_SIZE) as usize,
                 );
+                let dst = thr_gamma
+                    .as_mut_ptr()
+                    .add((j * elements_per_u128::<bf16>()) as usize);
+                dst.cast::<u128>().write(src.cast::<u128>().read());
             }
 
+            // With the SMEM data consumed, we can prefetch the next stage.
+            warp::sync_mask(u32::MAX);
+            let next_row_idx = row_idx + cta_stride * PREFETCH_STAGES as u32;
+            if next_row_idx < num_vectors {
+                do_prefetch(next_row_idx, slot_idx);
+            }
+
+            // Compute sum(x^2).
             let mut thr_sum2 = 0.0f32;
-            for val in &x {
-                let val = val.to_f32();
-                thr_sum2 += val * val;
+            #[llvm_unroll]
+            for pair in thr_x.chunks_exact(2) {
+                let pair = bf16x2::new(pair[0], pair[1]);
+                let (v1, v2) = pair.to_f32_pair();
+                thr_sum2 += v1 * v1 + v2 * v2;
             }
 
             // Intra-warp reduction.
+            #[llvm_unroll]
             for i in 0..WARP_SIZE.ilog2() {
                 thr_sum2 += warp::shuffle_xor_f32_sync(u32::MAX, thr_sum2, 1 << i);
             }
 
-            let r_inv = rsqrt_approx_ftz_f32(thr_sum2 + 1e-6);
+            // Compute reciprocal divisor.
+            let r_inv = rsqrt_approx_ftz_f32(thr_sum2 * (1.0 / INNER_SIZE as f32) + 1e-6);
 
-            make_register_view!(gamma, bf16, ELEMENTS_PER_THREAD);
-            for_each_zip2(
-                gamma.partition_iter(PartitionU128Chunks),
-                smem_gamma.partition_iter(PartitionWithinWarpCoalesced),
-                |mut dst, src| {
-                    dst.copy_from(src.as_view());
-                },
-            );
-
-            for (x, gamma) in (&mut x).into_iter().zip(&gamma) {
-                *x = bf16::from_f32(x.to_f32() * gamma.to_f32() * r_inv);
+            // Apply normalization to the data.
+            #[llvm_unroll]
+            for i in 0..thr_x.len() / 2 {
+                let x_pair = &mut thr_x[i * 2..][..2];
+                let gamma_pair = &mut thr_gamma[i * 2..][..2];
+                let (x1, x2) = bf16x2::new(x_pair[0], x_pair[1]).to_f32_pair();
+                let (g1, g2) = bf16x2::new(gamma_pair[0], gamma_pair[1]).to_f32_pair();
+                let (y1, y2) = (x1 * g1 * r_inv, x2 * g2 * r_inv);
+                (x_pair[0], x_pair[1]) = bf16x2::from_f32_pair(y1, y2).to_bf16_pair();
             }
 
-            // Store to GMEM.
-            let mut gmem_row = gmem_y.slice_mut(row_idx * stride..row_idx * stride + INNER_SIZE);
-            for_each_zip2(
-                x.partition_iter(PartitionU128Chunks),
-                gmem_row.partition_iter(PartitionWithinWarpCoalesced),
-                |src, mut dst| {
-                    dst.copy_from(src.as_view());
-                },
-            );
+            let gmem_y = gmem_y.add(row_idx as usize * INNER_SIZE);
 
+            // Write result to GMEM.
+            #[llvm_unroll]
+            for j in 0..chunks_per_thread {
+                let src = thr_x
+                    .as_ptr()
+                    .add((j * elements_per_u128::<bf16>()) as usize);
+                let dst = gmem_y.add(
+                    (lane_id() * elements_per_u128::<bf16>()
+                        + j * elements_per_u128::<bf16>() * WARP_SIZE) as usize,
+                );
+                dst.cast::<u128>().write(src.cast::<u128>().read());
+            }
+
+            let gmem_r_inv = gmem_r_inv.add(row_idx as usize);
             if lane_id() == 0 {
-                *gmem_r_inv.get_unchecked_mut(row_idx) = r_inv;
+                gmem_r_inv.write(r_inv);
             }
+
+            i += 1;
+            row_idx += cta_stride;
         }
     }
 }
 
 #[kernel]
-#[launch_bounds(256, 1)]
-pub fn rmsnorm_bf16_warp_persistent_inner2048_sm90_sm10x(
+#[launch_bounds(384, 1)]
+pub fn rmsnorm_bf16_warp_persistent_inner2048(
     gmem_x: *const bf16,
     gmem_gamma: *const bf16,
     gmem_y: *mut bf16,
     gmem_r_inv: *mut f32,
-    num_vectors: usize,
+    num_vectors: u32,
 ) {
-    rmsnorm_bf16_warp_persistent::<2048, 64, 2, { PrefetchMode::CpAsyncBulk }>(
+    cfg_select! {
+        any(
+            cuda_arch_specific = "90",
+            cuda_arch_specific = "100",
+            cuda_arch_specific = "103",
+            cuda_arch_specific = "107"
+        ) => {
+            const PREFETCH_STAGES: usize = 4;
+        }
+        _ => {
+            const PREFETCH_STAGES: usize = 1;
+        }
+    }
+
+    rmsnorm_bf16_warp_persistent::<2048, 64, PREFETCH_STAGES, 12>(
         gmem_x,
         gmem_gamma,
         gmem_y,
