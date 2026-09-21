@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use serde::Serialize;
+use rand::{RngExt, SeedableRng};
+use rand_xoshiro::Xoroshiro128StarStar;
+use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
 use skycuda_cublaslt::{
     Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout, Order,
@@ -9,6 +11,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, ResourceKey},
+    disk_cache::DiskCacheKey,
     tensor::{Tensor, TensorView},
 };
 
@@ -167,9 +170,13 @@ impl ResourceKey for MatmulConfig {
             .build_plan(&desc, &MatmulPreference::default().requested_algo_count(32))?;
 
         let algo = if cx.is_autotuning_enabled() {
-            todo!()
+            let index = autotune(&plan, self, cx)?;
+            plan.algorithms()
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| plan.algorithms()[0])
         } else {
-            plan.algorithms()[0].clone()
+            plan.algorithms()[0]
         };
 
         Ok(MatmulExecutor {
@@ -180,6 +187,96 @@ impl ResourceKey for MatmulConfig {
             algo,
         })
     }
+}
+
+fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::Result<usize> {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct MatmulAutotuningCacheKey {
+        config: serde_json::Value,
+        num_algorithms: usize,
+    }
+
+    #[typetag::serde]
+    impl DiskCacheKey for MatmulAutotuningCacheKey {}
+
+    cx.disk_cache().get_or_create(
+        &MatmulAutotuningCacheKey {
+            config: serde_json::to_value(config)?,
+            num_algorithms: plan.algorithms().len(),
+        },
+        || {
+            cx.cuda().set_as_current()?;
+
+            let make_dummy = |rows: usize, cols: usize, element_type: ElementType| {
+                let mut tensor = Tensor::new_zeroed([rows, cols], element_type, cx)?;
+                let data = Xoroshiro128StarStar::seed_from_u64(66)
+                    .random_iter::<u8>()
+                    .take(tensor.storage().len())
+                    .collect::<Vec<_>>();
+                cx.upload_to_device(&data, tensor.storage_mut(), cx.h2d_copy_stream())?;
+                anyhow::Ok(tensor)
+            };
+
+            let a = make_dummy(config.m, config.k, config.ab_element_type)?;
+            let b = make_dummy(config.k, config.n, config.ab_element_type)?;
+            let residual = config
+                .residual
+                .as_ref()
+                .map(|residual| make_dummy(config.m, config.n, residual.element_type))
+                .transpose()?;
+            let mut out = make_dummy(config.m, config.n, config.out_element_type)?;
+            cx.h2d_copy_stream().block_on()?;
+
+            let mut workspace = cx
+                .device_memory_pool()
+                .alloc_zeroed_on(plan.max_workspace_size(), cx.memset_stream())?;
+
+            let mut operands = plan.operands();
+            operands.a(a.storage()).b(b.storage()).d(out.storage_mut());
+            if let Some(residual) = &residual {
+                operands.c(residual.storage());
+            }
+
+            let mut best_algo_idx = 0;
+            let mut best_algo_time = None;
+            for (i, algo) in plan.algorithms().iter().enumerate() {
+                let name = format!("{:?}", algo.config()?);
+                let time = crate::autotuning::measure_kernel(
+                    |stream| unsafe {
+                        plan.execute_with(algo, stream, &operands, &mut workspace)?;
+                        Ok(())
+                    },
+                    &name,
+                    cx,
+                );
+                let time = match time {
+                    Ok(time) => time,
+                    Err(e) => {
+                        tracing::debug!(
+                            "skipping matmul algorithm {name} due to execution failure: {e}"
+                        );
+                        continue;
+                    }
+                };
+                if best_algo_time.is_none() || time < best_algo_time.unwrap() {
+                    best_algo_idx = i;
+                    best_algo_time = Some(time);
+                }
+            }
+            tracing::info!(
+                "winning matmul algorithm for shape {}x{}x{}: {:?} in {:.1?}",
+                config.m,
+                config.n,
+                config.k,
+                plan.algorithms()[best_algo_idx].config()?,
+                best_algo_time.unwrap_or_default(),
+            );
+
+            drop(operands);
+
+            Ok(best_algo_idx)
+        },
+    )
 }
 
 fn make_matrix_layout(
