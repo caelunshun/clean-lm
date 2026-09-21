@@ -16,8 +16,7 @@ use crate::{
 #[derive(Debug)]
 pub struct NormExecutor {
     cx: Context,
-    bwd_module: Arc<Module>,
-    fwd_module: Arc<Module>,
+    module: Arc<Module>,
 }
 
 /// Outputs of [`NormExecutor::rmsnorm_forward`].
@@ -62,7 +61,7 @@ impl NormExecutor {
         )?;
 
         let (kernel_name, cta_threads) = fwd_kernel_spec(inner_dim)?;
-        let kernel = self.fwd_module.get_function(kernel_name)?;
+        let kernel = self.module.get_function(kernel_name)?;
 
         let dynamic_smem = self.cx.cuda().max_dynamic_smem_per_cta() - 1024;
         kernel.set_max_dynamic_smem(dynamic_smem)?;
@@ -140,10 +139,13 @@ impl NormExecutor {
             &self.cx,
         )?;
 
-        let kernel_name = bwd_kernel_name(inner_dim)?;
-        let kernel = self.bwd_module.get_function(kernel_name)?;
+        let (kernel_name, cta_size) = bwd_kernel_spec(inner_dim)?;
+        let kernel = self.module.get_function(kernel_name)?;
 
-        let occupancy = kernel.max_active_blocks_per_sm(1, 0)? * stream.device().sm_count();
+        let dynamic_smem = self.cx.cuda().max_dynamic_smem_per_cta() - 1024;
+        kernel.set_max_dynamic_smem(dynamic_smem)?;
+
+        let occupancy = stream.device().sm_count();
 
         {
             let x_memory = x.storage();
@@ -166,7 +168,9 @@ impl NormExecutor {
                 .arg(r_inv_memory)?
                 .arg(out_dx_memory)?
                 .arg(out_dgamma_memory)?
-                .arg(i32::try_from(batch_size)?)?;
+                .arg(i32::try_from(batch_size)?)?
+                .dynamic_smem(dynamic_smem)?
+                .block_size(cta_size, 1, 1)?;
             // Block dim and smem are overriden by TileIR.
             unsafe {
                 launch.launch(occupancy as u32, 1, 1)?;
@@ -186,9 +190,9 @@ fn fwd_kernel_spec(inner_dim: usize) -> anyhow::Result<(&'static str, u32)> {
     }
 }
 
-fn bwd_kernel_name(inner_dim: usize) -> anyhow::Result<&'static str> {
+fn bwd_kernel_spec(inner_dim: usize) -> anyhow::Result<(&'static str, u32)> {
     match inner_dim {
-        2048 => Ok("rmsnorm_bwd_inner2048_persistent"),
+        2048 => Ok(("rmsnorm_bwd_bf16_cta_persistent_inner2048", 256)),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
 }
@@ -208,9 +212,8 @@ impl ResourceKey for NormExecutorKey {
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         Ok(NormExecutor {
             cx: cx.clone(),
-            fwd_module: cx
+            module: cx
                 .get_or_create_resource(include_cubins!("../../rust-kernels/target/kernels"))?,
-            bwd_module: cx.get_or_create_resource(include_cubins!("../../cutile-kernels/norm"))?,
         })
     }
 }

@@ -1,6 +1,6 @@
 use cuda_device::{
     DynamicSharedArray, async_copy,
-    atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32},
+    atomic::{AtomicOrdering, DeviceAtomicF32},
     blockIdx_x,
     cooperative_groups::{ThreadGroup, this_thread_block},
     float::rsqrt_approx_ftz_f32,
@@ -39,7 +39,7 @@ fn rmsnorm_bf16_warp_persistent<
     unsafe {
         let smem_base = DynamicSharedArray::<bf16, 128>::get();
         let smem_gamma = smem_base;
-        let get_smem_slot = |i| smem_base.add((i + 1) * VECTOR_SIZE * NUM_WARPS);
+        let get_smem_slot = |i| smem_base.add(VECTOR_SIZE + i * VECTOR_SIZE * NUM_WARPS);
 
         // Warp 0 copies gamma into SMEM.
         if warp_id() == 0 {
@@ -55,15 +55,17 @@ fn rmsnorm_bf16_warp_persistent<
         this_thread_block().sync();
 
         let do_prefetch = |row_idx: u32, slot_index: u32| {
-            let dst =
-                get_smem_slot(slot_index as usize).add((VECTOR_SIZE as u32 * warp_id()) as usize);
-            let src = gmem_x.add(row_idx as usize * VECTOR_SIZE);
-            collective_async_copy_g2s_128bit(
-                src,
-                dst,
-                VECTOR_SIZE as u32,
-                this_thread_block().tiled_partition::<32>(),
-            );
+            if row_idx < num_rows {
+                let dst = get_smem_slot(slot_index as usize)
+                    .add((VECTOR_SIZE as u32 * warp_id()) as usize);
+                let src = gmem_x.add(row_idx as usize * VECTOR_SIZE);
+                collective_async_copy_g2s_128bit(
+                    src,
+                    dst,
+                    VECTOR_SIZE as u32,
+                    this_thread_block().tiled_partition::<32>(),
+                );
+            }
             async_copy::cp_async_commit_group();
         };
 
@@ -73,10 +75,7 @@ fn rmsnorm_bf16_warp_persistent<
         // Initial pipeline fill.
         #[llvm_unroll]
         for i in 0..PREFETCH_STAGES as u32 {
-            let row_idx = first_row + i * cta_stride;
-            if row_idx < num_rows {
-                do_prefetch(row_idx, i);
-            }
+            do_prefetch(first_row + i * cta_stride, i);
         }
 
         let mut row_idx = first_row;
@@ -119,10 +118,7 @@ fn rmsnorm_bf16_warp_persistent<
 
             // With the SMEM data consumed, we can prefetch the next stage.
             warp::sync_mask(u32::MAX);
-            let next_row_idx = row_idx + cta_stride * PREFETCH_STAGES as u32;
-            if next_row_idx < num_rows {
-                do_prefetch(next_row_idx, slot_idx);
-            }
+            do_prefetch(row_idx + cta_stride * PREFETCH_STAGES as u32, slot_idx);
 
             // Compute sum(x^2).
             let mut thr_sum2 = 0.0f32;
@@ -270,13 +266,13 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                 .cast::<f32>()
         };
 
-        // one f32 value per row in SMEM for inter-warp reductions.
+        // one f32 value per row, per warp in SMEM for inter-warp reductions.
         let reduction_scratchpad = smem_base
             .add(
-                4 * VECTOR_SIZE * PREFETCH_STAGES * ROWS_PER_ITER
-                    + ROWS_PER_ITER * (size_of::<f32>() / size_of::<bf16>()),
+                3 * VECTOR_SIZE * PREFETCH_STAGES * ROWS_PER_ITER
+                    + PREFETCH_STAGES * ROWS_PER_ITER * (size_of::<f32>() / size_of::<bf16>()),
             )
-            .cast::<BlockAtomicF32>();
+            .cast::<f32>();
 
         // Synchronously load gamma to keep in registers.
         let mut thr_gamma = [bf16::ZERO; { VECTOR_SIZE / NUM_WARPS / WARP_SIZE as usize }];
@@ -354,14 +350,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                 {
                     get_residual_prefetch_slot(slot_idx)
                         .cast::<u128>()
-                        .add(
-                            (i as u32
-                                + thread_id
-                                    * NUM_WARPS as u32
-                                    * WARP_SIZE
-                                    * elements_per_u128::<bf16>())
-                                as usize,
-                        )
+                        .add((thread_id + i as u32 * cta_threads) as usize)
                         .write(0);
                 }
             }
@@ -420,13 +409,6 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                 dst.write(src.read());
             }
 
-            // pre-zero reduction scratchpad before the barrier
-            if thread_id < ROWS_PER_ITER as u32 {
-                reduction_scratchpad
-                    .add(thread_id as usize)
-                    .write(BlockAtomicF32::new(0.0));
-            }
-
             // `r_inv`
             // need to wait for the leader warp who issued the load
             this_thread_block().sync();
@@ -452,6 +434,9 @@ fn rmsnorm_bwd_bf16_cta_persistent<
 
             #[llvm_unroll]
             for i in 0..ROWS_PER_ITER {
+                if first_row_idx + i as u32 >= num_rows {
+                    continue;
+                }
                 let offs = i * elements_per_row_per_thread;
                 let r_inv = thr_r_inv[i];
                 #[llvm_unroll]
@@ -484,19 +469,26 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                 *c = warp::reduce_sum_f32(*c);
             }
 
-            // Inter-warp reduction of `c` via shared memory atomics.
+            // Inter-warp reduction of `c` by sending each warp's per-row contributions
+            // to SMEM, then having each warp load all warps' values and independently compute
+            // the CTA-wide sum.
             if lane_id() == 0 {
                 #[llvm_unroll]
                 for i in 0..ROWS_PER_ITER {
-                    (&*reduction_scratchpad.add(i)).fetch_add(thr_c[i], AtomicOrdering::Relaxed);
+                    reduction_scratchpad
+                        .add(i + warp_id() as usize * ROWS_PER_ITER)
+                        .write(thr_c[i]);
                 }
             }
-
             this_thread_block().sync();
 
             #[llvm_unroll]
             for i in 0..ROWS_PER_ITER {
-                thr_c[i] = (&*reduction_scratchpad.add(i)).load(AtomicOrdering::Relaxed);
+                thr_c[i] = 0.0;
+                #[llvm_unroll]
+                for warp in 0..NUM_WARPS {
+                    thr_c[i] += reduction_scratchpad.add(i + warp * ROWS_PER_ITER).read();
+                }
             }
 
             // compute dx = r_inv * (g - x_hat * c) + residual
@@ -505,6 +497,9 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                 [bf16::ZERO; { VECTOR_SIZE * ROWS_PER_ITER / NUM_WARPS / WARP_SIZE as usize }];
             #[llvm_unroll]
             for i in 0..ROWS_PER_ITER {
+                if first_row_idx + i as u32 >= num_rows {
+                    continue;
+                }
                 let r_inv = thr_r_inv[i];
                 let c = thr_c[i];
                 let offs = i * elements_per_row_per_thread;
@@ -533,6 +528,9 @@ fn rmsnorm_bwd_bf16_cta_persistent<
             // store dx to GMEM
             #[llvm_unroll]
             for i in 0..ROWS_PER_ITER {
+                if first_row_idx + i as u32 >= num_rows {
+                    continue;
+                }
                 #[llvm_unroll]
                 for j in 0..elements_per_row_per_thread / elements_per_u128::<bf16>() as usize {
                     let src = thr_dx
@@ -561,9 +559,8 @@ fn rmsnorm_bwd_bf16_cta_persistent<
             for j in 0..elements_per_u128::<bf16>() as usize {
                 let src = thr_dgamma_partials[i * elements_per_u128::<bf16>() as usize + j];
                 let dst = gmem_dgamma.add(
-                    i * cta_threads as usize
-                        * (WARP_SIZE as usize * NUM_WARPS * elements_per_u128::<bf16>() as usize)
-                        + thread_id as usize * elements_per_u128::<bf16>() as usize
+                    (i * cta_threads as usize + thread_id as usize)
+                        * elements_per_u128::<bf16>() as usize
                         + j,
                 );
                 (&*dst).fetch_add(src, AtomicOrdering::Relaxed);
