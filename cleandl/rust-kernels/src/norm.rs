@@ -87,6 +87,21 @@ fn rmsnorm_bf16_warp_persistent<
             do_prefetch(first_row + i * cta_stride, i);
         }
 
+        // Replicate gamma into registers.
+        let mut thr_gamma = [bf16::ZERO; { VECTOR_SIZE / WARP_SIZE as usize }];
+        let chunks_per_thread = VECTOR_SIZE as u32 / WARP_SIZE / elements_per_u128::<bf16>();
+        #[llvm_unroll]
+        for j in 0..chunks_per_thread {
+            let src = smem_gamma.add(
+                (lane_id() * elements_per_u128::<bf16>()
+                    + j * elements_per_u128::<bf16>() * WARP_SIZE) as usize,
+            );
+            let dst = thr_gamma
+                .as_mut_ptr()
+                .add((j * elements_per_u128::<bf16>()) as usize);
+            dst.cast::<u128>().write(src.cast::<u128>().read());
+        }
+
         let mut row_idx = first_row;
         let mut i = 0;
         while row_idx < num_rows {
@@ -96,9 +111,8 @@ fn rmsnorm_bf16_warp_persistent<
             let pipeline_depth_minus_one = const { PREFETCH_STAGES as u32 - 1 };
             async_copy::cp_async_wait_group(pipeline_depth_minus_one);
 
-            // Copy row and gamma from SMEM into registers.
+            // Copy row from SMEM into registers.
             let mut thr_x = [bf16::ZERO; { VECTOR_SIZE / WARP_SIZE as usize }];
-            let mut thr_gamma = [bf16::ZERO; { VECTOR_SIZE / WARP_SIZE as usize }];
 
             let chunks_per_thread = VECTOR_SIZE as u32 / WARP_SIZE / elements_per_u128::<bf16>();
             #[llvm_unroll]
@@ -114,19 +128,9 @@ fn rmsnorm_bf16_warp_persistent<
                     .as_mut_ptr()
                     .add((j * elements_per_u128::<bf16>()) as usize);
                 dst.cast::<u128>().write(src.cast::<u128>().read());
-
-                let src = smem_gamma.add(
-                    (lane_id() * elements_per_u128::<bf16>()
-                        + j * elements_per_u128::<bf16>() * WARP_SIZE) as usize,
-                );
-                let dst = thr_gamma
-                    .as_mut_ptr()
-                    .add((j * elements_per_u128::<bf16>()) as usize);
-                dst.cast::<u128>().write(src.cast::<u128>().read());
             }
 
             // With the SMEM data consumed, we can prefetch the next stage.
-            warp::sync_mask(u32::MAX);
             do_prefetch(row_idx + cta_stride * PREFETCH_STAGES as u32, slot_idx);
 
             // Compute sum(x^2).
@@ -598,7 +602,20 @@ pub fn rmsnorm_bwd_bf16_cta_persistent_inner2048(
     gmem_dgamma: *mut DeviceAtomicF32,
     num_rows: u32,
 ) {
-    const PREFETCH_STAGES: usize = 1;
+    cfg_select! {
+        any(
+            cuda_arch_specific = "90",
+            cuda_arch_specific = "100",
+            cuda_arch_specific = "103",
+            cuda_arch_specific = "107"
+        ) => {
+            const PREFETCH_STAGES: usize = 3;
+        }
+        _ => {
+            const PREFETCH_STAGES: usize = 1;
+        }
+    }
+
     rmsnorm_bwd_bf16_cta_persistent::<2048, 4, PREFETCH_STAGES, 8>(
         gmem_x,
         gmem_dy,

@@ -16,6 +16,7 @@ use skycuda::{
     host_pinned_memory_pool::{HostPinnedMemoryPool, HostPinnedMemoryPoolOptions},
     stream::Stream,
 };
+use skycuda_cublaslt::CublasLtHandle;
 use skycuda_cudnn::CudnnHandle;
 use thread_local::ThreadLocal;
 
@@ -36,6 +37,7 @@ impl Context {
         let device_memory_pool = cuda.create_device_memory_pool(device_memory_options)?;
         let host_pinned_memory_pool =
             cuda.create_host_pinned_memory_pool(host_pinned_memory_options)?;
+        let cublaslt = CublasLtHandle::new(&cuda)?;
 
         Ok(Self(Arc::new(Inner {
             default_compute_stream: cuda.create_stream()?,
@@ -50,6 +52,7 @@ impl Context {
             host_pinned_memory_pool,
             disk_cache: DiskCache::new()?,
             enable_autotuning,
+            cublaslt,
         })))
     }
 
@@ -151,6 +154,10 @@ impl Context {
     pub fn is_autotuning_enabled(&self) -> bool {
         self.0.enable_autotuning
     }
+
+    pub fn cublaslt(&self) -> &CublasLtHandle {
+        &self.0.cublaslt
+    }
 }
 
 type Resource = Arc<dyn Any + Send + Sync>;
@@ -170,6 +177,7 @@ struct Inner {
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
     disk_cache: DiskCache,
     enable_autotuning: bool,
+    cublaslt: CublasLtHandle,
 }
 
 pub trait ResourceKey: Serialize + 'static {

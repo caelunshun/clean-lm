@@ -27,6 +27,7 @@ pub mod decoder;
 
 #[derive(Debug)]
 pub struct MetaTensors {
+    pub decoder_seqlen_cpu: Vec<u32>,
     pub decoder_seqlen: Tensor,
     pub decoder_cu_seqlen: Tensor,
     pub decoder_cu_seqlen_times_hd_times_qh: Tensor,

@@ -12,7 +12,7 @@ use cleandl::{
         linear::{LinearConfig, LinearExecutor},
         matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
         norm::{NormExecutor, RmsNormForwardOutput},
-        rope::{RopeConfig, RopeExecutor},
+        rope::{RopeConfig, RopeExecutor, RopeMode},
         swiglu_ffn::{DownProjDgradOutput, GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
     },
     tensor::{Tensor, TensorView},
@@ -34,7 +34,6 @@ pub struct DecoderExecutor {
     k_proj: Arc<LinearExecutor>,
     v_proj: Arc<LinearExecutor>,
     kv_proj_dgrad_with_res: Arc<MatmulExecutor>,
-    #[expect(unused)] // RoPE disabled for now
     rope: Arc<RopeExecutor>,
     // qk_norm: Arc<NormExecutor>,
     attention: Arc<AttentionExecutor>,
@@ -350,6 +349,29 @@ impl DecoderExecutor {
             stream,
         )?;
 
+        let q_proj_result = self.rope.execute(
+            &q_proj_result.reshaped([
+                batch_size,
+                self.config.num_decoder_q_heads,
+                self.config.head_dim,
+            ]),
+            &meta_tensors.decoder_cu_seqlen.view(),
+            &meta_tensors.decoder_seqlen_cpu,
+            RopeMode::Forward,
+            stream,
+        )?;
+        let k_proj_result = self.rope.execute(
+            &k_proj_result.reshaped([
+                batch_size,
+                self.config.num_decoder_kv_heads,
+                self.config.head_dim,
+            ]),
+            &meta_tensors.decoder_cu_seqlen.view(),
+            &meta_tensors.decoder_seqlen_cpu,
+            RopeMode::Forward,
+            stream,
+        )?;
+
         // --- Q norm --- //
         // let q =
         //     qkv_proj_result.sliced(1, 0..self.config.head_dim * self.config.num_decoder_q_heads);
@@ -649,6 +671,22 @@ impl DecoderExecutor {
             &saves.attn_stats.view(),
             stream,
         )?;
+
+        let dq = self.rope.execute(
+            &dq.view(),
+            &meta_tensors.decoder_cu_seqlen.view(),
+            &meta_tensors.decoder_seqlen_cpu,
+            RopeMode::Backward,
+            stream,
+        )?;
+        let dk = self.rope.execute(
+            &dk.view(),
+            &meta_tensors.decoder_cu_seqlen.view(),
+            &meta_tensors.decoder_seqlen_cpu,
+            RopeMode::Backward,
+            stream,
+        )?;
+
         let dq = dq.reshaped([batch_size, q_features]);
         let dk = dk.reshaped([batch_size, kv_features]);
         let dv = dv.reshaped([batch_size, kv_features]);

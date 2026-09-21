@@ -12,6 +12,7 @@ half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 skycuda = { git = "https://github.com/caelunshun/skycuda" }
 skycuda-cudnn = { git = "https://github.com/caelunshun/skycuda" }
+skycuda-cublaslt = { git = "https://github.com/caelunshun/skycuda" }
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
 rayon = "1"
 thread_local = "1"

@@ -1,5 +1,6 @@
 use std::env;
 
+use clap::Parser;
 use cleandl::{context::Context, tensor::Tensor};
 use mimalloc::MiMalloc;
 use rand::{SeedableRng, rngs::StdRng};
@@ -19,9 +20,18 @@ use skycuda::{
 #[global_allocator]
 static ALLOCATOR: MiMalloc = MiMalloc;
 
+#[derive(Debug, Parser)]
+struct Cli {
+    #[arg(long, default_value = "4096")]
+    batch_size: usize,
+    #[arg(long, default_value = "128")]
+    max_decoder_seqlen: usize,
+}
+
 // Temporary testbed code
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
 
     let cx = &Context::new(
         0,
@@ -42,9 +52,9 @@ fn main() -> anyhow::Result<()> {
             num_decoder_q_heads: 32,
             num_decoder_kv_heads: 4,
             head_dim: 64,
-            max_batch_decoder_tokens: 128 * 1024,
-            max_num_sequences: 32,
-            max_decoder_seqlen: 4096,
+            max_batch_decoder_tokens: cli.batch_size,
+            max_num_sequences: 32usize.max(cli.batch_size / cli.max_decoder_seqlen),
+            max_decoder_seqlen: cli.max_decoder_seqlen,
             rope_base_freq: 10_000.0,
         },
         vocab_size: 65536,
@@ -91,6 +101,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let meta_tensors = MetaTensors {
+        decoder_seqlen_cpu: seqlen.iter().map(|&x| x as u32).collect(),
         decoder_seqlen: Tensor::from_slice(&seqlen, [config.blocks.max_num_sequences], stream, cx)?,
         decoder_cu_seqlen: Tensor::from_slice(
             &cu_seqlen,
