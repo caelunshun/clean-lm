@@ -8,7 +8,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 use crate::{
     context::{Context, ResourceKey},
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
+    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
     tensor::{Tensor, TensorView, VirtTensorView},
 };
 
@@ -268,11 +268,13 @@ impl ResourceKey for SwiGluConfig {
                 m: self.estimated_batch_size,
                 n: self.intermediate_features,
                 k: self.in_features,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -281,11 +283,16 @@ impl ResourceKey for SwiGluConfig {
                 m: self.estimated_batch_size,
                 n: self.out_features,
                 k: self.intermediate_features,
-                residual_format: Some(MatrixFormat::RowMajor),
+                residual: Some(ResidualConfig {
+                    format: MatrixFormat::RowMajor,
+                    element_type: ElementType::Float(FloatType::Bf16),
+                }),
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -326,11 +333,13 @@ impl ResourceKey for SwiGluConfig {
                 m: self.intermediate_features,
                 n: self.out_features,
                 k: self.estimated_batch_size,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -340,11 +349,13 @@ impl ResourceKey for SwiGluConfig {
                 m: self.in_features,
                 n: self.intermediate_features,
                 k: self.estimated_batch_size,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -353,11 +364,13 @@ impl ResourceKey for SwiGluConfig {
                 m: self.estimated_batch_size,
                 n: self.in_features,
                 k: self.intermediate_features,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;

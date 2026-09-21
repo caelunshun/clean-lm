@@ -1715,7 +1715,7 @@ dependencies = [
 [[package]]
 name = "skycuda"
 version = "0.1.0"
-source = "git+https://github.com/caelunshun/skycuda#e57e466efd2d3e7a16df98320c65b1cda58ee1c7"
+source = "git+https://github.com/caelunshun/skycuda#626611cea2b7811e0055d319a8dd47fd538c6fef"
 dependencies = [
  "bumpalo",
  "bytemuck",
@@ -1730,7 +1730,7 @@ dependencies = [
 [[package]]
 name = "skycuda-cublaslt"
 version = "0.1.0"
-source = "git+https://github.com/caelunshun/skycuda#e57e466efd2d3e7a16df98320c65b1cda58ee1c7"
+source = "git+https://github.com/caelunshun/skycuda#626611cea2b7811e0055d319a8dd47fd538c6fef"
 dependencies = [
  "bytemuck",
  "cudarc",
@@ -1742,7 +1742,7 @@ dependencies = [
 [[package]]
 name = "skycuda-cudnn"
 version = "0.1.0"
-source = "git+https://github.com/caelunshun/skycuda#e57e466efd2d3e7a16df98320c65b1cda58ee1c7"
+source = "git+https://github.com/caelunshun/skycuda#626611cea2b7811e0055d319a8dd47fd538c6fef"
 dependencies = [
  "bytemuck",
  "skycuda",
@@ -1752,7 +1752,7 @@ dependencies = [
 [[package]]
 name = "skycuda-cudnn-sys"
 version = "0.1.0"
-source = "git+https://github.com/caelunshun/skycuda#e57e466efd2d3e7a16df98320c65b1cda58ee1c7"
+source = "git+https://github.com/caelunshun/skycuda#626611cea2b7811e0055d319a8dd47fd538c6fef"
 dependencies = [
  "bindgen",
  "cc",

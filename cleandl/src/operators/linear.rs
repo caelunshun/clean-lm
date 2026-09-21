@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use skycuda::stream::Stream;
+use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, ResourceKey},
-    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
+    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
     tensor::{Tensor, TensorView},
 };
 
@@ -87,13 +88,16 @@ impl ResourceKey for LinearConfig {
                 m: self.estimated_batch_size,
                 n: self.out_features,
                 k: self.in_features,
-                residual_format: self
-                    .forward_fused_residual_add
-                    .then_some(MatrixFormat::RowMajor),
+                residual: self.forward_fused_residual_add.then_some(ResidualConfig {
+                    format: MatrixFormat::RowMajor,
+                    element_type: ElementType::Float(FloatType::Bf16),
+                }),
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -102,11 +106,13 @@ impl ResourceKey for LinearConfig {
                 m: self.estimated_batch_size,
                 n: self.in_features,
                 k: self.out_features,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transposed
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
@@ -115,10 +121,12 @@ impl ResourceKey for LinearConfig {
                 m: self.in_features,
                 n: self.out_features,
                 k: self.estimated_batch_size,
-                residual_format: None,
+                residual: None,
                 a_format: MatrixFormat::ColumnMajor, // transposed
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
                 allow_shape_override: true,
             },
             cx,

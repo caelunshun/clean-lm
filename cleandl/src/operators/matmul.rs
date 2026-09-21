@@ -2,29 +2,24 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use skycuda::stream::Stream;
-use skycuda_cudnn::{DataType, MatmulAttributes, PointwiseAttributes, PointwiseMode, TensorId};
-use skytens_core::{
-    data_type::{ElementType, FloatType},
-    shape::{Shape, Strides},
+use skycuda_cublaslt::{
+    Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout, Order,
 };
+use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, ResourceKey},
-    cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{Tensor, TensorView, VirtTensorView},
+    tensor::{Tensor, TensorView},
 };
 
 /// Matmul executor with optional residual add.
 #[derive(Debug)]
 pub struct MatmulExecutor {
-    #[allow(unused)]
     config: MatmulConfig,
     cx: Context,
-    graph: ExecutableCudnnGraph,
-    a: TensorId,
-    b: TensorId,
-    residual: Option<TensorId>,
-    out: TensorId,
+    plan: MatmulPlan,
+    desc: MatmulDesc,
+    algo: Algorithm,
 }
 
 impl MatmulExecutor {
@@ -40,30 +35,84 @@ impl MatmulExecutor {
         residual: Option<&TensorView>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        let &[m, k] = a.shape().dims_slice() else {
-            panic!()
-        };
-        let &[_, n] = b.shape().dims_slice() else {
-            panic!()
+        let validate_matrix = |tensor: &TensorView,
+                               rows: usize,
+                               cols: usize,
+                               format: MatrixFormat,
+                               ty: ElementType| {
+            assert_eq!(tensor.element_type(), ty);
+            assert_eq!(tensor.shape().dims_slice(), &[rows, cols]);
+            match format {
+                MatrixFormat::RowMajor => assert_eq!(tensor.strides().dims_slice(), &[cols, 1]),
+                MatrixFormat::ColumnMajor => assert_eq!(tensor.strides().dims_slice(), &[1, rows]),
+            }
         };
 
-        let mut out = Tensor::new_zeroed([m, n], ElementType::Float(FloatType::Bf16), &self.cx)?;
+        let (m, n, k) = if self.config.allow_shape_override {
+            (a.shape()[0], b.shape()[1], a.shape()[1])
+        } else {
+            (self.config.m, self.config.n, self.config.k)
+        };
+        validate_matrix(a, m, k, self.config.a_format, self.config.ab_element_type);
+        validate_matrix(b, k, n, self.config.b_format, self.config.ab_element_type);
 
-        let mut inputs = vec![
-            (self.a, a.reshaped([1, m, k])),
-            (self.b, b.reshaped([1, k, n])),
-        ];
-        if let Some(residual) = residual {
-            inputs.push((self.residual.unwrap(), residual.reshaped([1, m, n])));
+        match &self.config.residual {
+            Some(residual_config) => {
+                let residual = residual.expect("missing residual for matmul execute");
+                validate_matrix(
+                    residual,
+                    m,
+                    n,
+                    residual_config.format,
+                    residual_config.element_type,
+                );
+            }
+            None => assert!(residual.is_none()),
         }
-        self.graph.execute(
-            &inputs
-                .iter()
-                .map(|(id, view)| (*id, view))
-                .collect::<Vec<_>>(),
-            &mut [(self.out, out.reshaped_mut([1, m, n]))],
-            stream,
+
+        let mut out = Tensor::new_zeroed([m, n], self.config.out_element_type, &self.cx)?;
+
+        let reshaped_plan;
+        let plan = if m != self.config.m || n != self.config.n || k != self.config.k {
+            assert!(self.config.allow_shape_override);
+            reshaped_plan = self.plan.reshape(&MatmulDesc {
+                a: make_matrix_layout(m, k, self.config.a_format, self.config.ab_element_type),
+                b: make_matrix_layout(k, n, self.config.b_format, self.config.ab_element_type),
+                c: if let Some(residual) = &self.config.residual {
+                    Some(make_matrix_layout(
+                        m,
+                        n,
+                        residual.format,
+                        residual.element_type,
+                    ))
+                } else {
+                    None
+                },
+                d: make_matrix_layout(m, n, self.config.out_format, self.config.out_element_type),
+                ..self.desc.clone()
+            })?;
+            &reshaped_plan
+        } else {
+            &self.plan
+        };
+
+        let mut workspace = self.cx.device_memory_pool().alloc_zeroed_on(
+            plan.check(&self.algo)?.workspace_size,
+            self.cx.memset_stream(),
         )?;
+
+        let mut operands = plan.operands();
+        operands.a(a.storage()).b(b.storage()).d(out.storage_mut());
+        if let Some(residual) = residual {
+            operands.c(residual.storage());
+        }
+
+        unsafe {
+            plan.execute_with(&self.algo, stream, &operands, &mut workspace)?;
+        }
+
+        drop(operands);
+
         Ok(out)
     }
 }
@@ -75,12 +124,21 @@ pub struct MatmulConfig {
     pub k: usize,
     pub a_format: MatrixFormat,
     pub b_format: MatrixFormat,
-    pub residual_format: Option<MatrixFormat>,
+    pub residual: Option<ResidualConfig>,
     pub out_format: MatrixFormat,
+    pub ab_element_type: ElementType,
+    pub out_element_type: ElementType,
     pub allow_shape_override: bool,
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+pub struct ResidualConfig {
+    /// Currently, must match out_format
+    pub format: MatrixFormat,
+    pub element_type: ElementType,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
 pub enum MatrixFormat {
     RowMajor,
     ColumnMajor,
@@ -89,53 +147,67 @@ pub enum MatrixFormat {
 impl ResourceKey for MatmulConfig {
     type Resource = MatmulExecutor;
 
-    fn create(&self, cx: &crate::context::Context) -> anyhow::Result<Self::Resource> {
-        let graph = CudnnGraphBuilder::new(cx)?;
+    fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        let a_layout = make_matrix_layout(self.m, self.k, self.a_format, self.ab_element_type);
+        let b_layout = make_matrix_layout(self.k, self.n, self.b_format, self.ab_element_type);
+        let d_layout = make_matrix_layout(self.m, self.n, self.out_format, self.out_element_type);
 
-        let make_view = |dim0: usize, dim1: usize, format: MatrixFormat| match format {
-            MatrixFormat::RowMajor => VirtTensorView::new(
-                Shape::new([1, dim0, dim1]),
-                ElementType::Float(FloatType::Bf16),
-            ),
-            MatrixFormat::ColumnMajor => VirtTensorView::with_strides(
-                Shape::new([1, dim0, dim1]),
-                Strides::new([dim0 * dim1, 1, dim0]),
-                ElementType::Float(FloatType::Bf16),
-            ),
+        let mut desc = MatmulDesc::new(ComputeType::F32, a_layout, b_layout, d_layout);
+        if let Some(residual) = &self.residual {
+            desc = desc.c(make_matrix_layout(
+                self.m,
+                self.n,
+                residual.format,
+                self.out_element_type,
+            ));
+        }
+
+        let plan = cx
+            .cublaslt()
+            .build_plan(&desc, &MatmulPreference::default().requested_algo_count(32))?;
+
+        let algo = if cx.is_autotuning_enabled() {
+            todo!()
+        } else {
+            plan.algorithms()[0].clone()
         };
-
-        let a = graph.bind_tensor(&make_view(self.m, self.k, self.a_format));
-        let b = graph.bind_tensor(&make_view(self.k, self.n, self.b_format));
-        let residual = self
-            .residual_format
-            .map(|residual_format| graph.bind_tensor(&make_view(self.m, self.n, residual_format)));
-        let mut out = graph.graph().matmul(
-            a,
-            b,
-            &MatmulAttributes::new().compute_data_type(DataType::Float),
-        )?;
-        if let Some(residual) = residual {
-            out = graph.graph().pointwise_binary(
-                residual,
-                out,
-                &PointwiseAttributes::new(PointwiseMode::Add).compute_data_type(DataType::Float),
-            )?;
-        }
-        let out = graph.mark_output(out, &make_view(self.m, self.n, self.out_format));
-        let (a, b) = (a.uid(), b.uid());
-
-        if self.allow_shape_override {
-            graph.graph().set_override_shape_enabled(true);
-        }
 
         Ok(MatmulExecutor {
             config: self.clone(),
+            desc,
             cx: cx.clone(),
-            residual: residual.map(|r| r.uid()),
-            graph: graph.build()?,
-            a,
-            b,
-            out,
+            plan,
+            algo,
         })
+    }
+}
+
+fn make_matrix_layout(
+    rows: usize,
+    cols: usize,
+    format: MatrixFormat,
+    dtype: ElementType,
+) -> MatrixLayout {
+    let dtype = match dtype {
+        ElementType::Float(FloatType::Bf16) => DataType::BF16,
+        ElementType::Float(FloatType::F16) => DataType::F16,
+        ElementType::Float(FloatType::F32) => DataType::F32,
+        _ => panic!("unsupported data type in matmul: {dtype:?}"),
+    };
+
+    MatrixLayout {
+        data_type: dtype,
+        rows: rows as u64,
+        cols: cols as u64,
+        ld: match format {
+            MatrixFormat::RowMajor => cols as i64,
+            MatrixFormat::ColumnMajor => rows as i64,
+        },
+        order: match format {
+            MatrixFormat::RowMajor => Order::Row,
+            MatrixFormat::ColumnMajor => Order::Col,
+        },
+        batch_count: 1,
+        batch_stride: 0,
     }
 }

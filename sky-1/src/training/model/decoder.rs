@@ -10,7 +10,7 @@ use cleandl::{
         },
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
-        matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
+        matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
         norm::{NormExecutor, RmsNormForwardOutput},
         rope::{RopeConfig, RopeExecutor, RopeMode},
         swiglu_ffn::{DownProjDgradOutput, GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
@@ -20,6 +20,7 @@ use cleandl::{
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
+use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
@@ -85,9 +86,14 @@ impl ResourceKey for DecoderExecutorKey {
                 k: self.config.head_dim * self.config.num_decoder_kv_heads,
                 a_format: MatrixFormat::RowMajor,
                 b_format: MatrixFormat::ColumnMajor, // transpose
-                residual_format: Some(MatrixFormat::RowMajor),
+                residual: Some(ResidualConfig {
+                    format: MatrixFormat::RowMajor,
+                    element_type: ElementType::Float(FloatType::Bf16),
+                }),
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
             },
             cx,
         )?;
