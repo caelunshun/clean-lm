@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
@@ -215,7 +215,7 @@ fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::R
                 par_random::par_fill_from_distr(
                     &Uniform::<u8>::new_inclusive(0, u8::MAX).unwrap(),
                     &mut data,
-                    rng,
+                    &mut Xoroshiro128StarStar::seed_from_u64(66),
                 );
                 cx.upload_to_device(&data, tensor.storage_mut(), cx.h2d_copy_stream())?;
                 anyhow::Ok(tensor)
