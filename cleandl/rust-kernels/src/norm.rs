@@ -1,16 +1,19 @@
 use cuda_device::{
     DynamicSharedArray, async_copy,
-    atomic::{AtomicOrdering, DeviceAtomicF32},
+    atomic::DeviceAtomicF32,
     blockIdx_x,
     cooperative_groups::{ThreadGroup, this_thread_block},
     float::rsqrt_approx_ftz_f32,
+    shared::dynamic_smem_size,
     uniform::grid_dim_x,
     warp::{self, warp_id},
 };
 use cuda_device_ext::{bf16, bf16x2};
 use cuda_macros::{device, kernel, launch_bounds};
 
-use crate::{WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id};
+use crate::{
+    WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id, red_add_global_f32,
+};
 
 /// Template for fast RMSNorm where the vector size
 /// is small enough to fit within a single warp's registers, enabling
@@ -37,6 +40,10 @@ fn rmsnorm_bf16_warp_persistent<
     num_rows: u32,
 ) {
     unsafe {
+        let required_smem = size_of::<bf16>() * VECTOR_SIZE
+            + size_of::<bf16>() * (VECTOR_SIZE * PREFETCH_STAGES * NUM_WARPS);
+        assert!(dynamic_smem_size() >= required_smem as u32);
+
         let smem_base = DynamicSharedArray::<bf16, 128>::get();
         let smem_gamma = smem_base;
         let get_smem_slot = |i| smem_base.add(VECTOR_SIZE + i * VECTOR_SIZE * NUM_WARPS);
@@ -48,6 +55,7 @@ fn rmsnorm_bf16_warp_persistent<
                 smem_gamma,
                 VECTOR_SIZE as u32,
                 this_thread_block().tiled_partition::<32>(),
+                32,
             );
             async_copy::cp_async_commit_group();
             async_copy::cp_async_wait_all();
@@ -64,6 +72,7 @@ fn rmsnorm_bf16_warp_persistent<
                     dst,
                     VECTOR_SIZE as u32,
                     this_thread_block().tiled_partition::<32>(),
+                    32,
                 );
             }
             async_copy::cp_async_commit_group();
@@ -239,6 +248,11 @@ fn rmsnorm_bwd_bf16_cta_persistent<
 
     let elements_per_row_per_thread = VECTOR_SIZE / NUM_WARPS / WARP_SIZE as usize;
 
+    let required_smem = (4 * size_of::<bf16>() * VECTOR_SIZE * ROWS_PER_ITER * PREFETCH_STAGES)
+        + (size_of::<f32>() * ROWS_PER_ITER * PREFETCH_STAGES)
+        + (size_of::<f32>() * ROWS_PER_ITER * NUM_WARPS);
+    assert!(dynamic_smem_size() >= required_smem as u32);
+
     unsafe {
         let smem_base = DynamicSharedArray::<bf16, 256>::get();
 
@@ -287,7 +301,8 @@ fn rmsnorm_bwd_bf16_cta_persistent<
             dst.write(src.read());
         }
 
-        let do_prefetch = |first_row_idx: u32, slot_idx: u32| {
+        let do_prefetch = #[inline(always)]
+        |first_row_idx: u32, slot_idx: u32| {
             #[llvm_unroll]
             for row_idx in first_row_idx..(first_row_idx + ROWS_PER_ITER as u32) {
                 if row_idx < num_rows {
@@ -300,6 +315,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                         dst,
                         VECTOR_SIZE as u32,
                         this_thread_block(),
+                        cta_threads,
                     );
 
                     // `dy`
@@ -311,6 +327,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                         dst,
                         VECTOR_SIZE as u32,
                         this_thread_block(),
+                        cta_threads,
                     );
 
                     // residual
@@ -323,6 +340,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                             dst,
                             VECTOR_SIZE as u32,
                             this_thread_block(),
+                            cta_threads,
                         );
                     }
 
@@ -371,6 +389,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
 
         let mut first_row_idx = blockIdx_x() * ROWS_PER_ITER as u32;
         let mut slot_idx = 0;
+
         while first_row_idx < num_rows {
             let prefetch_stages_minus_one = const { PREFETCH_STAGES as u32 - 1 };
             async_copy::cp_async_wait_group(prefetch_stages_minus_one);
@@ -418,7 +437,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
             }
             this_thread_block().sync();
 
-            // done consuming SMEM slots, can prefetch next row
+            // Once we're done consuming SMEM slots, can prefetch next row.
             do_prefetch(
                 first_row_idx + cta_stride * PREFETCH_STAGES as u32,
                 slot_idx,
@@ -548,8 +567,6 @@ fn rmsnorm_bwd_bf16_cta_persistent<
 
             first_row_idx += cta_stride;
             slot_idx = (slot_idx + 1) % PREFETCH_STAGES as u32;
-
-            this_thread_block().sync();
         }
 
         // Add our contribution to dgamma to the global sums.
@@ -563,14 +580,14 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                         * elements_per_u128::<bf16>() as usize
                         + j,
                 );
-                (&*dst).fetch_add(src, AtomicOrdering::Relaxed);
+                red_add_global_f32(dst.cast(), src);
             }
         }
     }
 }
 
 #[kernel]
-#[launch_bounds(256, 2)]
+#[launch_bounds(256, 1)]
 pub fn rmsnorm_bwd_bf16_cta_persistent_inner2048(
     gmem_x: *const bf16,
     gmem_dy: *const bf16,
