@@ -6,8 +6,8 @@
     generic_const_exprs
 )]
 #![allow(
-    incomplete_features,
-    clippy::implied_bounds_in_impls,
+    incomplete_features, 
+    clippy::too_many_arguments,
     // These unidiomatic expressions are needed
     // to get proper loop unrolling in same cases. 
     clippy::needless_range_loop,
