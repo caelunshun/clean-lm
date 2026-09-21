@@ -1,7 +1,8 @@
 use std::{collections::HashMap, fmt};
 
 use bumpalo::Bump;
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
+use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
 use skycuda::{
@@ -22,6 +23,7 @@ use skytens_core::{
 use crate::{
     context::Context,
     disk_cache::DiskCacheKey,
+    par_random,
     tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
 
@@ -218,7 +220,6 @@ fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
             graph: serialized_graph,
         },
         || {
-            dbg!();
             let mut workspace = cx
                 .device_memory_pool()
                 .alloc_zeroed_on(graph.max_workspace_size(), cx.memset_stream())?;
@@ -245,10 +246,12 @@ fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
                         cx.memset_stream(),
                     )?));
 
-                let data = Xoroshiro128StarStar::seed_from_u64(66)
-                    .random_iter::<u8>()
-                    .take(tensor_requirement.min_len().unwrap())
-                    .collect::<Vec<_>>();
+                let mut data = vec![0u8; tensor_requirement.min_len().unwrap()];
+                par_random::par_fill_from_distr(
+                    &Uniform::new(0, u8::MAX).unwrap(),
+                    &mut data,
+                    &mut Xoroshiro128StarStar::seed_from_u64(66),
+                );
                 cx.upload_to_device(&data, memory.as_mut().unwrap(), cx.h2d_copy_stream())?;
 
                 memory_ptrs_for_drop.push(memory as *mut Option<DeviceMemory>);

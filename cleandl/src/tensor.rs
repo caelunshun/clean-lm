@@ -2,10 +2,8 @@ use std::ops::{Bound, RangeBounds};
 
 use bytemuck::Pod;
 use half::bf16;
-use rand::{Rng, RngExt, SeedableRng};
+use rand::Rng;
 use rand_distr::Distribution;
-use rand_xoshiro::Xoshiro128StarStar;
-use rayon::prelude::*;
 use skycuda::{
     device_memory::DeviceMemory,
     memory_slice::{MemorySlice, MemorySliceMut},
@@ -72,23 +70,7 @@ impl Tensor {
             .host_pinned_memory_pool()
             .alloc_zeroed(allocation_bytes)?;
         let data = bytemuck::cast_slice_mut::<u8, T>(host_memory.view_mut()?);
-
-        const CHUNK_SIZE: usize = 65536;
-        let num_chunks = data.len().div_ceil(CHUNK_SIZE);
-        let mut chunk_rngs = Vec::new();
-        let mut current_rng = Xoshiro128StarStar::from_rng(rng);
-        for _ in 0..num_chunks {
-            chunk_rngs.push(current_rng.clone());
-            current_rng.jump();
-        }
-
-        data.par_chunks_mut(CHUNK_SIZE)
-            .zip(&mut chunk_rngs)
-            .for_each(|(chunk, rng)| {
-                chunk.iter_mut().for_each(|x| {
-                    *x = rng.sample(&distr);
-                });
-            });
+        crate::par_random::par_fill_from_distr(distr, data, rng);
 
         let mut device_memory = cx
             .device_memory_pool()
@@ -135,6 +117,10 @@ impl Tensor {
             cx: cx.clone(),
             storage: device_memory,
         })
+    }
+
+    pub fn into_memory(self) -> DeviceMemory {
+        self.storage
     }
 
     pub fn cx(&self) -> &Context {

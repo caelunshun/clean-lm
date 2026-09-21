@@ -12,3 +12,4 @@ pub mod context;
 pub mod disk_cache;
 pub mod kernel;
 pub mod operators;
+pub mod par_random;
