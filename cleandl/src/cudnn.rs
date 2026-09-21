@@ -248,7 +248,7 @@ fn autotune(graph: &BuiltGraph, cx: &Context) -> anyhow::Result<usize> {
 
                 let mut data = vec![0u8; tensor_requirement.min_len().unwrap()];
                 par_random::par_fill_from_distr(
-                    &Uniform::new(0, u8::MAX).unwrap(),
+                    &Uniform::new_inclusive(0, u8::MAX).unwrap(),
                     &mut data,
                     &mut Xoroshiro128StarStar::seed_from_u64(66),
                 );

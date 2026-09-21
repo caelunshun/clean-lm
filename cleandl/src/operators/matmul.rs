@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rand::{RngExt, SeedableRng};
+use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
@@ -12,6 +13,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 use crate::{
     context::{Context, ResourceKey},
     disk_cache::DiskCacheKey,
+    par_random,
     tensor::{Tensor, TensorView},
 };
 
@@ -209,10 +211,12 @@ fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::R
 
             let make_dummy = |rows: usize, cols: usize, element_type: ElementType| {
                 let mut tensor = Tensor::new_zeroed([rows, cols], element_type, cx)?;
-                let data = Xoroshiro128StarStar::seed_from_u64(66)
-                    .random_iter::<u8>()
-                    .take(tensor.storage().len())
-                    .collect::<Vec<_>>();
+                let mut data = vec![0u8; tensor.storage().len()];
+                par_random::par_fill_from_distr(
+                    &Uniform::<u8>::new_inclusive(0, u8::MAX).unwrap(),
+                    &mut data,
+                    rng,
+                );
                 cx.upload_to_device(&data, tensor.storage_mut(), cx.h2d_copy_stream())?;
                 anyhow::Ok(tensor)
             };
