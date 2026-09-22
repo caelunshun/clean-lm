@@ -8,6 +8,7 @@ use cleandl::{
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
         norm::{NormExecutor, RmsNormForwardOutput},
+        rope::{RopeConfig, RopeExecutor, RopeMode},
         swiglu_ffn::{DownProjDgradOutput, GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
     },
     tensor::{Tensor, TensorView},
@@ -25,9 +26,8 @@ use crate::{
 pub struct DecoderExecutor {
     config: BlocksConfig,
     pre_qkv_norm: Arc<NormExecutor>,
-    /// Merged Q, K, V projection; output is packed `[T, (q_heads + 2 * kv_heads) * head_dim]`.
     qkv_proj: Arc<LinearExecutor>,
-    // TODO: rope is disabled until the kernel supports strided in-place operation on packed QKV.
+    rope: Arc<RopeExecutor>,
     // qk_norm: Arc<NormExecutor>,
     attention: Arc<AttentionExecutor>,
     o_proj: Arc<LinearExecutor>,
@@ -62,7 +62,17 @@ impl ResourceKey for DecoderExecutorKey {
             },
             cx,
         )?;
+
+        let rope = RopeExecutor::get(
+            RopeConfig {
+                base_freq: self.config.rope_base_freq,
+                max_seqlen: self.config.max_decoder_seqlen,
+                head_dim: self.config.head_dim,
+            },
+            cx,
+        )?;
         // let qk_norm = NormExecutor::get(cx)?;
+
         let attention = AttentionExecutor::get(self.config.decoder_attention_config(), cx)?;
         let o_proj = LinearExecutor::get(
             LinearConfig {
@@ -91,6 +101,7 @@ impl ResourceKey for DecoderExecutorKey {
             config: self.config.clone(),
             pre_qkv_norm,
             qkv_proj,
+            rope,
             // qk_norm,
             attention,
             o_proj,
@@ -195,7 +206,6 @@ impl DecoderWeights {
 pub struct DecoderSavedTensors {
     pre_qkv_norm_r_inv: Tensor,
     pre_qkv_norm_result: Tensor,
-    /// Packed `[T, (q_heads + 2 * kv_heads) * head_dim]`.
     qkv_proj_result: Tensor,
     // q_norm_result: Tensor,
     // q_norm_r_inv: Tensor,
@@ -242,9 +252,26 @@ impl DecoderExecutor {
         )?;
 
         // --- QKV projection --- //
-        let qkv_proj_result = self.qkv_proj.forward(
+        let mut qkv_proj_result = self.qkv_proj.forward(
             &pre_qkv_norm_result.view(),
             &weights.qkv_proj.bf16_weights().view(),
+            stream,
+        )?;
+
+        let mut qkv_reshaped = qkv_proj_result.reshaped_mut([
+            batch_size,
+            self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
+            self.config.head_dim,
+        ]);
+        let mut qk = qkv_reshaped.sliced_mut(
+            1,
+            0..(self.config.num_decoder_q_heads + self.config.num_decoder_kv_heads),
+        );
+        self.rope.execute(
+            &mut qk,
+            &meta_tensors.decoder_ragged_seqlen.cu_seqlen(),
+            &meta_tensors.seqlen,
+            RopeMode::Forward,
             stream,
         )?;
 
@@ -490,7 +517,7 @@ impl DecoderExecutor {
         )?;
 
         // --- Attention --- //
-        let AttentionBackwardOutput { dqkv } = self.attention.backward_attn(
+        let AttentionBackwardOutput { mut dqkv } = self.attention.backward_attn(
             &saves.qkv_proj_result.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
@@ -506,6 +533,19 @@ impl DecoderExecutor {
             &saves.attn_stats.view(),
             stream,
         )?;
+
+        let mut dqk = dqkv.sliced_mut(
+            1,
+            0..(self.config.num_decoder_q_heads + self.config.num_decoder_kv_heads),
+        );
+        self.rope.execute(
+            &mut dqk,
+            &meta_tensors.decoder_ragged_seqlen.cu_seqlen(),
+            &meta_tensors.seqlen,
+            RopeMode::Backward,
+            stream,
+        )?;
+
         let dqkv = dqkv.reshaped([batch_size, self.config.qkv_features()]);
 
         // --- QKV-proj --- //

@@ -29,6 +29,7 @@ pub mod decoder;
 #[derive(Debug)]
 pub struct MetaTensors {
     pub decoder_ragged_seqlen: RaggedSeqlenTensors,
+    pub seqlen: Vec<u32>,
 }
 
 #[derive(Debug)]

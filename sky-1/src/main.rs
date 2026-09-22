@@ -100,6 +100,7 @@ fn main() -> anyhow::Result<()> {
             cx,
             &config.decoder_attention_config(),
         )?,
+        seqlen,
     };
 
     let training_config = TrainingConfig {

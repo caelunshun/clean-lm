@@ -10,7 +10,7 @@ use wide::f32x16;
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
-    tensor::{Tensor, TensorView},
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 
 #[derive(Debug)]
@@ -30,26 +30,27 @@ impl RopeExecutor {
         cx.get_or_create_resource(config)
     }
 
-    /// Returns the rotated tensor, with the same shape and type as `x`.
+    /// Applies rotation in place.
     #[allow(unused_variables)]
     pub fn execute(
         &self,
-        x: &TensorView<'_>,
+        x: &mut TensorViewMut<'_>,
         cu_seqlen: &TensorView<'_>,
         seqlens: &[u32],
         mode: RopeMode,
         stream: &Stream,
-    ) -> anyhow::Result<Tensor> {
+    ) -> anyhow::Result<()> {
         assert_eq!(cu_seqlen.element_type(), ElementType::SInt(SIntType::S64));
         assert_eq!(x.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(x.shape().num_dims(), 3);
         assert_eq!(x.shape()[2], self.config.head_dim);
         assert_eq!(cu_seqlen.shape().dims_slice(), &[seqlens.len() + 1]);
 
-        assert!(x.is_packed_row_major());
         assert!(cu_seqlen.is_packed_row_major());
 
-        let mut out = Tensor::new_zeroed(x.shape(), x.element_type(), &self.cx)?;
+        assert_eq!(x.strides()[2], 1);
+        assert_eq!(x.strides()[1], x.shape()[2]);
+        let row_stride = x.strides()[0];
 
         let (block_size, kernel_name) = match self.config.head_dim {
             64 => (64, "rope_hd64_64x1x64"),
@@ -85,22 +86,24 @@ impl RopeExecutor {
 
         {
             let mut launch = stream.launch_builder(&kernel);
+            let t = x.shape()[0];
+            let h = x.shape()[1];
             launch
-                .arg(x.storage())?
+                .arg(x.storage_mut())?
                 .arg(cu_seqlen.storage())?
                 .arg(cos_table.storage())?
                 .arg(sin_table.storage())?
                 .arg(&cta_work_items_mem)?
-                .arg(out.storage_mut())?
-                .arg(i32::try_from(x.shape()[0])?)?
-                .arg(i32::try_from(x.shape()[1])?)?
-                .arg(i32::try_from(self.config.max_seqlen)?)?;
+                .arg(i32::try_from(t)?)?
+                .arg(i32::try_from(h)?)?
+                .arg(i32::try_from(self.config.max_seqlen)?)?
+                .arg(i32::try_from(row_stride)?)?;
             unsafe {
                 launch.launch(cta_work_items.len().try_into()?, 1, 1)?;
             }
         }
 
-        Ok(out)
+        Ok(())
     }
 }
 

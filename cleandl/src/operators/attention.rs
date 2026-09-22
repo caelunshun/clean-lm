@@ -21,6 +21,8 @@ use crate::{
 pub struct RaggedSeqlenTensors {
     /// s32 `[max_num_sequences]`.
     seqlen: Tensor,
+    /// s64 `[max_num_sequences + 1]`.
+    cu_seqlen: Tensor,
     /// Offset of each sequence's Q-head span within the packed QKV tensor, in units of elements.
     offset_q: Tensor,
     /// Offset of each sequence's K-head span within the packed QKV tensor, in units of elements.
@@ -52,15 +54,15 @@ impl RaggedSeqlenTensors {
         let mut cu_seqlens = Vec::with_capacity(b + 1);
         let mut cu_seqlen = 0usize;
         for &seqlen in &seqlen_data {
-            cu_seqlens.push(cu_seqlen);
+            cu_seqlens.push(cu_seqlen as i64);
             cu_seqlen += seqlen as usize;
         }
-        cu_seqlens.push(cu_seqlen);
+        cu_seqlens.push(cu_seqlen as i64);
 
         let offsets = |row_stride: usize, base: usize| -> Vec<i64> {
             cu_seqlens
                 .iter()
-                .map(|&cu_seqlen| (cu_seqlen * row_stride + base) as i64)
+                .map(|&cu_seqlen| cu_seqlen * row_stride as i64 + base as i64)
                 .collect()
         };
         let upload = |data: &[i64]| Tensor::from_slice(data, [b + 1], cx.h2d_copy_stream(), cx);
@@ -71,7 +73,12 @@ impl RaggedSeqlenTensors {
             offset_k: upload(&offsets(packed_row_stride, q_span))?,
             offset_v: upload(&offsets(packed_row_stride, q_span + kv_span))?,
             offset_o: upload(&offsets(q_span, 0))?,
+            cu_seqlen: upload(&cu_seqlens)?,
         })
+    }
+
+    pub fn cu_seqlen(&self) -> TensorView<'_> {
+        self.cu_seqlen.view()
     }
 }
 

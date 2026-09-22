@@ -238,6 +238,17 @@ impl Tensor {
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorView<'_> {
         self.view().sliced(dim, bounds)
     }
+
+    /// Returns a contiguous mutable slice view along a dimension.
+    #[must_use]
+    pub fn sliced_mut(&mut self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorViewMut<'_> {
+        let (virt, offset_bytes) = self.virt.sliced(dim, bounds);
+        TensorViewMut {
+            virt,
+            cx: self.cx.clone(),
+            storage: self.storage.slice_mut(offset_bytes..),
+        }
+    }
 }
 
 /// Immutable view into a (sub-slice of a) tensor.
@@ -463,6 +474,19 @@ impl<'a> TensorViewMut<'a> {
     #[must_use]
     pub fn sliced(&self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorView<'_> {
         self.view().sliced(dim, bounds)
+    }
+
+    /// Returns a contiguous mutable slice view along a dimension.
+    #[must_use]
+    pub fn sliced_mut(&mut self, dim: usize, bounds: impl RangeBounds<usize>) -> TensorViewMut<'_> {
+        let (virt, offset_bytes) = self.virt.sliced(dim, bounds);
+        let start = self.storage.offset() + offset_bytes;
+        let end = self.storage.offset() + self.storage.len();
+        TensorViewMut {
+            virt,
+            cx: self.cx.clone(),
+            storage: self.storage.inner_mut().slice_mut(start..end),
+        }
     }
 }
 
