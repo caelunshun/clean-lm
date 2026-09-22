@@ -17,7 +17,7 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
     constexpr int HALF_HEAD_DIM = HEAD_DIM / 2;
 
     max_seqlen = ct::assume_divisible(max_seqlen, ct::integral_constant<BLOCK_SIZE>{});
-    row_stride = ct::assume_divisible(row_stride, 16_ic);
+    row_stride = ct::assume_divisible(row_stride, ct::integral_constant<HEAD_DIM>{});
 
     ASSUME_ALIGNED(x);
     ASSUME_ALIGNED(cu_seqlen);
@@ -49,7 +49,7 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
 
     auto x_view = ct::partition_view{
         ct::tensor_span{x + elements_offset,
-                        ct::extents{seqlen - token_offset, row_stride, HEAD_DIM}},
+                        ct::extents{seqlen - token_offset, row_stride / HEAD_DIM, HEAD_DIM}},
         ct::shape<BLOCK_SIZE, 1, HALF_HEAD_DIM>{}};
 
     for (int head_idx : ct::irange(0, num_heads))

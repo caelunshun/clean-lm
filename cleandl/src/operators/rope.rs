@@ -31,7 +31,6 @@ impl RopeExecutor {
     }
 
     /// Applies rotation in place.
-    #[allow(unused_variables)]
     pub fn execute(
         &self,
         x: &mut TensorViewMut<'_>,
@@ -44,7 +43,11 @@ impl RopeExecutor {
         assert_eq!(x.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(x.shape().num_dims(), 3);
         assert_eq!(x.shape()[2], self.config.head_dim);
-        assert_eq!(cu_seqlen.shape().dims_slice(), &[seqlens.len() + 1]);
+
+        let &[num_cu_seqlen] = cu_seqlen.shape().dims_slice() else {
+            panic!()
+        };
+        assert!(num_cu_seqlen > seqlens.len());
 
         assert!(cu_seqlen.is_packed_row_major());
 
@@ -77,7 +80,7 @@ impl RopeExecutor {
             .view_mut()?
             .copy_from_slice(bytemuck::cast_slice(&cta_work_items));
 
-        let kernel = self.module.get_function("rope_hd64_64x1x64")?;
+        let kernel = self.module.get_function(kernel_name)?;
 
         let (cos_table, sin_table) = match mode {
             RopeMode::Forward => (&self.fwd_cos_table, &self.fwd_sin_table),
