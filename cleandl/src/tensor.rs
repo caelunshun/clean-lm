@@ -10,7 +10,7 @@ use skycuda::{
     stream::Stream,
 };
 use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
+    data_type::{ElementType, FloatType, SIntType, UIntType},
     shape::{Shape, Strides},
 };
 
@@ -720,5 +720,11 @@ impl TensorElement for i32 {
 impl TensorElement for i64 {
     fn element_type() -> ElementType {
         ElementType::SInt(SIntType::S64)
+    }
+}
+
+impl TensorElement for u32 {
+    fn element_type() -> ElementType {
+        ElementType::UInt(UIntType::U32)
     }
 }

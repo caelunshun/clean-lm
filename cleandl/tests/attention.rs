@@ -1,7 +1,8 @@
 use cleandl::{
     context::Context,
     operators::attention::{
-        AttentionConfig, AttentionExecutor, AttentionForwardOutput, CuSeqlenTensors,
+        AttentionBackwardOutput, AttentionConfig, AttentionExecutor, AttentionForwardOutput,
+        RaggedSeqlenTensors,
     },
     tensor::Tensor,
 };
@@ -14,7 +15,7 @@ use skycuda::{
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
+    data_type::{ElementType, FloatType},
     shape::Shape,
 };
 
@@ -23,6 +24,7 @@ const SEQLENS: [usize; 4] = [37, 128, 201, 411];
 const Q_HEADS: usize = 64;
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
+const PACKED_HEADS: usize = Q_HEADS + 2 * KV_HEADS;
 
 const REL_TOLERANCE: f32 = 2e-2;
 const ABS_TOLERANCE: f32 = 4e-3;
@@ -45,53 +47,21 @@ fn attention() -> anyhow::Result<()> {
     let max_seqlen = SEQLENS.iter().copied().max().unwrap();
     let total_tokens: usize = SEQLENS.iter().sum();
 
-    let executor = AttentionExecutor::get(
-        AttentionConfig {
-            is_causal: true,
-            max_q_seqlen: max_seqlen,
-            max_kv_seqlen: max_seqlen,
-            max_num_sequences: num_sequences,
-            q_heads: Q_HEADS,
-            kv_heads: KV_HEADS,
-            head_dim: HEAD_DIM,
-        },
-        &cx,
-    )?;
+    let config = AttentionConfig {
+        is_causal: true,
+        max_q_seqlen: max_seqlen,
+        max_kv_seqlen: max_seqlen,
+        max_num_sequences: num_sequences,
+        q_heads: Q_HEADS,
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+    };
+    let executor = AttentionExecutor::get(config.clone(), &cx)?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut q = Tensor::new_zeroed(
-        Shape::new([total_tokens, Q_HEADS, HEAD_DIM]),
+    let mut qkv = Tensor::new_zeroed(
+        Shape::new([total_tokens, PACKED_HEADS, HEAD_DIM]),
         bf16_type,
-        &cx,
-    )?;
-    let mut k = Tensor::new_zeroed(
-        Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
-        bf16_type,
-        &cx,
-    )?;
-    let mut v = Tensor::new_zeroed(
-        Shape::new([total_tokens, KV_HEADS, HEAD_DIM]),
-        bf16_type,
-        &cx,
-    )?;
-    let mut cu_seqlen_q_times_hd_times_qh = Tensor::new_zeroed(
-        Shape::new([num_sequences + 1]),
-        ElementType::SInt(SIntType::S64),
-        &cx,
-    )?;
-    let mut cu_seqlen_kv_times_hd_times_kvh = Tensor::new_zeroed(
-        Shape::new([num_sequences + 1]),
-        ElementType::SInt(SIntType::S64),
-        &cx,
-    )?;
-    let mut seqlen_q = Tensor::new_zeroed(
-        Shape::new([num_sequences]),
-        ElementType::SInt(SIntType::S32),
-        &cx,
-    )?;
-    let mut seqlen_kv = Tensor::new_zeroed(
-        Shape::new([num_sequences]),
-        ElementType::SInt(SIntType::S32),
         &cx,
     )?;
 
@@ -105,52 +75,25 @@ fn attention() -> anyhow::Result<()> {
     let k_host = sample(total_tokens * KV_HEADS * HEAD_DIM);
     let v_host = sample(total_tokens * KV_HEADS * HEAD_DIM);
 
+    let mut qkv_host = Vec::with_capacity(total_tokens * PACKED_HEADS * HEAD_DIM);
+    for token in 0..total_tokens {
+        qkv_host.extend_from_slice(&q_host[token * Q_HEADS * HEAD_DIM..][..Q_HEADS * HEAD_DIM]);
+        qkv_host.extend_from_slice(&k_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
+        qkv_host.extend_from_slice(&v_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
+    }
+    cx.upload_to_device(&qkv_host, qkv.storage_mut(), &stream)?;
+
     // Cumulative sequence offsets, in tokens.
     let mut cu_seqlens_host: Vec<i64> = Vec::with_capacity(num_sequences + 1);
     cu_seqlens_host.push(0);
     for len in SEQLENS {
         cu_seqlens_host.push(cu_seqlens_host.last().unwrap() + len as i64);
     }
-    let seqlens_host: Vec<i32> = SEQLENS.iter().map(|&len| len as i32).collect();
+    let seqlens_host: Vec<u32> = SEQLENS.iter().map(|&len| len as u32).collect();
+    let seqlen_tensors = RaggedSeqlenTensors::build(&seqlens_host, &cx, &config)?;
 
-    for (tensor, host) in [(&mut q, &q_host), (&mut k, &k_host), (&mut v, &v_host)] {
-        cx.upload_to_device(host, tensor.storage_mut(), &stream)?;
-    }
-
-    let scaled = |multiplier: usize| -> Vec<i64> {
-        cu_seqlens_host
-            .iter()
-            .map(|&offset| offset * multiplier as i64)
-            .collect()
-    };
-    for (tensor, host) in [
-        (
-            &mut cu_seqlen_q_times_hd_times_qh,
-            scaled(HEAD_DIM * Q_HEADS),
-        ),
-        (
-            &mut cu_seqlen_kv_times_hd_times_kvh,
-            scaled(HEAD_DIM * KV_HEADS),
-        ),
-    ] {
-        cx.upload_to_device(&host, tensor.storage_mut(), &stream)?;
-    }
-    for tensor in [&mut seqlen_q, &mut seqlen_kv] {
-        cx.upload_to_device(&seqlens_host, tensor.storage_mut(), &stream)?;
-    }
-
-    let AttentionForwardOutput { out, .. } = executor.forward_attn(
-        &q.view(),
-        &k.view(),
-        &v.view(),
-        &CuSeqlenTensors {
-            cu_seqlen_q_times_hd_times_qh: cu_seqlen_q_times_hd_times_qh.view(),
-            cu_seqlen_kv_times_hd_times_kvh: cu_seqlen_kv_times_hd_times_kvh.view(),
-        },
-        &seqlen_q.view(),
-        &seqlen_kv.view(),
-        &stream,
-    )?;
+    let AttentionForwardOutput { out, stats } =
+        executor.forward_attn(&qkv.view(), &seqlen_tensors, &stream)?;
 
     // Read the result back to the host.
     let out_staging = cx.download_from_device(out.storage(), &stream)?;
@@ -184,6 +127,41 @@ fn attention() -> anyhow::Result<()> {
     }
 
     println!("results match the reference (max absolute error: {max_error})");
+
+    let out_grad = Tensor::from_slice(
+        &sample(total_tokens * Q_HEADS * HEAD_DIM),
+        [total_tokens, Q_HEADS, HEAD_DIM],
+        &stream,
+        &cx,
+    )?;
+    let AttentionBackwardOutput { dqkv } = executor.backward_attn(
+        &qkv.view(),
+        &seqlen_tensors,
+        &out.view(),
+        &out_grad.view(),
+        &stats.view(),
+        &stream,
+    )?;
+    let dqkv_staging = cx.download_from_device(dqkv.storage(), &stream)?;
+    stream.block_on()?;
+    let dqkv_host: &[bf16] = bytemuck::cast_slice(dqkv_staging.view()?);
+    assert_eq!(dqkv_host.len(), total_tokens * PACKED_HEADS * HEAD_DIM);
+
+    for (name, head_range) in [
+        ("dq", 0..Q_HEADS),
+        ("dk", Q_HEADS..Q_HEADS + KV_HEADS),
+        ("dv", Q_HEADS + KV_HEADS..PACKED_HEADS),
+    ] {
+        let mut any_nonzero = false;
+        for token in 0..total_tokens {
+            for head in head_range.clone() {
+                let row = &dqkv_host[(token * PACKED_HEADS + head) * HEAD_DIM..][..HEAD_DIM];
+                assert!(row.iter().all(|x| x.is_finite()), "{name} not finite");
+                any_nonzero |= row.iter().any(|x| x.to_f32() != 0.0);
+            }
+        }
+        assert!(any_nonzero, "{name} was never written");
+    }
 
     Ok(())
 }

@@ -368,6 +368,23 @@ impl ExecutableCudnnGraph {
         outputs: &mut [(TensorId, TensorViewMut<'_>)],
         stream: &Stream,
     ) -> anyhow::Result<()> {
+        let mut outputs: Vec<(&[TensorId], TensorViewMut<'_>)> = outputs
+            .iter_mut()
+            .map(|(id, view)| (std::slice::from_ref(&*id), view.view_mut()))
+            .collect();
+        self.execute_aliased(inputs, &mut outputs, stream)
+    }
+
+    /// Like [`Self::execute`], but each output allocation may be bound to several
+    /// tensor IDs at once, e.g. for ragged tensors packed into one buffer or
+    /// for in-place mutations.
+    /// cuDNN does not check that aliased outputs are disjoint.
+    pub fn execute_aliased(
+        &self,
+        inputs: &[(TensorId, &TensorView<'_>)],
+        outputs: &mut [(&[TensorId], TensorViewMut<'_>)],
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
         assert_eq!(stream.device(), self.cx.cuda());
 
         let cudnn = self.cx.cudnn_on(stream)?;
@@ -396,20 +413,22 @@ impl ExecutableCudnnGraph {
                 }
             })
             .collect();
-        let mut output_memories: Vec<(TensorId, _)> = outputs
+        let mut output_memories: Vec<(&[TensorId], _)> = outputs
             .iter_mut()
-            .map(|(id, view)| {
-                if self.tensor_virt_descs[id]
-                    .check(view.virt(), self.graph.is_override_shape_enabled())
-                {
+            .map(|(ids, view)| {
+                let override_shape = ids.iter().any(|id| {
+                    self.tensor_virt_descs[id]
+                        .check(view.virt(), self.graph.is_override_shape_enabled())
+                });
+                if override_shape {
                     let shape = view.shape();
                     let strides = view.strides();
                     (
-                        *id,
+                        *ids,
                         InputMut::OverrideShape(view.storage_mut(), shape, strides),
                     )
                 } else {
-                    (*id, InputMut::StaticShape(view.storage_mut()))
+                    (*ids, InputMut::StaticShape(view.storage_mut()))
                 }
             })
             .collect();
@@ -430,18 +449,17 @@ impl ExecutableCudnnGraph {
                 }
             }
         }
-        for (id, input) in &mut output_memories {
+        for (ids, input) in &mut output_memories {
             match input {
                 InputMut::StaticShape(memory) => {
-                    variant_pack.add_mut(*id, *memory)?;
+                    variant_pack.add_mut_many(ids, *memory)?;
                 }
                 InputMut::OverrideShape(memory, shape, strides) => {
-                    variant_pack.add_mut_with_shape(
-                        *id,
-                        *memory,
-                        shape.dims_slice(),
-                        strides.dims_slice(),
-                    )?;
+                    let bindings: Vec<_> = ids
+                        .iter()
+                        .map(|&id| (id, shape.dims_slice(), strides.dims_slice()))
+                        .collect();
+                    variant_pack.add_mut_many_with_shape(&bindings, *memory)?;
                 }
             }
         }

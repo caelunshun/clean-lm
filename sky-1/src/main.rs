@@ -1,7 +1,7 @@
 use std::env;
 
 use clap::Parser;
-use cleandl::{context::Context, tensor::Tensor};
+use cleandl::{context::Context, operators::attention::RaggedSeqlenTensors, tensor::Tensor};
 use mimalloc::MiMalloc;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::Uniform;
@@ -91,41 +91,14 @@ fn main() -> anyhow::Result<()> {
 
     let seqlen = vec![
         (config.blocks.max_batch_decoder_tokens / config.blocks.max_num_sequences)
-            as i32;
+            as u32;
         config.blocks.max_num_sequences
     ];
-    let mut cu_seqlen = vec![0i64];
-    for &len in &seqlen {
-        let last = cu_seqlen.last().copied().unwrap();
-        cu_seqlen.push(last + len as i64);
-    }
-
     let meta_tensors = MetaTensors {
-        decoder_seqlen_cpu: seqlen.iter().map(|&x| x as u32).collect(),
-        decoder_seqlen: Tensor::from_slice(&seqlen, [config.blocks.max_num_sequences], stream, cx)?,
-        decoder_cu_seqlen: Tensor::from_slice(
-            &cu_seqlen,
-            [config.blocks.max_num_sequences + 1],
-            stream,
+        decoder_ragged_seqlen: RaggedSeqlenTensors::build(
+            &seqlen,
             cx,
-        )?,
-        decoder_cu_seqlen_times_hd_times_qh: Tensor::from_slice(
-            &cu_seqlen
-                .iter()
-                .map(|&x| x * (config.blocks.head_dim * config.blocks.num_decoder_q_heads) as i64)
-                .collect::<Vec<_>>(),
-            [config.blocks.max_num_sequences + 1],
-            stream,
-            cx,
-        )?,
-        decoder_cu_seqlen_times_hd_times_kvh: Tensor::from_slice(
-            &cu_seqlen
-                .iter()
-                .map(|&x| x * (config.blocks.head_dim * config.blocks.num_decoder_kv_heads) as i64)
-                .collect::<Vec<_>>(),
-            [config.blocks.max_num_sequences + 1],
-            stream,
-            cx,
+            &config.decoder_attention_config(),
         )?,
     };
 
@@ -164,8 +137,6 @@ fn main() -> anyhow::Result<()> {
         dbg!(loss);
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
-
-        break;
     }
 
     Ok(())

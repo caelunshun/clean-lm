@@ -106,9 +106,9 @@ impl bf16x2 {
     }
 
     #[must_use]
-    #[inline(always )]
+    #[inline(always)]
     pub fn to_bf16_pair(self) -> (bf16, bf16) {
-        (self.lo(), self.hi()) 
+        (self.lo(), self.hi())
     }
 
     /// Narrows and packs two `f32` values with round-to-nearest-even, clamping

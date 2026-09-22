@@ -4,15 +4,10 @@ use cleandl::{
     context::{Context, ResourceKey},
     operators::{
         adamw::AdamWExecutor,
-        attention::{
-            AttentionBackwardOutput, AttentionConfig, AttentionExecutor, AttentionForwardOutput,
-            CuSeqlenTensors,
-        },
+        attention::{AttentionBackwardOutput, AttentionExecutor, AttentionForwardOutput},
         gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
-        matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
         norm::{NormExecutor, RmsNormForwardOutput},
-        rope::{RopeConfig, RopeExecutor, RopeMode},
         swiglu_ffn::{DownProjDgradOutput, GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
     },
     tensor::{Tensor, TensorView},
@@ -20,7 +15,6 @@ use cleandl::{
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
-use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
@@ -31,11 +25,9 @@ use crate::{
 pub struct DecoderExecutor {
     config: BlocksConfig,
     pre_qkv_norm: Arc<NormExecutor>,
-    q_proj: Arc<LinearExecutor>,
-    k_proj: Arc<LinearExecutor>,
-    v_proj: Arc<LinearExecutor>,
-    kv_proj_dgrad_with_res: Arc<MatmulExecutor>,
-    rope: Arc<RopeExecutor>,
+    /// Merged Q, K, V projection; output is packed `[T, (q_heads + 2 * kv_heads) * head_dim]`.
+    qkv_proj: Arc<LinearExecutor>,
+    // TODO: rope is disabled until the kernel supports strided in-place operation on packed QKV.
     // qk_norm: Arc<NormExecutor>,
     attention: Arc<AttentionExecutor>,
     o_proj: Arc<LinearExecutor>,
@@ -61,72 +53,17 @@ impl ResourceKey for DecoderExecutorKey {
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         let pre_qkv_norm = NormExecutor::get(cx)?;
-        let q_proj = LinearExecutor::get(
+        let qkv_proj = LinearExecutor::get(
             LinearConfig {
                 estimated_batch_size: self.config.max_batch_decoder_tokens,
                 in_features: self.config.hidden_size,
-                out_features: self.config.head_dim * self.config.num_decoder_q_heads,
+                out_features: self.config.qkv_features(),
                 forward_fused_residual_add: false,
-            },
-            cx,
-        )?;
-        let k_proj = LinearExecutor::get(
-            LinearConfig {
-                estimated_batch_size: self.config.max_batch_decoder_tokens,
-                in_features: self.config.hidden_size,
-                out_features: self.config.head_dim * self.config.num_decoder_kv_heads,
-                forward_fused_residual_add: false,
-            },
-            cx,
-        )?;
-        let kv_proj_dgrad_with_res = MatmulExecutor::get(
-            MatmulConfig {
-                m: self.config.max_batch_decoder_tokens,
-                n: self.config.hidden_size,
-                k: self.config.head_dim * self.config.num_decoder_kv_heads,
-                a_format: MatrixFormat::RowMajor,
-                b_format: MatrixFormat::ColumnMajor, // transpose
-                residual: Some(ResidualConfig {
-                    format: MatrixFormat::RowMajor,
-                    element_type: ElementType::Float(FloatType::Bf16),
-                }),
-                out_format: MatrixFormat::RowMajor,
-                allow_shape_override: true,
-                ab_element_type: ElementType::Float(FloatType::Bf16),
-                out_element_type: ElementType::Float(FloatType::Bf16),
-            },
-            cx,
-        )?;
-        let v_proj = LinearExecutor::get(
-            LinearConfig {
-                estimated_batch_size: self.config.max_batch_decoder_tokens,
-                in_features: self.config.hidden_size,
-                out_features: self.config.head_dim * self.config.num_decoder_kv_heads,
-                forward_fused_residual_add: false,
-            },
-            cx,
-        )?;
-        let rope = RopeExecutor::get(
-            RopeConfig {
-                base_freq: self.config.rope_base_freq,
-                max_seqlen: self.config.max_decoder_seqlen,
-                head_dim: self.config.head_dim,
             },
             cx,
         )?;
         // let qk_norm = NormExecutor::get(cx)?;
-        let attention = AttentionExecutor::get(
-            AttentionConfig {
-                is_causal: true,
-                max_q_seqlen: self.config.max_decoder_seqlen,
-                max_kv_seqlen: self.config.max_decoder_seqlen,
-                max_num_sequences: self.config.max_num_sequences,
-                q_heads: self.config.num_decoder_q_heads,
-                kv_heads: self.config.num_decoder_kv_heads,
-                head_dim: self.config.head_dim,
-            },
-            cx,
-        )?;
+        let attention = AttentionExecutor::get(self.config.decoder_attention_config(), cx)?;
         let o_proj = LinearExecutor::get(
             LinearConfig {
                 estimated_batch_size: self.config.max_batch_decoder_tokens,
@@ -153,11 +90,7 @@ impl ResourceKey for DecoderExecutorKey {
         Ok(DecoderExecutor {
             config: self.config.clone(),
             pre_qkv_norm,
-            q_proj,
-            k_proj,
-            kv_proj_dgrad_with_res,
-            v_proj,
-            rope,
+            qkv_proj,
             // qk_norm,
             attention,
             o_proj,
@@ -172,9 +105,7 @@ impl ResourceKey for DecoderExecutorKey {
 #[derive(Debug)]
 pub struct DecoderWeights {
     pub pre_qkv_norm_gamma: Parameter,
-    pub q_proj: Parameter,
-    pub k_proj: Parameter,
-    pub v_proj: Parameter,
+    pub qkv_proj: Parameter,
     // pub q_norm_gamma: Parameter,
     // pub k_norm_gamma: Parameter,
     pub o_proj: Parameter,
@@ -200,33 +131,8 @@ impl DecoderWeights {
 
         Ok(Self {
             pre_qkv_norm_gamma: Parameter::constant([config.blocks.hidden_size], 1.0, stream, cx)?,
-            q_proj: Parameter::from_normal_distr(
-                [
-                    config.blocks.hidden_size,
-                    config.blocks.head_dim * config.blocks.num_decoder_q_heads,
-                ],
-                0.0,
-                ffn_up_gate_stdev,
-                rng,
-                stream,
-                cx,
-            )?,
-            k_proj: Parameter::from_normal_distr(
-                [
-                    config.blocks.hidden_size,
-                    config.blocks.head_dim * config.blocks.num_decoder_kv_heads,
-                ],
-                0.0,
-                ffn_up_gate_stdev,
-                rng,
-                stream,
-                cx,
-            )?,
-            v_proj: Parameter::from_normal_distr(
-                [
-                    config.blocks.hidden_size,
-                    config.blocks.head_dim * config.blocks.num_decoder_kv_heads,
-                ],
+            qkv_proj: Parameter::from_normal_distr(
+                [config.blocks.hidden_size, config.blocks.qkv_features()],
                 0.0,
                 ffn_up_gate_stdev,
                 rng,
@@ -289,9 +195,8 @@ impl DecoderWeights {
 pub struct DecoderSavedTensors {
     pre_qkv_norm_r_inv: Tensor,
     pre_qkv_norm_result: Tensor,
-    q_proj_result: Tensor,
-    k_proj_result: Tensor,
-    v_proj_result: Tensor,
+    /// Packed `[T, (q_heads + 2 * kv_heads) * head_dim]`.
+    qkv_proj_result: Tensor,
     // q_norm_result: Tensor,
     // q_norm_r_inv: Tensor,
     // k_norm_result: Tensor,
@@ -337,44 +242,9 @@ impl DecoderExecutor {
         )?;
 
         // --- QKV projection --- //
-        let q_proj_result = self.q_proj.forward(
+        let qkv_proj_result = self.qkv_proj.forward(
             &pre_qkv_norm_result.view(),
-            &weights.q_proj.bf16_weights().view(),
-            stream,
-        )?;
-
-        let k_proj_result = self.k_proj.forward(
-            &pre_qkv_norm_result.view(),
-            &weights.k_proj.bf16_weights().view(),
-            stream,
-        )?;
-
-        let v_proj_result = self.v_proj.forward(
-            &pre_qkv_norm_result.view(),
-            &weights.v_proj.bf16_weights().view(),
-            stream,
-        )?;
-
-        let q_proj_result = self.rope.execute(
-            &q_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_q_heads,
-                self.config.head_dim,
-            ]),
-            &meta_tensors.decoder_cu_seqlen.view(),
-            &meta_tensors.decoder_seqlen_cpu,
-            RopeMode::Forward,
-            stream,
-        )?;
-        let k_proj_result = self.rope.execute(
-            &k_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &meta_tensors.decoder_cu_seqlen.view(),
-            &meta_tensors.decoder_seqlen_cpu,
-            RopeMode::Forward,
+            &weights.qkv_proj.bf16_weights().view(),
             stream,
         )?;
 
@@ -442,31 +312,12 @@ impl DecoderExecutor {
             out: attn_result,
             stats: attn_stats,
         } = self.attention.forward_attn(
-            &q_proj_result.reshaped([
+            &qkv_proj_result.reshaped([
                 batch_size,
-                self.config.num_decoder_q_heads,
+                self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
                 self.config.head_dim,
             ]),
-            &k_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &v_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &CuSeqlenTensors {
-                cu_seqlen_q_times_hd_times_qh: meta_tensors
-                    .decoder_cu_seqlen_times_hd_times_qh
-                    .view(),
-                cu_seqlen_kv_times_hd_times_kvh: meta_tensors
-                    .decoder_cu_seqlen_times_hd_times_kvh
-                    .view(),
-            },
-            &meta_tensors.decoder_seqlen.view(),
-            &meta_tensors.decoder_seqlen.view(),
+            &meta_tensors.decoder_ragged_seqlen,
             stream,
         )?;
 
@@ -518,9 +369,7 @@ impl DecoderExecutor {
         Ok(DecoderSavedTensors {
             pre_qkv_norm_r_inv,
             pre_qkv_norm_result,
-            q_proj_result,
-            k_proj_result,
-            v_proj_result,
+            qkv_proj_result,
             // q_norm_result,
             // q_norm_r_inv,
             // k_norm_result,
@@ -550,7 +399,6 @@ impl DecoderExecutor {
             panic!()
         };
         let q_features = self.config.head_dim * self.config.num_decoder_q_heads;
-        let kv_features = self.config.head_dim * self.config.num_decoder_kv_heads;
 
         // --- FFN down --- //
 
@@ -642,32 +490,13 @@ impl DecoderExecutor {
         )?;
 
         // --- Attention --- //
-        let AttentionBackwardOutput { dq, dk, dv } = self.attention.backward_attn(
-            &saves.q_proj_result.reshaped([
+        let AttentionBackwardOutput { dqkv } = self.attention.backward_attn(
+            &saves.qkv_proj_result.reshaped([
                 batch_size,
-                self.config.num_decoder_q_heads,
+                self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
                 self.config.head_dim,
             ]),
-            &saves.k_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &saves.v_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &CuSeqlenTensors {
-                cu_seqlen_q_times_hd_times_qh: meta_tensors
-                    .decoder_cu_seqlen_times_hd_times_qh
-                    .view(),
-                cu_seqlen_kv_times_hd_times_kvh: meta_tensors
-                    .decoder_cu_seqlen_times_hd_times_kvh
-                    .view(),
-            },
-            &meta_tensors.decoder_seqlen.view(),
-            &meta_tensors.decoder_seqlen.view(),
+            &meta_tensors.decoder_ragged_seqlen,
             &saves.attn_result.view(),
             &o_proj_dx.reshaped([
                 batch_size,
@@ -677,68 +506,20 @@ impl DecoderExecutor {
             &saves.attn_stats.view(),
             stream,
         )?;
-
-        let dq = self.rope.execute(
-            &dq.view(),
-            &meta_tensors.decoder_cu_seqlen.view(),
-            &meta_tensors.decoder_seqlen_cpu,
-            RopeMode::Backward,
-            stream,
-        )?;
-        let dk = self.rope.execute(
-            &dk.view(),
-            &meta_tensors.decoder_cu_seqlen.view(),
-            &meta_tensors.decoder_seqlen_cpu,
-            RopeMode::Backward,
-            stream,
-        )?;
-
-        let dq = dq.reshaped([batch_size, q_features]);
-        let dk = dk.reshaped([batch_size, kv_features]);
-        let dv = dv.reshaped([batch_size, kv_features]);
+        let dqkv = dqkv.reshaped([batch_size, self.config.qkv_features()]);
 
         // --- QKV-proj --- //
-        let dwq = self
-            .q_proj
-            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dq, stream)?;
+        let dw_qkv =
+            self.qkv_proj
+                .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dqkv, stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
-            &dwq.view(),
-            &mut weights.q_proj.gradients.view_mut(),
+            &dw_qkv.view(),
+            &mut weights.qkv_proj.gradients.view_mut(),
             stream,
         )?;
-        let q_ddata =
-            self.q_proj
-                .backward_dgrad(&dq, &weights.q_proj.bf16_weights().view(), stream)?;
-
-        let dwk = self
-            .k_proj
-            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dk, stream)?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &dwk.view(),
-            &mut weights.k_proj.gradients.view_mut(),
-            stream,
-        )?;
-        let k_ddata = self.kv_proj_dgrad_with_res.matmul(
-            &dk,
-            &weights.k_proj.bf16_weights().view().transposed(0, 1),
-            Some(&q_ddata.view()),
-            stream,
-        )?;
-
-        let dwv = self
-            .v_proj
-            .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dv, stream)?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &dwv.view(),
-            &mut weights.v_proj.gradients.view_mut(),
-            stream,
-        )?;
-        let qkv_ddata = self.kv_proj_dgrad_with_res.matmul(
-            &dv,
-            &weights.v_proj.bf16_weights().view().transposed(0, 1),
-            Some(&k_ddata.view()),
-            stream,
-        )?;
+        let qkv_ddata =
+            self.qkv_proj
+                .backward_dgrad(&dqkv, &weights.qkv_proj.bf16_weights().view(), stream)?;
 
         // --- Pre-QKV norm --- //
 
@@ -762,9 +543,7 @@ impl DecoderExecutor {
     ) -> anyhow::Result<()> {
         for param in [
             &weights.pre_qkv_norm_gamma,
-            &weights.q_proj,
-            &weights.k_proj,
-            &weights.v_proj,
+            &weights.qkv_proj,
             &weights.o_proj,
             &weights.pre_ffn_norm_gamma,
             &weights.ffn_up,
@@ -786,9 +565,7 @@ impl DecoderExecutor {
     ) -> anyhow::Result<()> {
         for param in [
             &mut weights.pre_qkv_norm_gamma,
-            &mut weights.q_proj,
-            &mut weights.k_proj,
-            &mut weights.v_proj,
+            &mut weights.qkv_proj,
             &mut weights.o_proj,
             &mut weights.pre_ffn_norm_gamma,
             &mut weights.ffn_up,

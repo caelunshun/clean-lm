@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use skycuda::stream::Stream;
 use skycuda_cudnn::{SdpaAttributes, SdpaBackwardAttributes, TensorId};
-use skytens_core::data_type::{ElementType, FloatType, SIntType};
+use skytens_core::{
+    data_type::{ElementType, FloatType, SIntType},
+    shape::{Shape, Strides},
+};
 
 use crate::{
     context::{Context, ResourceKey},
@@ -10,18 +13,71 @@ use crate::{
     tensor::{Tensor, TensorView, VirtTensorView},
 };
 
-/// Various cumulative sequence length tensors
-/// with different scales needed for cuDNN attention.
-/// All tensors are expected as sint64 `[B + 1]`.
+/// Sequence length and ragged offset tensors needed for attention
+/// on a packed, ragged QKV tensor.
+///
+/// Sequences beyond those given (up to `max_num_sequences`) are padded as zero-length.
 #[derive(Debug)]
-pub struct CuSeqlenTensors<'a> {
-    /// Output cu_seqlen scaled by head_dim * num_q_heads.
-    pub cu_seqlen_q_times_hd_times_qh: TensorView<'a>,
-    /// Input cu_seqlen scaled by head_dim * num_kv_heads.
-    pub cu_seqlen_kv_times_hd_times_kvh: TensorView<'a>,
+pub struct RaggedSeqlenTensors {
+    /// s32 `[max_num_sequences]`.
+    seqlen: Tensor,
+    /// Offset of each sequence's Q-head span within the packed QKV tensor, in units of elements.
+    offset_q: Tensor,
+    /// Offset of each sequence's K-head span within the packed QKV tensor, in units of elements.
+    offset_k: Tensor,
+    /// Offset of each sequence's V-head span within the packed QKV tensor, in units of elements.
+    offset_v: Tensor,
+    /// Offset of each sequence within the `[T, q_heads, head_dim]` output tensor, in units of elements.
+    offset_o: Tensor,
 }
 
-/// Attention with varlen and ragged offsets.
+impl RaggedSeqlenTensors {
+    pub fn build(seqlens: &[u32], cx: &Context, config: &AttentionConfig) -> anyhow::Result<Self> {
+        let b = config.max_num_sequences;
+        anyhow::ensure!(
+            seqlens.len() <= b,
+            "got {} sequences, but max_num_sequences is {b}",
+            seqlens.len()
+        );
+
+        let packed_row_stride = config.packed_row_stride();
+        let q_span = config.head_dim * config.q_heads;
+        let kv_span = config.head_dim * config.kv_heads;
+
+        let mut seqlen_data = vec![0i32; b];
+        for (dst, &seqlen) in seqlen_data.iter_mut().zip(seqlens) {
+            *dst = i32::try_from(seqlen)?;
+        }
+
+        let mut cu_seqlens = Vec::with_capacity(b + 1);
+        let mut cu_seqlen = 0usize;
+        for &seqlen in &seqlen_data {
+            cu_seqlens.push(cu_seqlen);
+            cu_seqlen += seqlen as usize;
+        }
+        cu_seqlens.push(cu_seqlen);
+
+        let offsets = |row_stride: usize, base: usize| -> Vec<i64> {
+            cu_seqlens
+                .iter()
+                .map(|&cu_seqlen| (cu_seqlen * row_stride + base) as i64)
+                .collect()
+        };
+        let upload = |data: &[i64]| Tensor::from_slice(data, [b + 1], cx.h2d_copy_stream(), cx);
+
+        Ok(Self {
+            seqlen: Tensor::from_slice(&seqlen_data, [b], cx.h2d_copy_stream(), cx)?,
+            offset_q: upload(&offsets(packed_row_stride, 0))?,
+            offset_k: upload(&offsets(packed_row_stride, q_span))?,
+            offset_v: upload(&offsets(packed_row_stride, q_span + kv_span))?,
+            offset_o: upload(&offsets(q_span, 0))?,
+        })
+    }
+}
+
+/// Attention with varlen and ragged offsets, operating on a packed QKV tensor
+/// laid out as row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`
+/// (Q heads first, then K heads, then V heads).
 ///
 /// Due to apparent cuDNN API inconsistencies, the stats tensor
 /// is not ragged like the others. It must be padded to shape [max_num_sequences, max_output_seqlen, num_q_heads].
@@ -30,35 +86,35 @@ pub struct AttentionExecutor {
     config: AttentionConfig,
     cx: Context,
     forward_graph: ExecutableCudnnGraph,
-    forward_input_cu_seqlen_q_times_hd_times_qh: TensorId,
-    forward_input_cu_seqlen_kv_times_hd_times_kvh: TensorId,
+    /// Q, K, V tensor IDs, all bound to the packed QKV buffer.
+    forward_input_qkv: [TensorId; 3],
+    forward_input_offset_q: TensorId,
+    forward_input_offset_k: TensorId,
+    forward_input_offset_v: TensorId,
+    forward_input_offset_o: TensorId,
     forward_input_seqlen_q: TensorId,
     forward_input_seqlen_kv: TensorId,
-    forward_input_q: TensorId,
-    forward_input_k: TensorId,
-    forward_input_v: TensorId,
     forward_output_o: TensorId,
     forward_output_stats: TensorId,
     backward_graph: ExecutableCudnnGraph,
-    backward_input_q: TensorId,
-    backward_input_k: TensorId,
-    backward_input_v: TensorId,
-    backward_input_cu_seqlen_q_times_hd_times_qh: TensorId,
-    backward_input_cu_seqlen_kv_times_hd_times_kvh: TensorId,
+    backward_input_qkv: [TensorId; 3],
+    backward_input_offset_q: TensorId,
+    backward_input_offset_k: TensorId,
+    backward_input_offset_v: TensorId,
+    backward_input_offset_o: TensorId,
     backward_input_seqlen_q: TensorId,
     backward_input_seqlen_kv: TensorId,
     backward_input_o: TensorId,
     backward_input_do: TensorId,
     backward_input_stats: TensorId,
-    backward_output_dq: TensorId,
-    backward_output_dk: TensorId,
-    backward_output_dv: TensorId,
+    /// dQ, dK, dV tensor IDs, all aliased onto the packed dQKV buffer.
+    backward_output_dqkv: [TensorId; 3],
 }
 
 /// Outputs of [`AttentionExecutor::forward_attn`].
 #[derive(Debug)]
 pub struct AttentionForwardOutput {
-    /// Attention output, row-major bf16 `[T, H, D]` like `q`.
+    /// Attention output, row-major bf16 `[T, q_heads, head_dim]`.
     pub out: Tensor,
     /// Softmax stats, row-major f32 `[max_num_sequences, max_q_seqlen, q_heads]`.
     pub stats: Tensor,
@@ -67,9 +123,8 @@ pub struct AttentionForwardOutput {
 /// Outputs of [`AttentionExecutor::backward_attn`].
 #[derive(Debug)]
 pub struct AttentionBackwardOutput {
-    pub dq: Tensor,
-    pub dk: Tensor,
-    pub dv: Tensor,
+    /// Gradient of the packed QKV tensor, with the same layout as the input.
+    pub dqkv: Tensor,
 }
 
 impl AttentionExecutor {
@@ -77,22 +132,36 @@ impl AttentionExecutor {
         cx.get_or_create_resource(config)
     }
 
-    /// Q, K, V expected as row-major bf16 [T, H, D].
-    /// `seqlen_*` expected as s32 [B].
-    #[allow(clippy::too_many_arguments)]
+    /// Validates the packed QKV layout and returns the number of tokens `T`.
+    fn check_qkv(&self, qkv: &TensorView<'_>) -> usize {
+        let shape = qkv.shape();
+        assert_eq!(
+            shape.num_dims(),
+            3,
+            "packed QKV must be [T, heads, head_dim]"
+        );
+        assert_eq!(shape[1], self.config.q_heads + 2 * self.config.kv_heads);
+        assert_eq!(shape[2], self.config.head_dim);
+        assert_eq!(qkv.element_type(), ElementType::Float(FloatType::Bf16));
+        assert!(qkv.is_packed_row_major());
+        shape[0]
+    }
+
+    /// `qkv` expected as packed row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`.
     pub fn forward_attn(
         &self,
-        q: &TensorView<'_>,
-        k: &TensorView<'_>,
-        v: &TensorView<'_>,
-        cu_seqlens: &CuSeqlenTensors<'_>,
-        seqlen_q: &TensorView<'_>,
-        seqlen_kv: &TensorView<'_>,
+        qkv: &TensorView<'_>,
+        seqlens: &RaggedSeqlenTensors,
         stream: &Stream,
     ) -> anyhow::Result<AttentionForwardOutput> {
         let b = self.config.max_num_sequences;
+        let num_tokens = self.check_qkv(qkv);
 
-        let mut out = Tensor::new_zeroed(q.shape(), q.element_type(), &self.cx)?;
+        let mut out = Tensor::new_zeroed(
+            [num_tokens, self.config.q_heads, self.config.head_dim],
+            qkv.element_type(),
+            &self.cx,
+        )?;
         let mut out_stats = Tensor::new_zeroed(
             [
                 self.config.max_num_sequences,
@@ -105,28 +174,32 @@ impl AttentionExecutor {
 
         self.forward_graph.execute(
             &[
-                (self.forward_input_q, q),
-                (self.forward_input_k, k),
-                (self.forward_input_v, v),
+                (self.forward_input_qkv[0], qkv),
+                (self.forward_input_qkv[1], qkv),
+                (self.forward_input_qkv[2], qkv),
                 (
-                    self.forward_input_cu_seqlen_q_times_hd_times_qh,
-                    &cu_seqlens
-                        .cu_seqlen_q_times_hd_times_qh
-                        .reshaped([b + 1, 1, 1, 1]),
+                    self.forward_input_offset_q,
+                    &seqlens.offset_q.reshaped([b + 1, 1, 1, 1]),
                 ),
                 (
-                    self.forward_input_cu_seqlen_kv_times_hd_times_kvh,
-                    &cu_seqlens
-                        .cu_seqlen_kv_times_hd_times_kvh
-                        .reshaped([b + 1, 1, 1, 1]),
+                    self.forward_input_offset_k,
+                    &seqlens.offset_k.reshaped([b + 1, 1, 1, 1]),
+                ),
+                (
+                    self.forward_input_offset_v,
+                    &seqlens.offset_v.reshaped([b + 1, 1, 1, 1]),
+                ),
+                (
+                    self.forward_input_offset_o,
+                    &seqlens.offset_o.reshaped([b + 1, 1, 1, 1]),
                 ),
                 (
                     self.forward_input_seqlen_q,
-                    &seqlen_q.reshaped([b, 1, 1, 1]),
+                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
                 ),
                 (
                     self.forward_input_seqlen_kv,
-                    &seqlen_kv.reshaped([b, 1, 1, 1]),
+                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
                 ),
             ],
             &mut [
@@ -151,53 +224,51 @@ impl AttentionExecutor {
         })
     }
 
-    /// Q, K, V, O, dO expected as row-major bf16 [T, H, D].
+    /// `qkv` expected as packed row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`.
+    /// `out`, `out_grad` expected as row-major bf16 `[T, q_heads, head_dim]`.
     /// Stats expected as returned by [`Self::forward_attn`].
-    /// `seqlen_*` expected as s32 [B].
-    #[allow(clippy::too_many_arguments)]
     pub fn backward_attn(
         &self,
-        q: &TensorView<'_>,
-        k: &TensorView<'_>,
-        v: &TensorView<'_>,
-        cu_seqlens: &CuSeqlenTensors<'_>,
-        seqlen_q: &TensorView<'_>,
-        seqlen_kv: &TensorView<'_>,
+        qkv: &TensorView<'_>,
+        seqlens: &RaggedSeqlenTensors,
         out: &TensorView<'_>,
         out_grad: &TensorView<'_>,
         stats: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<AttentionBackwardOutput> {
         let b = self.config.max_num_sequences;
+        self.check_qkv(qkv);
 
-        let mut grad_q = Tensor::new_zeroed(q.shape(), q.element_type(), &self.cx)?;
-        let mut grad_k = Tensor::new_zeroed(k.shape(), k.element_type(), &self.cx)?;
-        let mut grad_v = Tensor::new_zeroed(v.shape(), v.element_type(), &self.cx)?;
+        let mut grad_qkv = Tensor::new_zeroed(qkv.shape(), qkv.element_type(), &self.cx)?;
 
-        self.backward_graph.execute(
+        self.backward_graph.execute_aliased(
             &[
-                (self.backward_input_q, q),
-                (self.backward_input_k, k),
-                (self.backward_input_v, v),
+                (self.backward_input_qkv[0], qkv),
+                (self.backward_input_qkv[1], qkv),
+                (self.backward_input_qkv[2], qkv),
                 (
-                    self.backward_input_cu_seqlen_q_times_hd_times_qh,
-                    &cu_seqlens
-                        .cu_seqlen_q_times_hd_times_qh
-                        .reshaped([b + 1, 1, 1, 1]),
+                    self.backward_input_offset_q,
+                    &seqlens.offset_q.reshaped([b + 1, 1, 1, 1]),
                 ),
                 (
-                    self.backward_input_cu_seqlen_kv_times_hd_times_kvh,
-                    &cu_seqlens
-                        .cu_seqlen_kv_times_hd_times_kvh
-                        .reshaped([b + 1, 1, 1, 1]),
+                    self.backward_input_offset_k,
+                    &seqlens.offset_k.reshaped([b + 1, 1, 1, 1]),
+                ),
+                (
+                    self.backward_input_offset_v,
+                    &seqlens.offset_v.reshaped([b + 1, 1, 1, 1]),
+                ),
+                (
+                    self.backward_input_offset_o,
+                    &seqlens.offset_o.reshaped([b + 1, 1, 1, 1]),
                 ),
                 (
                     self.backward_input_seqlen_q,
-                    &seqlen_q.reshaped([b, 1, 1, 1]),
+                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
                 ),
                 (
                     self.backward_input_seqlen_kv,
-                    &seqlen_kv.reshaped([b, 1, 1, 1]),
+                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
                 ),
                 (self.backward_input_o, out),
                 (self.backward_input_do, out_grad),
@@ -213,18 +284,10 @@ impl AttentionExecutor {
                         .transposed(1, 2),
                 ),
             ],
-            &mut [
-                (self.backward_output_dq, grad_q.view_mut()),
-                (self.backward_output_dk, grad_k.view_mut()),
-                (self.backward_output_dv, grad_v.view_mut()),
-            ],
+            &mut [(&self.backward_output_dqkv[..], grad_qkv.view_mut())],
             stream,
         )?;
-        Ok(AttentionBackwardOutput {
-            dq: grad_q,
-            dk: grad_k,
-            dv: grad_v,
-        })
+        Ok(AttentionBackwardOutput { dqkv: grad_qkv })
     }
 }
 
@@ -240,7 +303,12 @@ pub struct AttentionConfig {
 }
 
 impl AttentionConfig {
-    fn cu_seqlen_layout(&self) -> VirtTensorView {
+    /// Elements per token row of the packed QKV tensor.
+    fn packed_row_stride(&self) -> usize {
+        self.head_dim * (self.q_heads + 2 * self.kv_heads)
+    }
+
+    fn ragged_offset_layout(&self) -> VirtTensorView {
         VirtTensorView::new(
             [self.max_num_sequences + 1, 1, 1, 1],
             ElementType::SInt(SIntType::S64),
@@ -254,25 +322,33 @@ impl AttentionConfig {
         )
     }
 
+    /// `[B, H, S, D]` layout of one of Q, K, V within the packed QKV tensor.
+    /// Per-sequence base pointers come from the ragged offset tensors,
+    /// so the batch stride is nominal.
+    fn packed_layout(&self, heads: usize, max_seqlen: usize) -> VirtTensorView {
+        let row = self.packed_row_stride();
+        VirtTensorView::with_strides(
+            Shape::new([self.max_num_sequences, heads, max_seqlen, self.head_dim]),
+            Strides::new([max_seqlen * row, self.head_dim, row, 1]),
+            ElementType::Float(FloatType::Bf16),
+        )
+    }
+
     fn q_layout(&self) -> VirtTensorView {
+        self.packed_layout(self.q_heads, self.max_q_seqlen)
+    }
+
+    fn kv_layout(&self) -> VirtTensorView {
+        self.packed_layout(self.kv_heads, self.max_kv_seqlen)
+    }
+
+    /// `[B, H, S, D]` layout of the `[T, q_heads, head_dim]` output tensor.
+    fn o_layout(&self) -> VirtTensorView {
         VirtTensorView::new(
             [
                 self.max_num_sequences,
                 self.max_q_seqlen,
                 self.q_heads,
-                self.head_dim,
-            ],
-            ElementType::Float(FloatType::Bf16),
-        )
-        .transposed(1, 2)
-    }
-
-    fn kv_layout(&self) -> VirtTensorView {
-        VirtTensorView::new(
-            [
-                self.max_num_sequences,
-                self.max_kv_seqlen,
-                self.kv_heads,
                 self.head_dim,
             ],
             ElementType::Float(FloatType::Bf16),
@@ -297,10 +373,10 @@ impl ResourceKey for AttentionConfig {
 
         let forward_graph = CudnnGraphBuilder::new(cx)?;
 
-        let forward_cu_seqlen_q_times_hd_times_qh =
-            forward_graph.bind_tensor(&self.cu_seqlen_layout());
-        let forward_cu_seqlen_kv_times_hd_times_kvh =
-            forward_graph.bind_tensor(&self.cu_seqlen_layout());
+        let forward_offset_q = forward_graph.bind_tensor(&self.ragged_offset_layout());
+        let forward_offset_k = forward_graph.bind_tensor(&self.ragged_offset_layout());
+        let forward_offset_v = forward_graph.bind_tensor(&self.ragged_offset_layout());
+        let forward_offset_o = forward_graph.bind_tensor(&self.ragged_offset_layout());
         let forward_seqlen_q = forward_graph.bind_tensor(&self.seqlen_layout());
         let forward_seqlen_kv = forward_graph.bind_tensor(&self.seqlen_layout());
 
@@ -308,9 +384,9 @@ impl ResourceKey for AttentionConfig {
         let forward_input_k = forward_graph.bind_tensor(&self.kv_layout());
         let forward_input_v = forward_graph.bind_tensor(&self.kv_layout());
 
-        forward_input_q.set_ragged_offset(forward_cu_seqlen_q_times_hd_times_qh, None);
-        forward_input_k.set_ragged_offset(forward_cu_seqlen_kv_times_hd_times_kvh, None);
-        forward_input_v.set_ragged_offset(forward_cu_seqlen_kv_times_hd_times_kvh, None);
+        forward_input_q.set_ragged_offset(forward_offset_q, None);
+        forward_input_k.set_ragged_offset(forward_offset_k, None);
+        forward_input_v.set_ragged_offset(forward_offset_v, None);
 
         let [forward_output_o, forward_output_stats] = forward_graph.graph().sdpa(
             forward_input_q,
@@ -325,44 +401,45 @@ impl ResourceKey for AttentionConfig {
         )?;
         let forward_output_o = forward_output_o.unwrap();
         let forward_output_stats = forward_output_stats.unwrap();
-        let forward_output_o_id = forward_graph.mark_output(forward_output_o, &self.q_layout());
-        forward_output_o.set_ragged_offset(forward_cu_seqlen_q_times_hd_times_qh, None);
+        let forward_output_o_id = forward_graph.mark_output(forward_output_o, &self.o_layout());
+        forward_output_o.set_ragged_offset(forward_offset_o, None);
         let forward_output_stats_id =
             forward_graph.mark_output(forward_output_stats, &self.stats_layout());
 
-        let executor_forward = (
-            forward_cu_seqlen_q_times_hd_times_qh.uid(),
-            forward_cu_seqlen_kv_times_hd_times_kvh.uid(),
-            forward_seqlen_q.uid(),
-            forward_seqlen_kv.uid(),
+        let forward_input_qkv = [
             forward_input_q.uid(),
             forward_input_k.uid(),
             forward_input_v.uid(),
-        );
+        ];
+        let forward_input_offset_q = forward_offset_q.uid();
+        let forward_input_offset_k = forward_offset_k.uid();
+        let forward_input_offset_v = forward_offset_v.uid();
+        let forward_input_offset_o = forward_offset_o.uid();
+        let forward_input_seqlen_q = forward_seqlen_q.uid();
+        let forward_input_seqlen_kv = forward_seqlen_kv.uid();
         let forward_graph = forward_graph.build()?;
 
         let backward_graph = CudnnGraphBuilder::new(cx)?;
 
-        let backward_cu_seqlen_q_times_hd_times_qh =
-            backward_graph.bind_tensor(&self.cu_seqlen_layout());
-        let backward_cu_seqlen_kv_times_hd_times_kvh =
-            backward_graph.bind_tensor(&self.cu_seqlen_layout());
+        let backward_offset_q = backward_graph.bind_tensor(&self.ragged_offset_layout());
+        let backward_offset_k = backward_graph.bind_tensor(&self.ragged_offset_layout());
+        let backward_offset_v = backward_graph.bind_tensor(&self.ragged_offset_layout());
+        let backward_offset_o = backward_graph.bind_tensor(&self.ragged_offset_layout());
         let backward_seqlen_q = backward_graph.bind_tensor(&self.seqlen_layout());
         let backward_seqlen_kv = backward_graph.bind_tensor(&self.seqlen_layout());
 
         let backward_input_q = backward_graph.bind_tensor(&self.q_layout());
         let backward_input_k = backward_graph.bind_tensor(&self.kv_layout());
         let backward_input_v = backward_graph.bind_tensor(&self.kv_layout());
-        let backward_input_o = backward_graph.bind_tensor(&self.q_layout());
-        let backward_input_do = backward_graph.bind_tensor(&self.q_layout());
+        let backward_input_o = backward_graph.bind_tensor(&self.o_layout());
+        let backward_input_do = backward_graph.bind_tensor(&self.o_layout());
         let backward_input_stats = backward_graph.bind_tensor(&self.stats_layout());
 
-        for tensor in [backward_input_q, backward_input_o, backward_input_do] {
-            tensor.set_ragged_offset(backward_cu_seqlen_q_times_hd_times_qh, None);
-        }
-        for tensor in [backward_input_k, backward_input_v] {
-            tensor.set_ragged_offset(backward_cu_seqlen_kv_times_hd_times_kvh, None);
-        }
+        backward_input_q.set_ragged_offset(backward_offset_q, None);
+        backward_input_k.set_ragged_offset(backward_offset_k, None);
+        backward_input_v.set_ragged_offset(backward_offset_v, None);
+        backward_input_o.set_ragged_offset(backward_offset_o, None);
+        backward_input_do.set_ragged_offset(backward_offset_o, None);
 
         let [backward_output_dq, backward_output_dk, backward_output_dv] =
             backward_graph.graph().sdpa_backward(
@@ -386,77 +463,59 @@ impl ResourceKey for AttentionConfig {
         let backward_output_dv = backward_output_dv.unwrap();
         let backward_output_dq_id =
             backward_graph.mark_output(backward_output_dq, &self.q_layout());
-        backward_output_dq.set_ragged_offset(backward_cu_seqlen_q_times_hd_times_qh, None);
+        backward_output_dq.set_ragged_offset(backward_offset_q, None);
         let backward_output_dk_id =
             backward_graph.mark_output(backward_output_dk, &self.kv_layout());
-        backward_output_dk.set_ragged_offset(backward_cu_seqlen_kv_times_hd_times_kvh, None);
+        backward_output_dk.set_ragged_offset(backward_offset_k, None);
         let backward_output_dv_id =
             backward_graph.mark_output(backward_output_dv, &self.kv_layout());
-        backward_output_dv.set_ragged_offset(backward_cu_seqlen_kv_times_hd_times_kvh, None);
+        backward_output_dv.set_ragged_offset(backward_offset_v, None);
 
-        let executor_backward = (
-            backward_cu_seqlen_q_times_hd_times_qh.uid(),
-            backward_cu_seqlen_kv_times_hd_times_kvh.uid(),
-            backward_seqlen_q.uid(),
-            backward_seqlen_kv.uid(),
+        let backward_input_qkv = [
             backward_input_q.uid(),
             backward_input_k.uid(),
             backward_input_v.uid(),
-            backward_input_o.uid(),
-            backward_input_do.uid(),
-            backward_input_stats.uid(),
-        );
+        ];
+        let backward_input_offset_q = backward_offset_q.uid();
+        let backward_input_offset_k = backward_offset_k.uid();
+        let backward_input_offset_v = backward_offset_v.uid();
+        let backward_input_offset_o = backward_offset_o.uid();
+        let backward_input_seqlen_q = backward_seqlen_q.uid();
+        let backward_input_seqlen_kv = backward_seqlen_kv.uid();
+        let backward_input_o = backward_input_o.uid();
+        let backward_input_do = backward_input_do.uid();
+        let backward_input_stats = backward_input_stats.uid();
         let backward_graph = backward_graph.build()?;
-
-        let (
-            forward_input_cu_seqlen_q_times_hd_times_qh,
-            forward_input_cu_seqlen_kv_times_hd_times_kvh,
-            forward_input_seqlen_q,
-            forward_input_seqlen_kv,
-            forward_input_q,
-            forward_input_k,
-            forward_input_v,
-        ) = executor_forward;
-        let (
-            backward_input_cu_seqlen_q_times_hd_times_qh,
-            backward_input_cu_seqlen_kv_times_hd_times_kvh,
-            backward_input_seqlen_q,
-            backward_input_seqlen_kv,
-            backward_input_q,
-            backward_input_k,
-            backward_input_v,
-            backward_input_o,
-            backward_input_do,
-            backward_input_stats,
-        ) = executor_backward;
 
         Ok(AttentionExecutor {
             config: self.clone(),
             cx: cx.clone(),
             forward_graph,
-            forward_input_cu_seqlen_q_times_hd_times_qh,
-            forward_input_cu_seqlen_kv_times_hd_times_kvh,
+            forward_input_qkv,
+            forward_input_offset_q,
+            forward_input_offset_k,
+            forward_input_offset_v,
+            forward_input_offset_o,
             forward_input_seqlen_q,
             forward_input_seqlen_kv,
-            forward_input_q,
-            forward_input_k,
-            forward_input_v,
             forward_output_o: forward_output_o_id,
             forward_output_stats: forward_output_stats_id,
             backward_graph,
-            backward_input_q,
-            backward_input_k,
-            backward_input_v,
-            backward_input_cu_seqlen_q_times_hd_times_qh,
-            backward_input_cu_seqlen_kv_times_hd_times_kvh,
+            backward_input_qkv,
+            backward_input_offset_q,
+            backward_input_offset_k,
+            backward_input_offset_v,
+            backward_input_offset_o,
             backward_input_seqlen_q,
             backward_input_seqlen_kv,
             backward_input_o,
             backward_input_do,
             backward_input_stats,
-            backward_output_dq: backward_output_dq_id,
-            backward_output_dk: backward_output_dk_id,
-            backward_output_dv: backward_output_dv_id,
+            backward_output_dqkv: [
+                backward_output_dq_id,
+                backward_output_dk_id,
+                backward_output_dv_id,
+            ],
         })
     }
 }
