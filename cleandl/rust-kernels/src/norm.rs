@@ -198,12 +198,7 @@ pub fn rmsnorm_bf16_warp_persistent_inner2048(
     num_rows: u32,
 ) {
     cfg_select! {
-        any(
-            cuda_arch_specific = "90",
-            cuda_arch_specific = "100",
-            cuda_arch_specific = "103",
-            cuda_arch_specific = "107"
-        ) => {
+        has_227kb_smem => {
             const PREFETCH_STAGES: usize = 4;
         }
         _ => {
@@ -603,12 +598,7 @@ pub fn rmsnorm_bwd_bf16_cta_persistent_inner2048(
     num_rows: u32,
 ) {
     cfg_select! {
-        any(
-            cuda_arch_specific = "90",
-            cuda_arch_specific = "100",
-            cuda_arch_specific = "103",
-            cuda_arch_specific = "107"
-        ) => {
+        has_227kb_smem => {
             const PREFETCH_STAGES: usize = 3;
         }
         _ => {
