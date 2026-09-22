@@ -26,6 +26,8 @@ struct Cli {
     batch_size: usize,
     #[arg(long, default_value = "128")]
     max_decoder_seqlen: usize,
+    #[arg(long)]
+    single_step: bool,
 }
 
 // Temporary testbed code
@@ -135,9 +137,13 @@ fn main() -> anyhow::Result<()> {
                 .view()?,
         )[0];
 
-        dbg!(loss);
+        println!("Loss: {loss}");
 
         executor.weight_update(&mut weights, &training_config, train_step, stream)?;
+
+        if cli.single_step {
+            break;
+        }
     }
 
     Ok(())
