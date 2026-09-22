@@ -1,3 +1,12 @@
+#[cfg(has_tma)]
+use cuda_device::{
+    Barrier,
+    barrier::{
+        fence_proxy_async_shared_cta, mbarrier_arrive_expect_tx, mbarrier_init,
+        mbarrier_try_wait_parity,
+    },
+    tma,
+};
 use cuda_device::{
     DynamicSharedArray, async_copy,
     atomic::DeviceAtomicF32,
@@ -40,13 +49,60 @@ fn rmsnorm_bf16_warp_persistent<
     num_rows: u32,
 ) {
     unsafe {
+        #[cfg(has_tma)]
+        let num_mbarriers = PREFETCH_STAGES * NUM_WARPS;
+        #[cfg(not(has_tma))]
+        let num_mbarriers = 0;
+
+        if cfg!(has_227kb_smem) {
+            assert!(cfg!(has_tma));
+        }
+
+        // Not enough SMEM on consumer TMA GPUs for store staging,
+        // so gate on has_227kb_smem insteaed of has_tma.
+        let store_staging_space = if cfg!(has_227kb_smem) {
+            size_of::<bf16>() * VECTOR_SIZE * NUM_WARPS
+        } else {
+            0
+        };
+
         let required_smem = size_of::<bf16>() * VECTOR_SIZE
-            + size_of::<bf16>() * (VECTOR_SIZE * PREFETCH_STAGES * NUM_WARPS);
+            + size_of::<bf16>() * (VECTOR_SIZE * PREFETCH_STAGES * NUM_WARPS)
+            + num_mbarriers * size_of::<cuda_device::Barrier>()
+            + store_staging_space;
         assert!(dynamic_smem_size() >= required_smem as u32);
 
         let smem_base = DynamicSharedArray::<bf16, 128>::get();
         let smem_gamma = smem_base;
         let get_smem_slot = |i| smem_base.add(VECTOR_SIZE + i * VECTOR_SIZE * NUM_WARPS);
+
+        #[cfg(has_tma)]
+        let mbarriers = smem_base
+            .add(VECTOR_SIZE + PREFETCH_STAGES * VECTOR_SIZE * NUM_WARPS)
+            .cast::<Barrier>();
+
+        #[cfg(has_227kb_smem)]
+        let store_staging_smem = smem_base.add(
+            VECTOR_SIZE
+                + PREFETCH_STAGES * NUM_WARPS * VECTOR_SIZE
+                + size_of::<Barrier>() * num_mbarriers / size_of::<bf16>(),
+        );
+
+        #[cfg(has_tma)]
+        let get_mbarrier =
+            #[inline(always)]
+            |slot: u32| mbarriers.add((warp_id() * PREFETCH_STAGES as u32 + slot) as usize);
+
+        // Each warp initializes its mbarriers.
+        #[cfg(has_tma)]
+        if lane_id() == 0 {
+            #[llvm_unroll]
+            for i in 0..PREFETCH_STAGES {
+                mbarrier_init(get_mbarrier(i as u32), 1);
+            }
+        }
+        #[cfg(has_tma)]
+        fence_proxy_async_shared_cta();
 
         // Warp 0 copies gamma into SMEM.
         if warp_id() == 0 {
@@ -60,6 +116,7 @@ fn rmsnorm_bf16_warp_persistent<
             async_copy::cp_async_commit_group();
             async_copy::cp_async_wait_all();
         }
+
         this_thread_block().sync();
 
         let do_prefetch = |row_idx: u32, slot_index: u32| {
@@ -67,6 +124,20 @@ fn rmsnorm_bf16_warp_persistent<
                 let dst = get_smem_slot(slot_index as usize)
                     .add((VECTOR_SIZE as u32 * warp_id()) as usize);
                 let src = gmem_x.add(row_idx as usize * VECTOR_SIZE);
+
+                #[cfg(has_tma)]
+                if lane_id() == 0 {
+                    let bytes = (VECTOR_SIZE * size_of::<bf16>()) as u32;
+                    mbarrier_arrive_expect_tx(get_mbarrier(slot_index), 1, bytes);
+                    tma::cp_async_bulk_g2s_cta(
+                        dst.cast(),
+                        src.cast(),
+                        bytes,
+                        get_mbarrier(slot_index),
+                    );
+                }
+
+                #[cfg(not(has_tma))]
                 collective_async_copy_g2s_128bit(
                     src,
                     dst,
@@ -75,6 +146,7 @@ fn rmsnorm_bf16_warp_persistent<
                     32,
                 );
             }
+            #[cfg(not(has_tma))]
             async_copy::cp_async_commit_group();
         };
 
@@ -108,8 +180,16 @@ fn rmsnorm_bf16_warp_persistent<
             let slot_idx = i as u32 % PREFETCH_STAGES as u32;
 
             // Wait for our SMEM slot to be ready.
-            let pipeline_depth_minus_one = const { PREFETCH_STAGES as u32 - 1 };
-            async_copy::cp_async_wait_group(pipeline_depth_minus_one);
+            #[cfg(has_tma)]
+            {
+                let parity = i as u32 / PREFETCH_STAGES as u32 % 2;
+                while !mbarrier_try_wait_parity(get_mbarrier(slot_idx), parity) {}
+            }
+            #[cfg(not(has_tma))]
+            {
+                let pipeline_depth_minus_one = const { PREFETCH_STAGES as u32 - 1 };
+                async_copy::cp_async_wait_group(pipeline_depth_minus_one);
+            }
 
             // Copy row from SMEM into registers.
             let mut thr_x = [bf16::ZERO; { VECTOR_SIZE / WARP_SIZE as usize }];
@@ -131,6 +211,8 @@ fn rmsnorm_bf16_warp_persistent<
             }
 
             // With the SMEM data consumed, we can prefetch the next stage.
+            #[cfg(has_tma)]
+            warp::sync_mask(u32::MAX);
             do_prefetch(row_idx + cta_stride * PREFETCH_STAGES as u32, slot_idx);
 
             // Compute sum(x^2).
@@ -165,16 +247,57 @@ fn rmsnorm_bf16_warp_persistent<
             let gmem_y = gmem_y.add(row_idx as usize * VECTOR_SIZE);
 
             // Write result to GMEM.
-            #[llvm_unroll]
-            for j in 0..chunks_per_thread {
-                let src = thr_x
-                    .as_ptr()
-                    .add((j * elements_per_u128::<bf16>()) as usize);
-                let dst = gmem_y.add(
-                    (lane_id() * elements_per_u128::<bf16>()
-                        + j * elements_per_u128::<bf16>() * WARP_SIZE) as usize,
-                );
-                dst.cast::<u128>().write(src.cast::<u128>().read());
+            #[cfg(has_227kb_smem)]
+            {
+                // Stage through SMEM, then bulk copy.
+                if lane_id() == 0 {
+                    tma::cp_async_bulk_wait_group_read(0);
+                }
+                warp::sync_mask(u32::MAX);
+                #[llvm_unroll]
+                for j in 0..chunks_per_thread {
+                    let src = thr_x
+                        .as_ptr()
+                        .add((j * elements_per_u128::<bf16>()) as usize);
+                    let dst = store_staging_smem.add(
+                        (warp_id() * VECTOR_SIZE as u32
+                            + lane_id() * elements_per_u128::<bf16>()
+                            + j * elements_per_u128::<bf16>() * WARP_SIZE)
+                            as usize,
+                    );
+                    dst.cast::<u128>().write(src.cast::<u128>().read());
+                }
+
+                fence_proxy_async_shared_cta();
+                warp::sync_mask(u32::MAX);
+
+                if lane_id() == 0 {
+                    let bytes = (VECTOR_SIZE * size_of::<bf16>()) as u32;
+                    tma::cp_async_bulk_s2g(
+                        gmem_y.cast(),
+                        store_staging_smem
+                            .add((warp_id() * VECTOR_SIZE as u32) as usize)
+                            .cast(),
+                        bytes,
+                    );
+                    tma::cp_async_bulk_commit_group();
+                }
+            }
+            #[cfg(not(has_227kb_smem))]
+            {
+                // Direct store to GMEM.
+                #[llvm_unroll]
+                for j in 0..chunks_per_thread {
+                    let src = thr_x
+                        .as_ptr()
+                        .add((j * elements_per_u128::<bf16>()) as usize);
+                    let dst = gmem_y.add(
+                        (lane_id() * elements_per_u128::<bf16>()
+                            + j * elements_per_u128::<bf16>() * WARP_SIZE)
+                            as usize,
+                    );
+                    dst.cast::<u128>().write(src.cast::<u128>().read());
+                }
             }
 
             let gmem_r_inv = gmem_r_inv.add(row_idx as usize);
@@ -184,6 +307,11 @@ fn rmsnorm_bf16_warp_persistent<
 
             i += 1;
             row_idx += cta_stride;
+        }
+
+        #[cfg(has_227kb_smem)]
+        if lane_id() == 0 && i > 0 {
+            tma::cp_async_bulk_wait_group_read(0);
         }
     }
 }
@@ -199,7 +327,7 @@ pub fn rmsnorm_bf16_warp_persistent_inner2048(
 ) {
     cfg_select! {
         has_227kb_smem => {
-            const PREFETCH_STAGES: usize = 4;
+            const PREFETCH_STAGES: usize = 3;
         }
         _ => {
             const PREFETCH_STAGES: usize = 1;
