@@ -83,16 +83,9 @@ impl MatmulExecutor {
             reshaped_plan = self.plan.reshape(&MatmulDesc {
                 a: make_matrix_layout(m, k, self.config.a_format, self.config.ab_element_type),
                 b: make_matrix_layout(k, n, self.config.b_format, self.config.ab_element_type),
-                c: if let Some(residual) = &self.config.residual {
-                    Some(make_matrix_layout(
-                        m,
-                        n,
-                        residual.format,
-                        residual.element_type,
-                    ))
-                } else {
-                    None
-                },
+                c: self.config.residual.as_ref().map(|residual| {
+                    make_matrix_layout(m, n, residual.format, residual.element_type)
+                }),
                 d: make_matrix_layout(m, n, self.config.out_format, self.config.out_element_type),
                 ..self.desc.clone()
             })?;
@@ -213,7 +206,7 @@ fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::R
                 let mut tensor = Tensor::new_zeroed([rows, cols], element_type, cx)?;
                 let mut data = vec![0u8; tensor.storage().len()];
                 par_random::par_fill_from_distr(
-                    &Uniform::<u8>::new_inclusive(0, u8::MAX).unwrap(),
+                    Uniform::<u8>::new_inclusive(0, u8::MAX).unwrap(),
                     &mut data,
                     &mut Xoroshiro128StarStar::seed_from_u64(66),
                 );
