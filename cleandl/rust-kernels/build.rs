@@ -13,6 +13,14 @@ fn main() {
                 cuda_arch_specific = "110"
             )
         },
+        has_tcgen05: {
+            any(
+                cuda_arch_specific = "100",
+                cuda_arch_specific = "103",
+                cuda_arch_specific = "107",
+                cuda_arch_specific = "110"
+            )
+        },
         has_tma: {
             cuda_arch_min = "90"
         }
