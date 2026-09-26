@@ -49,3 +49,17 @@ impl ResourceKey for Cubins<'static> {
         Ok(module)
     }
 }
+
+#[derive(Debug, Copy, Clone, Serialize)]
+pub struct RustKernels;
+
+impl ResourceKey for RustKernels {
+    type Resource = Module;
+
+    fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        Ok(
+            (*cx.get_or_create_resource(include_cubins!("../rust-kernels/target/kernels"))?)
+                .clone(),
+        )
+    }
+}

@@ -43,9 +43,9 @@ fn adamw_weight_update() -> anyhow::Result<()> {
     let adamw = AdamWExecutor::get(&cx)?;
 
     let shape = Shape::new([N]);
-    let bf16_type = ElementType::Float(FloatType::Bf16);
     let f32_type = ElementType::Float(FloatType::F32);
-    let mut gradient = Tensor::new_zeroed(shape, bf16_type, &cx)?;
+    let bf16_type = ElementType::Float(FloatType::Bf16);
+    let mut gradient = Tensor::new_zeroed(shape, f32_type, &cx)?;
     let mut weight = Tensor::new_zeroed(shape, f32_type, &cx)?;
     let mut weight_bf16_replica = Tensor::new_zeroed(shape, bf16_type, &cx)?;
     let mut adam_m = Tensor::new_zeroed(shape, f32_type, &cx)?;
@@ -59,7 +59,7 @@ fn adamw_weight_update() -> anyhow::Result<()> {
             .collect()
     };
 
-    let gradient_host: Vec<bf16> = sample(N, 1.0).into_iter().map(bf16::from_f32).collect();
+    let gradient_host: Vec<f32> = sample(N, 1.0).into_iter().collect();
     let weight_host = sample(N, 0.1);
     let adam_m_host = sample(N, 0.01);
     let adam_v_host: Vec<f32> = sample(N, 0.01).into_iter().map(f32::abs).collect();
@@ -155,11 +155,11 @@ struct Reference {
     v: Vec<f32>,
 }
 
-fn reference_adamw(gradient: &[bf16], weight: &[f32], m: &[f32], v: &[f32]) -> Reference {
+fn reference_adamw(gradient: &[f32], weight: &[f32], m: &[f32], v: &[f32]) -> Reference {
     let sum_squares: f64 = gradient
         .iter()
         .map(|g| {
-            let g = g.to_f32() as f64;
+            let g = *g as f64;
             g * g
         })
         .sum();
@@ -176,7 +176,7 @@ fn reference_adamw(gradient: &[bf16], weight: &[f32], m: &[f32], v: &[f32]) -> R
     };
 
     for i in 0..weight.len() {
-        let g = gradient[i].to_f32() * clip_scale;
+        let g = gradient[i] * clip_scale;
 
         let m_new = BETA1 * m[i] + (1.0 - BETA1) * g;
         let v_new = BETA2 * v[i] + (1.0 - BETA2) * (g * g);

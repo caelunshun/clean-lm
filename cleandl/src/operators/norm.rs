@@ -9,7 +9,7 @@ use skytens_core::{
 
 use crate::{
     context::{Context, ResourceKey},
-    include_cubins,
+    kernel::RustKernels,
     tensor::{Tensor, TensorView, TensorViewMut},
 };
 
@@ -212,8 +212,7 @@ impl ResourceKey for NormExecutorKey {
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         Ok(NormExecutor {
             cx: cx.clone(),
-            module: cx
-                .get_or_create_resource(include_cubins!("../../rust-kernels/target/kernels"))?,
+            module: cx.get_or_create_resource(RustKernels)?,
         })
     }
 }

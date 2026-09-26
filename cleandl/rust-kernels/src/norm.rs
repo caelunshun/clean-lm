@@ -37,6 +37,7 @@ use crate::{
 /// Uses dynamic shared memory. Gamma is cached at the beginning of dynamic shared memory.
 /// The rest holds prefetch buffers.
 #[device]
+#[allow(clippy::assertions_on_constants)] // const assert would trigger bug with generic_const_exprs
 fn rmsnorm_bf16_warp_persistent<
     const VECTOR_SIZE: usize,
     const PREFETCH_STAGES: usize,

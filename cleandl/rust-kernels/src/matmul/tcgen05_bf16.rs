@@ -56,7 +56,7 @@ use cuda_device::{
     warp::{is_elected_sync, warp_id},
 };
 use cuda_device_ext::{bf16, bf16x2};
-use cuda_macros::{cuda_annotate, device, kernel};
+use cuda_macros::{cluster_launch, cuda_annotate, device, kernel, launch_bounds};
 
 use crate::lane_id;
 
@@ -767,6 +767,8 @@ fn kernel_template<
 }
 
 #[kernel]
+#[launch_bounds(384, 1)]
+#[cluster_launch(2, 1, 1)]
 pub fn sky_matmul_sm10x_128x256_2cta_64x4_arow_bcol(
     m: u32,
     n: u32,
