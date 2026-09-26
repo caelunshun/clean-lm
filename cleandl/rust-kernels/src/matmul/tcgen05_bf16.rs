@@ -34,21 +34,21 @@ use core::mem;
 use cuda_device::{
     Barrier, DynamicSharedArray, TmaDescriptor,
     barrier::{
-        fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_cluster,
-        mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_try_wait, mbarrier_try_wait_parity,
+        barrier_cta_sync, fence_proxy_async_shared_cta, mbarrier_arrive_cluster,
+        mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_try_wait_parity,
         mbarrier_try_wait_parity_cluster,
     },
     blockIdx_x,
     cluster::{cluster_ctaidX, map_shared_rank},
     cooperative_groups::{ThreadGroup, this_cluster},
     setmaxnreg_dec, setmaxnreg_inc,
-    shared::dynamic_smem_size,
+    shared::{cvta_generic_to_shared_offset, dynamic_smem_size},
     tcgen05::{
         Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptorBuilder,
         Tcgen05SmemDescriptorBuilder, Tcgen05SwizzleMode, tcgen05_alloc_cg2,
         tcgen05_commit_multicast_cg2, tcgen05_dealloc_cg2, tcgen05_fence_after_thread_sync,
         tcgen05_fence_before_thread_sync, tcgen05_ld_32x32b_x32_raw, tcgen05_load_wait,
-        tcgen05_mma_f16_cg2,
+        tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
     },
     threadIdx_x,
     tma::{self, cp_async_bulk_wait_group_read},
@@ -64,6 +64,8 @@ const TM_CTA: u32 = 128;
 const TM_CGA: u32 = 256;
 const TN_CTA: u32 = 256;
 const TN_CGA: u32 = 256;
+/// Only half of the N dimension for the B tile is held per CTA due to the use of 2CTA MMA.
+const TN_B_CTA: u32 = TN_CGA / CGA_SIZE;
 const TK_CTA: u32 = 64;
 const TK_MMA: u32 = 16;
 const CGA_SIZE: u32 = 2;
@@ -71,6 +73,8 @@ const CGA_SIZE: u32 = 2;
 const TM_EPI: u32 = 128;
 const TN_EPI: u32 = 64;
 const EPI_ELEMENTS_PER_THREAD: usize = 32;
+
+const EPILOGUE_HELPER_BARRIER_ID: u32 = 1;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum WarpRole {
@@ -92,6 +96,12 @@ fn warp_role() -> WarpRole {
     }
 }
 
+/// See CUTLASS `Sm100MmaPeerBitMask` for why this is needed....
+#[inline(always)]
+fn leader_cta_barrier(bar: *mut Barrier) -> *mut Barrier {
+    ((bar as usize) & !(1 << 24)) as *mut Barrier
+}
+
 struct Barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
     ab_slot_produced: [Barrier; AB_PIPE_DEPTH],
     ab_slot_consumed: [Barrier; AB_PIPE_DEPTH],
@@ -99,7 +109,6 @@ struct Barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
     epi_load_slot_consumed: [Barrier; EPILOGUE_PIPE_DEPTH],
     accumulator_slot_produced: [Barrier; 2],
     accumulator_slot_consumed: [Barrier; 2],
-    epi_helper_barrier: Barrier,
 }
 
 #[derive(Copy, Clone)]
@@ -112,7 +121,7 @@ impl<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 {
     #[inline(always)]
     fn a_staging_slot_offset(&self, slot_idx: u32) -> u32 {
-        slot_idx * size_of::<bf16>() as u32 * (TM_CTA * TK_CTA + TN_CTA * TK_CTA)
+        slot_idx * size_of::<bf16>() as u32 * (TM_CTA * TK_CTA + TN_B_CTA * TK_CTA)
     }
 
     #[inline(always)]
@@ -199,7 +208,6 @@ fn init_barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>(
         for bar in &mut barriers.epi_load_slot_consumed {
             mbarrier_init(bar, 256);
         }
-        mbarrier_init(&mut barriers.epi_helper_barrier, 256);
     }
 }
 
@@ -210,6 +218,7 @@ struct State<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
     smem: Smem<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH>,
     raster_along_m: bool,
     cga_panel_length: u32,
+    cta_rank: u32,
     current_work_id: u32,
     current_cta_tm: u32,
     current_cta_tn: u32,
@@ -237,37 +246,34 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
     fn set_tile_from_work_id(&mut self) {
         let num_m_cgas = self.m.div_ceil(TM_CGA);
         let num_n_cgas = self.n.div_ceil(TN_CGA);
-        if self.raster_along_m {
+        let (cga_tm, cga_tn) = if self.raster_along_m {
             // raster along M (column-major before swizzling)
-            let panel = self.current_work_id / (self.cga_panel_length * num_m_cgas);
-            let this_panel_length = if ((panel + 1) * self.cga_panel_length) > num_n_cgas {
-                self.cga_panel_length - (((panel + 1) * self.cga_panel_length) - num_n_cgas)
-            } else {
-                self.cga_panel_length
-            };
-            let idx_in_panel = self.current_work_id % (this_panel_length * num_m_cgas);
+            let tiles_per_panel = self.cga_panel_length * num_m_cgas;
+            let panel = self.current_work_id / tiles_per_panel;
+            let panel_start = panel * self.cga_panel_length;
+            let this_panel_length = self.cga_panel_length.min(num_n_cgas - panel_start);
+            let idx_in_panel = self.current_work_id - panel * tiles_per_panel;
 
-            let cga_tm = idx_in_panel / this_panel_length;
-            let cga_tn = idx_in_panel % this_panel_length;
-
-            self.current_cta_tm = cga_tm * (TM_CGA / TM_CTA);
-            self.current_cta_tn = cga_tn * (TN_CGA / TN_CTA);
+            (
+                idx_in_panel / this_panel_length,
+                panel_start + idx_in_panel % this_panel_length,
+            )
         } else {
             // raster along N (row-major before swizzling)
-            let panel = self.current_work_id / (self.cga_panel_length * num_n_cgas);
-            let this_panel_length = if ((panel + 1) * self.cga_panel_length) > num_m_cgas {
-                self.cga_panel_length - (((panel + 1) * self.cga_panel_length) - num_m_cgas)
-            } else {
-                self.cga_panel_length
-            };
-            let idx_in_panel = self.current_work_id % (this_panel_length * num_n_cgas);
+            let tiles_per_panel = self.cga_panel_length * num_n_cgas;
+            let panel = self.current_work_id / tiles_per_panel;
+            let panel_start = panel * self.cga_panel_length;
+            let this_panel_length = self.cga_panel_length.min(num_m_cgas - panel_start);
+            let idx_in_panel = self.current_work_id - panel * tiles_per_panel;
 
-            let cga_tm = idx_in_panel % this_panel_length;
-            let cga_tn = idx_in_panel / this_panel_length;
+            (
+                panel_start + idx_in_panel % this_panel_length,
+                idx_in_panel / this_panel_length,
+            )
+        };
 
-            self.current_cta_tm = cga_tm * (TM_CGA / TM_CTA);
-            self.current_cta_tn = cga_tn * (TN_CGA / TN_CTA);
-        }
+        self.current_cta_tm = cga_tm * (TM_CGA / TM_CTA) + self.cta_rank;
+        self.current_cta_tn = cga_tn * (TN_CGA / TN_CTA);
     }
 
     #[inline(always)]
@@ -281,6 +287,8 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                 let mut parity = 0;
                 let mut is_first_iter = true;
                 let num_k_tiles = self.k.div_ceil(TK_CTA);
+                let is_leader = self.cta_rank == 0;
+                let cta_mask = 1u16 << self.cta_rank;
                 loop {
                     for k_tile_idx in 0..num_k_tiles {
                         if !is_first_iter {
@@ -291,34 +299,42 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                             ) {}
                         }
 
-                        let bytes = size_of::<bf16>() as u32 * (TM_CTA + TN_CTA) * TK_CTA;
-                        mbarrier_arrive_expect_tx(
-                            &self.smem.barriers().ab_slot_produced[slot_idx as usize],
-                            1, // ignored, unsure why this param is in cuda-device
-                            bytes,
+                        if is_leader {
+                            let bytes =
+                                size_of::<bf16>() as u32 * (TM_CTA + TN_B_CTA) * TK_CTA * CGA_SIZE;
+                            mbarrier_arrive_expect_tx(
+                                &self.smem.barriers().ab_slot_produced[slot_idx as usize],
+                                1, // ignored, unsure why this param is in cuda-device
+                                bytes,
+                            );
+                        }
+                        let produced_bar = leader_cta_barrier(
+                            &mut self.smem.barriers().ab_slot_produced[slot_idx as usize],
                         );
-                        tma::cp_async_bulk_tensor_2d_g2s(
+                        tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
                             self.smem.a_staging_slot(slot_idx),
                             self.a_tma,
                             (k_tile_idx * TK_CTA) as i32,
                             (self.current_cta_tm * TM_CTA) as i32,
-                            &mut self.smem.barriers().ab_slot_produced[slot_idx as usize],
+                            produced_bar,
+                            cta_mask,
                         );
-                        tma::cp_async_bulk_tensor_2d_g2s(
+                        tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
                             self.smem.b_staging_slot(slot_idx),
                             self.b_tma,
                             (k_tile_idx * TK_CTA) as i32,
-                            (self.current_cta_tn * TN_CTA) as i32,
-                            &mut self.smem.barriers().ab_slot_produced[slot_idx as usize],
+                            (self.current_cta_tn * TN_CTA + self.cta_rank * TN_B_CTA) as i32,
+                            produced_bar,
+                            cta_mask,
                         );
-                    }
 
-                    slot_idx = (slot_idx + 1) % AB_PIPE_DEPTH as u32;
-                    if slot_idx == 0 {
-                        if !is_first_iter {
-                            parity ^= 1;
+                        slot_idx = (slot_idx + 1) % AB_PIPE_DEPTH as u32;
+                        if slot_idx == 0 {
+                            if !is_first_iter {
+                                parity ^= 1;
+                            }
+                            is_first_iter = false;
                         }
-                        is_first_iter = false;
                     }
 
                     if !self.advance_to_next_tile() {
@@ -340,11 +356,9 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
             let is_elected = is_elected_sync(u32::MAX);
 
-            if is_elected && cluster_ctaidX().is_multiple_of(2) {
+            if is_elected && self.cta_rank == 0 {
                 let mut ab_slot_idx = 0;
                 let mut ab_parity = 0;
-                let mut last_ab_slot_idx = 0;
-                let mut last_ab_parity = 0;
                 let num_k_tiles = self.k.div_ceil(TK_CTA);
 
                 loop {
@@ -354,18 +368,23 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                             ab_parity,
                         ) {}
 
+                        let a_smem_addr =
+                            cvta_generic_to_shared_offset(self.smem.a_staging_slot(ab_slot_idx));
+                        let b_smem_addr =
+                            cvta_generic_to_shared_offset(self.smem.b_staging_slot(ab_slot_idx));
+
                         #[llvm_unroll]
                         for k_subtile_idx in 0..(TK_CTA / TK_MMA) {
+                            let k_offset =
+                                (k_subtile_idx * TK_MMA * size_of::<bf16>() as u32) as u64;
                             let a_smem_desc = Tcgen05SmemDescriptorBuilder::new()
-                                .address(self.smem.a_staging_slot(ab_slot_idx).add(TK_MMA as usize)
-                                    as usize as u64)
+                                .address(a_smem_addr + k_offset)
                                 .base_offset(0)
                                 .swizzle(Tcgen05SwizzleMode::Swizzle128B)
                                 .stride_bytes(8 * 128)
                                 .build();
                             let b_smem_desc = Tcgen05SmemDescriptorBuilder::new()
-                                .address(self.smem.b_staging_slot(ab_slot_idx).add(TK_MMA as usize)
-                                    as usize as u64)
+                                .address(b_smem_addr + k_offset)
                                 .base_offset(0)
                                 .swizzle(Tcgen05SwizzleMode::Swizzle128B)
                                 .stride_bytes(8 * 128)
@@ -374,8 +393,8 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                                 .a_type(Tcgen05ElementType::BF16)
                                 .b_type(Tcgen05ElementType::BF16)
                                 .accumulator_type(Tcgen05AccumulatorType::F32)
-                                .m(128)
-                                .n(256)
+                                .m(TM_CGA)
+                                .n(TN_CGA)
                                 .build();
                             tcgen05_mma_f16_cg2(
                                 accumulator_tmem_addr,
@@ -393,28 +412,18 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                             0b11,
                         );
 
-                        last_ab_parity = ab_parity;
-                        last_ab_slot_idx = ab_slot_idx;
-
                         ab_slot_idx = (ab_slot_idx + 1) % AB_PIPE_DEPTH as u32;
                         if ab_slot_idx == 0 {
                             ab_parity ^= 1;
                         }
                     }
 
-                    while !mbarrier_try_wait_parity(
-                        &self.smem.barriers().ab_slot_consumed[last_ab_slot_idx as usize],
-                        last_ab_parity,
-                    ) {}
-                    tcgen05_fence_before_thread_sync();
-
-                    mbarrier_arrive(
-                        &self.smem.barriers().accumulator_slot_produced[accumulator_slot as usize],
+                    tcgen05_commit_multicast_cg2(
+                        (&mut self.smem.barriers().accumulator_slot_produced
+                            [accumulator_slot as usize] as *mut Barrier)
+                            .cast(),
+                        0b11,
                     );
-                    mbarrier_arrive_cluster(map_shared_rank(
-                        &self.smem.barriers().accumulator_slot_produced[accumulator_slot as usize],
-                        1,
-                    ) as usize as u64);
 
                     if !self.advance_to_next_tile() {
                         break;
@@ -432,7 +441,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                     }
 
                     if !is_first_tile {
-                        while !mbarrier_try_wait_parity(
+                        while !mbarrier_try_wait_parity_cluster(
                             &self.smem.barriers().accumulator_slot_consumed
                                 [accumulator_slot as usize],
                             accumulator_parity,
@@ -450,6 +459,10 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
         &mut self,
         aux_input_descs: [&'a TmaDescriptor; NUM_AUX_INPUTS],
     ) {
+        if NUM_AUX_INPUTS == 0 {
+            return;
+        }
+
         unsafe {
             let is_elected = is_elected_sync(u32::MAX);
             if is_elected {
@@ -491,11 +504,11 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                                 }
                                 is_first_iter = false;
                             }
-
-                            if !self.advance_to_next_tile() {
-                                break;
-                            }
                         }
+                    }
+
+                    if !self.advance_to_next_tile() {
+                        break;
                     }
                 }
             }
@@ -508,6 +521,8 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
         unsafe {
             let thread_m = (threadIdx_x() - 128) % 128;
             let warp_tmem_lane_base = warp_id() % 4 * 32;
+            // Offset of this warp's elements within a subtile.
+            let warp_n = (threadIdx_x() - 128) / 128 * 32;
 
             let mut accum_slot_idx = 0;
             let mut accum_parity = 0;
@@ -523,10 +538,9 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                 ) {}
                 tcgen05_fence_after_thread_sync();
 
-                let base_tmem_addr = *self.smem.tmem_addr_dst() & (accum_slot_idx << 8);
+                let base_tmem_addr = *self.smem.tmem_addr_dst() + (accum_slot_idx << 8);
 
                 for subtile_n in 0..(TN_CTA / TN_EPI) {
-                    let warp_n = (threadIdx_x() - 128) / 128 * 32 + subtile_n * TN_EPI;
                     let tmem_addr = base_tmem_addr
                         + (warp_tmem_lane_base << 16)
                         + (subtile_n * TN_EPI)
@@ -550,18 +564,14 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
                             let smem = self.smem.epi_store_staging_slot().cast::<bf16>();
                             let row = thread_m;
-                            let smem_base = smem.add((row * TN_EPI + warp_n) as usize);
+                            let smem_row = smem.add((row * TN_EPI) as usize).cast::<u128>();
 
                             if has_stored {
-                                // Wait for smem to be done.
+                                // Wait for the previous TMA store to finish reading smem.
                                 if warp_id() == 4 && lane_id() == 0 {
                                     cp_async_bulk_wait_group_read(0);
                                 }
-                                let tok = mbarrier_arrive(&self.smem.barriers().epi_helper_barrier);
-                                while !mbarrier_try_wait(
-                                    &self.smem.barriers().epi_helper_barrier,
-                                    tok,
-                                ) {}
+                                barrier_cta_sync(EPILOGUE_HELPER_BARRIER_ID, 256);
                             }
 
                             // Store to SMEM panel with vectorized stores, in TMA 128B swizzled layout
@@ -571,26 +581,20 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                                 let src = thr_row_bf16.as_ptr().cast::<u128>().add(chunk);
                                 let col = chunk as u32 + warp_n / 8;
                                 let col_swizzle = col ^ (row & 0b111);
-                                smem_base
-                                    .cast::<u128>()
-                                    .add(col_swizzle as usize)
-                                    .write(src.read());
+                                smem_row.add(col_swizzle as usize).write(src.read());
                             }
 
                             fence_proxy_async_shared_cta();
-                            let tok = mbarrier_arrive(&self.smem.barriers().epi_helper_barrier);
+                            barrier_cta_sync(EPILOGUE_HELPER_BARRIER_ID, 256);
 
                             if warp_id() == 4 && lane_id() == 0 {
-                                while !mbarrier_try_wait(
-                                    &self.smem.barriers().epi_helper_barrier,
-                                    tok,
-                                ) {}
                                 tma::cp_async_bulk_tensor_2d_s2g(
                                     smem.cast(),
                                     tma_desc,
                                     (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
                                     (self.current_cta_tm * TM_CTA) as i32,
                                 );
+                                tma::cp_async_bulk_commit_group();
                             }
 
                             has_stored = true;
@@ -617,7 +621,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                 }
             }
 
-            if has_stored && warp_id() == 0 && lane_id() == 0 {
+            if has_stored && warp_id() == 4 && lane_id() == 0 {
                 tma::cp_async_bulk_wait_group(0);
             }
         }
@@ -709,8 +713,11 @@ fn kernel_template<
 
         if warp_role() == WarpRole::MmaIssue {
             tcgen05_alloc_cg2(smem.tmem_addr_dst(), 512);
+            tcgen05_relinquish_alloc_permit_cg2();
+            tcgen05_fence_before_thread_sync();
         }
         this_cluster().sync();
+        tcgen05_fence_after_thread_sync();
 
         let mut state = State {
             m,
@@ -719,7 +726,8 @@ fn kernel_template<
             smem,
             raster_along_m,
             cga_panel_length,
-            current_work_id: blockIdx_x(),
+            cta_rank: cluster_ctaidX(),
+            current_work_id: blockIdx_x() / CGA_SIZE,
             current_cta_tm: 0,
             current_cta_tn: 0,
             a_tma,
@@ -749,8 +757,10 @@ fn kernel_template<
             }
         }
 
+        tcgen05_fence_before_thread_sync();
         this_cluster().sync();
         if warp_role() == WarpRole::MmaIssue {
+            tcgen05_fence_after_thread_sync();
             tcgen05_dealloc_cg2(*smem.tmem_addr_dst(), 512);
         }
     }
