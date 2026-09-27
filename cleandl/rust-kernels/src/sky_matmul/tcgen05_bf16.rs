@@ -29,18 +29,19 @@
 //! * Warp 3: Unused / register donor for epilogue warps
 //! * Warps 4..12: Epilogue warps; TMA stores issued by warp 4
 
-use core::mem;
+use core::{f32::consts::LOG2_E, mem};
 
 use cuda_device::{
     Barrier, DynamicSharedArray, TmaDescriptor,
     barrier::{
-        barrier_cta_sync, fence_proxy_async_shared_cta, mbarrier_arrive_cluster,
-        mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_try_wait_parity,
-        mbarrier_try_wait_parity_cluster,
+        barrier_cta_sync, fence_mbarrier_init_release_cluster, fence_proxy_async_shared_cta,
+        mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
+        mbarrier_try_wait_parity, mbarrier_try_wait_parity_cluster,
     },
     blockIdx_x,
     cluster::{cluster_ctaidX, map_shared_rank},
     cooperative_groups::{ThreadGroup, this_cluster},
+    float::{ex2_approx_ftz_f32, rcp_approx_ftz_f32},
     setmaxnreg_dec, setmaxnreg_inc,
     shared::{cvta_generic_to_shared_offset, dynamic_smem_size},
     tcgen05::{
@@ -156,14 +157,19 @@ impl<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
     }
 
     #[inline(always)]
-    pub fn barriers_raw(&mut self) -> *mut Barriers<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
+    pub fn barriers_raw(&self) -> *mut Barriers<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
         let offset = self.epi_load_staging_slot_offset(EPILOGUE_PIPE_DEPTH as u32 + 1);
         unsafe { self.base.add(offset as usize).cast() }
     }
 
     #[inline(always)]
-    pub fn barriers(&mut self) -> &mut Barriers<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
+    pub fn barriers_mut(&mut self) -> &mut Barriers<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
         unsafe { &mut *self.barriers_raw() }
+    }
+
+    #[inline(always)]
+    pub fn barriers(&self) -> &Barriers<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
+        unsafe { &*self.barriers_raw() }
     }
 
     #[inline(always)]
@@ -183,7 +189,7 @@ fn init_barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>(
     smem: &mut Smem<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH>,
 ) {
     unsafe {
-        let barriers = smem.barriers();
+        let barriers = smem.barriers_mut();
         #[llvm_unroll]
         for bar in &mut barriers.ab_slot_produced {
             mbarrier_init(bar, 1);
@@ -294,7 +300,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                         if !is_first_iter {
                             // Wait for previous data in slot to be consumed
                             while !mbarrier_try_wait_parity_cluster(
-                                &self.smem.barriers().ab_slot_consumed[slot_idx as usize],
+                                &self.smem.barriers_mut().ab_slot_consumed[slot_idx as usize],
                                 parity,
                             ) {}
                         }
@@ -303,13 +309,13 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                             let bytes =
                                 size_of::<bf16>() as u32 * (TM_CTA + TN_B_CTA) * TK_CTA * CGA_SIZE;
                             mbarrier_arrive_expect_tx(
-                                &self.smem.barriers().ab_slot_produced[slot_idx as usize],
+                                &self.smem.barriers_mut().ab_slot_produced[slot_idx as usize],
                                 1, // ignored, unsure why this param is in cuda-device
                                 bytes,
                             );
                         }
                         let produced_bar = leader_cta_barrier(
-                            &mut self.smem.barriers().ab_slot_produced[slot_idx as usize],
+                            &mut self.smem.barriers_mut().ab_slot_produced[slot_idx as usize],
                         );
                         tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
                             self.smem.a_staging_slot(slot_idx),
@@ -364,7 +370,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                 loop {
                     for k_tile_idx in 0..num_k_tiles {
                         while !mbarrier_try_wait_parity(
-                            &self.smem.barriers().ab_slot_produced[ab_slot_idx as usize],
+                            &self.smem.barriers_mut().ab_slot_produced[ab_slot_idx as usize],
                             ab_parity,
                         ) {}
 
@@ -406,7 +412,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                         }
 
                         tcgen05_commit_multicast_cg2(
-                            (&mut self.smem.barriers().ab_slot_consumed[ab_slot_idx as usize]
+                            (&mut self.smem.barriers_mut().ab_slot_consumed[ab_slot_idx as usize]
                                 as *mut Barrier)
                                 .cast(),
                             0b11,
@@ -419,7 +425,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                     }
 
                     tcgen05_commit_multicast_cg2(
-                        (&mut self.smem.barriers().accumulator_slot_produced
+                        (&mut self.smem.barriers_mut().accumulator_slot_produced
                             [accumulator_slot as usize] as *mut Barrier)
                             .cast(),
                         0b11,
@@ -442,7 +448,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
                     if !is_first_tile {
                         while !mbarrier_try_wait_parity_cluster(
-                            &self.smem.barriers().accumulator_slot_consumed
+                            &self.smem.barriers_mut().accumulator_slot_consumed
                                 [accumulator_slot as usize],
                             accumulator_parity,
                         ) {}
@@ -476,7 +482,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                         for aux_input in aux_input_descs {
                             if !is_first_iter {
                                 while !mbarrier_try_wait_parity(
-                                    &self.smem.barriers().epi_load_slot_consumed
+                                    &self.smem.barriers_mut().epi_load_slot_consumed
                                         [epi_slot_idx as usize],
                                     epi_parity,
                                 ) {}
@@ -484,7 +490,8 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
                             let bytes = size_of::<bf16>() as u32 * TM_EPI * TN_EPI;
                             mbarrier_arrive_expect_tx(
-                                &self.smem.barriers().epi_load_slot_produced[epi_slot_idx as usize],
+                                &self.smem.barriers_mut().epi_load_slot_produced
+                                    [epi_slot_idx as usize],
                                 1,
                                 bytes,
                             );
@@ -493,7 +500,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                                 aux_input,
                                 (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
                                 (self.current_cta_tm * TM_CTA) as i32,
-                                &mut self.smem.barriers().epi_load_slot_produced
+                                &mut self.smem.barriers_mut().epi_load_slot_produced
                                     [epi_slot_idx as usize],
                             );
 
@@ -533,13 +540,14 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
             loop {
                 // Wait for accumulator to be ready in TMEM
                 while !mbarrier_try_wait_parity_cluster(
-                    &self.smem.barriers().accumulator_slot_produced[accum_slot_idx as usize],
+                    &self.smem.barriers_mut().accumulator_slot_produced[accum_slot_idx as usize],
                     accum_parity,
                 ) {}
                 tcgen05_fence_after_thread_sync();
 
                 let base_tmem_addr = *self.smem.tmem_addr_dst() + (accum_slot_idx << 8);
 
+                #[llvm_unroll]
                 for subtile_n in 0..(TN_CTA / TN_EPI) {
                     let tmem_addr = base_tmem_addr
                         + (warp_tmem_lane_base << 16)
@@ -553,6 +561,7 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                     >(mma_result.to_array());
 
                     let mut write_output =
+                        #[inline(always)]
                         |thr_row: &[f32; EPI_ELEMENTS_PER_THREAD], tma_desc: &TmaDescriptor| {
                             // Convert to bf16.
                             let mut thr_row_bf16 = [bf16x2::ZERO; EPI_ELEMENTS_PER_THREAD / 2];
@@ -602,14 +611,58 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
                     epilogue.visit_mma_result(mma_result, &mut write_output);
 
-                    // TODO aux inputs
+                    #[llvm_unroll]
+                    for _ in 0..E::NUM_AUX_INPUTS {
+                        while !mbarrier_try_wait_parity(
+                            &self.smem.barriers().epi_load_slot_produced[epi_slot_idx as usize],
+                            epi_parity,
+                        ) {}
+
+                        // Load from SMEM, convert to f32, feed to epilogue.
+                        let mut thr_row = [0.0f32; EPI_ELEMENTS_PER_THREAD];
+
+                        let smem = self.smem.epi_load_staging_slot(epi_slot_idx).cast::<bf16>();
+                        let row = thread_m;
+                        let smem_row = smem.add((row * TN_EPI) as usize).cast::<u128>();
+
+                        // Load pattern mirrors the store pattern above.
+                        #[llvm_unroll]
+                        for chunk in 0..EPI_ELEMENTS_PER_THREAD / 8 {
+                            let col = chunk as u32 + warp_n / 8;
+                            let col_swizzle = col ^ (row & 0b111);
+                            let src = smem_row.add(col_swizzle as usize).read();
+                            let src = bytemuck::cast::<u128, [bf16x2; 4]>(src);
+
+                            #[llvm_unroll]
+                            for i in 0..src.len() {
+                                let (a, b) = src[i].to_f32_pair();
+                                thr_row[chunk * 8 + i * 2] = a;
+                                thr_row[chunk * 8 + i * 2 + 1] = b;
+                            }
+                        }
+
+                        mbarrier_arrive(
+                            &self.smem.barriers().epi_load_slot_consumed[epi_slot_idx as usize],
+                        );
+
+                        epilogue.visit_aux_input(thr_row, &mut write_output);
+
+                        epi_slot_idx = (epi_slot_idx + 1) % EPILOGUE_PIPE_DEPTH as u32;
+                        if epi_slot_idx == 0 {
+                            epi_parity ^= 1;
+                        }
+                    }
                 }
 
                 tcgen05_fence_before_thread_sync();
-                mbarrier_arrive_cluster(map_shared_rank(
-                    &self.smem.barriers().accumulator_slot_consumed[accum_slot_idx as usize],
-                    0,
-                ) as usize as u64);
+                mbarrier_arrive_cluster(cvta_generic_to_shared_offset(
+                    map_shared_rank(
+                        &self.smem.barriers_mut().accumulator_slot_consumed
+                            [accum_slot_idx as usize],
+                        0,
+                    )
+                    .cast::<u8>(),
+                ));
 
                 if !self.advance_to_next_tile() {
                     break;
@@ -681,6 +734,58 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     }
 }
 
+/// Epilogue with two outputs:
+/// 1. G = mma_output
+/// 2. Y = SiLU(mma_output) * X, where X is an auxiliary input coming from up-projection
+struct SwiGluGateTrainFwdEpilogue<'a> {
+    x_desc: &'a TmaDescriptor,
+    g_desc: &'a TmaDescriptor,
+    y_desc: &'a TmaDescriptor,
+    vals: [f32; EPI_ELEMENTS_PER_THREAD],
+}
+
+impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
+    const NUM_AUX_INPUTS: usize = 1;
+
+    #[inline(always)]
+    #[cuda_annotate]
+    fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS] {
+        [self.x_desc]
+    }
+
+    #[inline(always)]
+    #[cuda_annotate]
+    fn visit_mma_result(
+        &mut self,
+        result: [f32; EPI_ELEMENTS_PER_THREAD],
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+    ) {
+        write_output(&result, self.g_desc);
+
+        // Apply SiLU
+        #[llvm_unroll]
+        for i in 0..EPI_ELEMENTS_PER_THREAD {
+            self.vals[i] =
+                result[i] * rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-result[i] * LOG2_E));
+        }
+    }
+
+    #[inline(always)]
+    #[cuda_annotate]
+    fn visit_aux_input(
+        &mut self,
+        aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+    ) {
+        // Apply Hadamard product
+        #[llvm_unroll]
+        for i in 0..EPI_ELEMENTS_PER_THREAD {
+            self.vals[i] *= aux_data[i];
+        }
+        write_output(&self.vals, self.y_desc);
+    }
+}
+
 /// Note: we rely on every CGA having at least one work tile.
 /// Host must clamp CGA count to this constraint.
 #[cuda_annotate]
@@ -709,6 +814,7 @@ fn kernel_template<
 
         if threadIdx_x() == 0 {
             init_barriers(&mut smem);
+            fence_mbarrier_init_release_cluster();
         }
 
         if warp_role() == WarpRole::MmaIssue {
@@ -716,6 +822,7 @@ fn kernel_template<
             tcgen05_relinquish_alloc_permit_cg2();
             tcgen05_fence_before_thread_sync();
         }
+
         this_cluster().sync();
         tcgen05_fence_after_thread_sync();
 
@@ -769,7 +876,7 @@ fn kernel_template<
 #[kernel]
 #[launch_bounds(384, 1)]
 #[cluster_launch(2, 1, 1)]
-pub fn sky_matmul_sm10x_128x256_2cta_64x4_arow_bcol(
+pub fn sky_matmul_sm10x_128x256_2cta_64x6_arow_bcol(
     m: u32,
     n: u32,
     k: u32,
@@ -779,7 +886,7 @@ pub fn sky_matmul_sm10x_128x256_2cta_64x4_arow_bcol(
     #[grid_constant] b_tma: &TmaDescriptor,
     #[grid_constant] out_tma: &TmaDescriptor,
 ) {
-    kernel_template::<_, 4, 1>(
+    kernel_template::<_, 6, 1>(
         m,
         n,
         k,
@@ -788,5 +895,37 @@ pub fn sky_matmul_sm10x_128x256_2cta_64x4_arow_bcol(
         a_tma,
         b_tma,
         IdentityEpilogue { out_tma },
+    );
+}
+
+#[kernel]
+#[launch_bounds(384, 1)]
+#[cluster_launch(2, 1, 1)]
+pub fn sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1_arow_bcol(
+    m: u32,
+    n: u32,
+    k: u32,
+    raster_along_m: bool,
+    cga_panel_length: u32,
+    #[grid_constant] a_tma: &TmaDescriptor,
+    #[grid_constant] b_tma: &TmaDescriptor,
+    #[grid_constant] x_tma: &TmaDescriptor,
+    #[grid_constant] g_tma: &TmaDescriptor,
+    #[grid_constant] y_tma: &TmaDescriptor,
+) {
+    kernel_template::<_, 6, 1>(
+        m,
+        n,
+        k,
+        raster_along_m,
+        cga_panel_length,
+        a_tma,
+        b_tma,
+        SwiGluGateTrainFwdEpilogue {
+            x_desc: x_tma,
+            g_desc: g_tma,
+            y_desc: y_tma,
+            vals: [0.0; EPI_ELEMENTS_PER_THREAD],
+        },
     );
 }

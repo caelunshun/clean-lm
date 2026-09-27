@@ -24,7 +24,7 @@ use cuda_device::{
     cooperative_groups::ThreadGroup,
     uniform::{block_dim_x, block_dim_y, block_dim_z},
 };
-use cuda_macros::device;
+use cuda_macros::cuda_annotate;
 
 pub mod norm;
 pub mod sky_matmul;
@@ -57,7 +57,7 @@ pub fn elements_per_u128<T>() -> u32 {
 
 /// Collective copy from GMEM into SMEM of a 1D array,
 /// distributed among the group.
-#[device]
+#[cuda_annotate]
 pub(crate) unsafe fn collective_async_copy_g2s_128bit<T: Pod, G: ThreadGroup>(
     src_gmem: *const T,
     dst_smem: *mut T,
@@ -86,7 +86,7 @@ pub(crate) unsafe fn collective_async_copy_g2s_128bit<T: Pod, G: ThreadGroup>(
 
 /// Force using a global memory atomic instruction instead of CAS
 /// loop or fallback path that needs to branch on shared vs. global address.
-#[device]
+#[cuda_annotate]
 pub(crate) unsafe fn red_add_global_f32(dst: *mut f32, val: f32) {
     unsafe {
         ptx_asm!(

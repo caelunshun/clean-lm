@@ -290,7 +290,7 @@ impl Epilogue for IdentityEpilogue {
     type Outputs = Tensor;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_sm10x_128x256_2cta_64x4_arow_bcol"
+        "sky_matmul_sm10x_128x256_2cta_64x6_arow_bcol"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {

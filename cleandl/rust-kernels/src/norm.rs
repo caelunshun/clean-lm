@@ -18,7 +18,7 @@ use cuda_device::{
     warp::{self, warp_id},
 };
 use cuda_device_ext::{bf16, bf16x2};
-use cuda_macros::{device, kernel, launch_bounds};
+use cuda_macros::{cuda_annotate, kernel, launch_bounds};
 
 use crate::{
     WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id, red_add_global_f32,
@@ -36,7 +36,7 @@ use crate::{
 ///
 /// Uses dynamic shared memory. Gamma is cached at the beginning of dynamic shared memory.
 /// The rest holds prefetch buffers.
-#[device]
+#[cuda_annotate]
 #[allow(clippy::assertions_on_constants)] // const assert would trigger bug with generic_const_exprs
 fn rmsnorm_bf16_warp_persistent<
     const VECTOR_SIZE: usize,
@@ -349,7 +349,7 @@ pub fn rmsnorm_bf16_warp_persistent_inner2048(
 /// Uses dynamic shared memory for prefetching
 /// and inter-warp reduction.
 /// `gamma` is kept stationary in registers.
-#[device]
+#[cuda_annotate]
 fn rmsnorm_bwd_bf16_cta_persistent<
     const VECTOR_SIZE: usize,
     const ROWS_PER_ITER: usize,
