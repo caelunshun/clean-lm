@@ -37,12 +37,14 @@ $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULE,$(arch),sm_$(patsubst sm%,%,$(ar
 
 # Rust kernels, built with cuda-oxide. The build emits PTX into a directory, so
 # each arch gets its own scratch dir which is then collapsed into a single .ptx.
+# Each arch also gets its own cargo target dir so builds don't serialize on
+# cargo's target dir lock.
 # $(1): arch name as used in artifact names (e.g. sm89)
 # $(2): arch name as passed to cargo oxide --arch (e.g. sm_89)
 define RUST_ARCH_RULE
 $$(RUST_KERNEL_OUT).$(1).ptx: $$(shell find $$(RUST_KERNEL_DIR)/src -name '*.rs') $$(RUST_KERNEL_DIR)/Cargo.toml
 	mkdir -p $$(RUST_KERNEL_OUT).$(1).d
-	cd $$(RUST_KERNEL_DIR) && CUDA_OXIDE_PTX_DIR=$$(abspath $$(RUST_KERNEL_OUT).$(1).d) cargo oxide build --arch $(2)
+	cd $$(RUST_KERNEL_DIR) && CARGO_TARGET_DIR=$$(abspath $$(RUST_KERNEL_DIR)/target/$(1)) CUDA_OXIDE_PTX_DIR=$$(abspath $$(RUST_KERNEL_OUT).$(1).d) cargo oxide build --arch $(2)
 	cat $$(RUST_KERNEL_OUT).$(1).d/*.ptx > $$@
 
 $$(RUST_KERNEL_OUT).$(1).cubin: $$(RUST_KERNEL_OUT).$(1).ptx
