@@ -6,8 +6,8 @@ use skycuda::{
     launch::LaunchBuilder,
     stream::Stream,
     tensor_map::{
-        TensorMap, TensorMapDataType, TensorMapDesc, TensorMapMut, TensorMapOobFill,
-        TensorMapSwizzle,
+        TensorMap, TensorMapDataType, TensorMapDesc, TensorMapL2Promotion, TensorMapMut,
+        TensorMapOobFill, TensorMapSwizzle,
     },
 };
 use skytens_core::data_type::{ElementType, FloatType};
@@ -127,11 +127,13 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         {
             let a_tma = TensorMap::new(
                 a.storage(),
-                bf16_tma_desc(m, k, self.config.format_a == MatrixFormat::RowMajor),
+                bf16_tma_desc(m, k, self.config.format_a == MatrixFormat::RowMajor)
+                    .l2_promotion(TensorMapL2Promotion::B256),
             );
             let b_tma = TensorMap::new(
                 b.storage(),
-                bf16_tma_desc(n, k, self.config.format_b == MatrixFormat::ColumnMajor),
+                bf16_tma_desc(n, k, self.config.format_b == MatrixFormat::ColumnMajor)
+                    .l2_promotion(TensorMapL2Promotion::B256),
             );
 
             let mut launch = stream.launch_builder(&native.kernel);
@@ -453,6 +455,107 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
             .arg(x.storage())?
             .arg(gate.storage())?
             .arg(activation.storage_mut())?
+            .arg(u32::try_from(count)?)?;
+        Ok((u32::try_from(count.div_ceil(4096))?, 1, 1))
+    }
+}
+
+/// Given
+/// `A @ B = dActivation` (the gradient of `swish(gate) * x`), outputs `dx = swish(gate) * dActivation`
+/// and `dgate = swish'(gate) * x * dActivation`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwiGluDownTrainDgradEpilogue;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SwiGluDownTrainDgradArgs<'a> {
+    pub gate: &'a TensorView<'a>,
+    pub x: &'a TensorView<'a>,
+}
+
+#[derive(Debug)]
+pub struct SwiGluDownTrainDgradOutputs {
+    /// Gradient of the gate projection, before the activation.
+    pub dgate: Tensor,
+    /// Gradient of the up projection.
+    pub dx: Tensor,
+}
+
+impl Epilogue for SwiGluDownTrainDgradEpilogue {
+    type Args<'a> = SwiGluDownTrainDgradArgs<'a>;
+    type Outputs = SwiGluDownTrainDgradOutputs;
+
+    fn native_kernel_name(&self) -> &'static str {
+        "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1"
+    }
+
+    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
+        Ok(SwiGluDownTrainDgradOutputs {
+            dgate: Tensor::new_zeroed([m, n], BF16, cx)?,
+            dx: Tensor::new_zeroed([m, n], BF16, cx)?,
+        })
+    }
+
+    fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>> {
+        let module =
+            cx.get_or_create_resource(include_cubins!("../../cutile-kernels/sky_matmul_fallback"))?;
+        Ok(Some(
+            module.get_function("swiglu_down_train_dgrad_bf16_4096")?,
+        ))
+    }
+
+    fn alloc_fallback_outputs(
+        &self,
+        product: Tensor,
+        cx: &Context,
+    ) -> anyhow::Result<Self::Outputs> {
+        let dgate = Tensor::new_zeroed(product.shape(), BF16, cx)?;
+        Ok(SwiGluDownTrainDgradOutputs { dgate, dx: product })
+    }
+
+    fn pass_args_to_native_kernel<'a: 'b, 'b>(
+        &self,
+        SwiGluDownTrainDgradArgs { gate, x }: Self::Args<'a>,
+        outputs: &'b mut Self::Outputs,
+        builder: &mut LaunchBuilder<'b>,
+    ) -> anyhow::Result<()> {
+        let &[m, n] = outputs.dx.shape().dims_slice() else {
+            unreachable!()
+        };
+        validate_matrix(gate, m, n, MatrixFormat::RowMajor);
+        validate_matrix(x, m, n, MatrixFormat::RowMajor);
+        let SwiGluDownTrainDgradOutputs { dgate, dx } = outputs;
+        builder
+            .arg(TensorMap::new(gate.storage(), bf16_tma_desc(m, n, true)))?
+            .arg(TensorMap::new(x.storage(), bf16_tma_desc(m, n, true)))?
+            .arg(TensorMapMut::new(
+                dx.storage_mut(),
+                bf16_tma_desc(m, n, true),
+            ))?
+            .arg(TensorMapMut::new(
+                dgate.storage_mut(),
+                bf16_tma_desc(m, n, true),
+            ))?;
+        Ok(())
+    }
+
+    fn pass_args_to_fallback_epilogue_kernel<'a: 'b, 'b>(
+        &self,
+        SwiGluDownTrainDgradArgs { gate, x }: Self::Args<'a>,
+        outputs: &'b mut Self::Outputs,
+        builder: &mut LaunchBuilder<'b>,
+    ) -> anyhow::Result<(u32, u32, u32)> {
+        let &[m, n] = outputs.dx.shape().dims_slice() else {
+            unreachable!()
+        };
+        validate_matrix(gate, m, n, MatrixFormat::RowMajor);
+        validate_matrix(x, m, n, MatrixFormat::RowMajor);
+        let count = m * n;
+        let SwiGluDownTrainDgradOutputs { dgate, dx } = outputs;
+        builder
+            .arg(gate.storage())?
+            .arg(x.storage())?
+            .arg(dx.storage_mut())?
+            .arg(dgate.storage_mut())?
             .arg(u32::try_from(count)?)?;
         Ok((u32::try_from(count.div_ceil(4096))?, 1, 1))
     }

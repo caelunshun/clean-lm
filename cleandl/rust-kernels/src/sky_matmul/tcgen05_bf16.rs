@@ -561,7 +561,7 @@ impl<
                     #[llvm_unroll]
                     for subtile_n in 0..TN_CTA / TN_EPI {
                         #[llvm_unroll]
-                        for aux_input in aux_input_descs {
+                        for &aux_input in &aux_input_descs {
                             if !is_first_iter {
                                 while !mbarrier_try_wait_parity(
                                     &self.smem.barriers_mut().epi_load_slot_consumed
@@ -701,7 +701,7 @@ impl<
                     epilogue.visit_mma_result(mma_result, &mut write_output);
 
                     #[llvm_unroll]
-                    for _ in 0..E::NUM_AUX_INPUTS {
+                    for aux_idx in 0..E::NUM_AUX_INPUTS {
                         while !mbarrier_try_wait_parity(
                             &self.smem.barriers().epi_load_slot_produced[epi_slot_idx as usize],
                             epi_parity,
@@ -734,7 +734,7 @@ impl<
                             &self.smem.barriers().epi_load_slot_consumed[epi_slot_idx as usize],
                         );
 
-                        epilogue.visit_aux_input(thr_row, &mut write_output);
+                        epilogue.visit_aux_input(aux_idx as u32, thr_row, &mut write_output);
 
                         epi_slot_idx = (epi_slot_idx + 1) % EPILOGUE_PIPE_DEPTH as u32;
                         if epi_slot_idx == 0 {
@@ -787,6 +787,7 @@ trait Epilogue<'a> {
 
     fn visit_aux_input(
         &mut self,
+        idx: u32,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
         write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     );
@@ -822,11 +823,23 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     #[inline(always)]
     fn visit_aux_input(
         &mut self,
+        _idx: u32,
         _aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
         _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
         unreachable!()
     }
+}
+
+#[inline(always)]
+fn silu(x: f32) -> f32 {
+    x * rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-x * LOG2_E))
+}
+
+#[inline(always)]
+fn dsilu(dy: f32, x: f32) -> f32 {
+    let sigmoid = rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-x * LOG2_E));
+    dy * (sigmoid + x * sigmoid * (1.0 - sigmoid))
 }
 
 /// Epilogue with two outputs:
@@ -863,8 +876,7 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
         // Apply SiLU
         #[llvm_unroll]
         for i in 0..EPI_ELEMENTS_PER_THREAD {
-            self.vals[i] =
-                result[i] * rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-result[i] * LOG2_E));
+            self.vals[i] = silu(result[i]);
         }
     }
 
@@ -872,6 +884,7 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
     #[cuda_annotate]
     fn visit_aux_input(
         &mut self,
+        _idx: u32,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
         mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
@@ -882,6 +895,87 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
         }
         let cache_hint = cache_policy::createpolicy_fractional_evict_unchanged(1.0);
         write_output(&self.vals, self.y_desc, cache_hint);
+    }
+}
+
+/// Epilogue for backward-pass fused SwiGLU down-projection dgrad.
+/// Auxiliary inputs:
+/// - G: output of gate-projection from forward pass
+/// - X: output of up-projection from forward pass
+///
+/// Computes:
+/// 1. dX = SiLU(G) * mma_result
+/// 2. dG = dSiLU(X * mma_result, G)
+struct SwiGluDownTrainDgradEpilogue<'a> {
+    g_desc: &'a TmaDescriptor,
+    x_desc: &'a TmaDescriptor,
+    dg_desc: &'a TmaDescriptor,
+    dx_desc: &'a TmaDescriptor,
+
+    mma_result: [f32; EPI_ELEMENTS_PER_THREAD],
+    g: [f32; EPI_ELEMENTS_PER_THREAD],
+}
+
+impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
+    const NUM_AUX_INPUTS: usize = 2;
+
+    #[inline(always)]
+    fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS] {
+        [self.g_desc, self.x_desc]
+    }
+
+    #[inline(always)]
+    #[cuda_annotate]
+    fn visit_mma_result(
+        &mut self,
+        result: [f32; EPI_ELEMENTS_PER_THREAD],
+        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+    ) {
+        #[llvm_unroll]
+        for i in 0..EPI_ELEMENTS_PER_THREAD {
+            self.mma_result[i] = result[i];
+        }
+    }
+
+    #[inline(always)]
+    #[cuda_annotate]
+    fn visit_aux_input(
+        &mut self,
+        idx: u32,
+        aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+    ) {
+        match idx {
+            0 => {
+                // aux_data contains G; save it and compute dX.
+                let mut dx = [0.0f32; EPI_ELEMENTS_PER_THREAD];
+                #[llvm_unroll]
+                for i in 0..EPI_ELEMENTS_PER_THREAD {
+                    self.g[i] = aux_data[i];
+                    dx[i] = silu(self.g[i]) * self.mma_result[i];
+                }
+                write_output(
+                    &dx,
+                    self.dx_desc,
+                    cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+                );
+            }
+            1 => {
+                // aux_data contains X; compute dG.
+                let mut dg = [0.0f32; EPI_ELEMENTS_PER_THREAD];
+                #[llvm_unroll]
+                for i in 0..EPI_ELEMENTS_PER_THREAD {
+                    let dy_i = self.mma_result[i] * aux_data[i];
+                    dg[i] = dsilu(dy_i, self.g[i]);
+                }
+                write_output(
+                    &dg,
+                    self.dg_desc,
+                    cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -1064,6 +1158,18 @@ kernel_with_variants! {
         #[grid_constant] y_tma: TmaDescriptor,
     ),
     epilogue = SwiGluGateTrainFwdEpilogue { x_desc: x_tma, g_desc: g_tma, y_desc: y_tma, vals: [0.0; EPI_ELEMENTS_PER_THREAD] },
+    AB_PIPE_DEPTH = 6,
+    EPILOGUE_PIPE_DEPTH = 1
+}
+
+kernel_with_variants! {
+    sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1(
+        #[grid_constant] g_desc: TmaDescriptor,
+        #[grid_constant] x_desc: TmaDescriptor,
+        #[grid_constant] dx_desc: TmaDescriptor,
+        #[grid_constant] dg_desc: TmaDescriptor,
+    ),
+    epilogue = SwiGluDownTrainDgradEpilogue { g_desc, x_desc, dg_desc, dx_desc, mma_result: [0.0; EPI_ELEMENTS_PER_THREAD], g: [0.0; EPI_ELEMENTS_PER_THREAD] },
     AB_PIPE_DEPTH = 6,
     EPILOGUE_PIPE_DEPTH = 1
 }

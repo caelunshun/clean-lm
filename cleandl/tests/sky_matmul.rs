@@ -5,7 +5,8 @@ use cleandl::{
     operators::{
         matmul::MatrixFormat,
         sky_matmul::{
-            IdentityEpilogue, SkyMatmulConfig, SkyMatmulExecutor, SwiGluGateTrainFwdEpilogue,
+            IdentityEpilogue, SkyMatmulConfig, SkyMatmulExecutor, SwiGluDownTrainDgradArgs,
+            SwiGluDownTrainDgradEpilogue, SwiGluDownTrainDgradOutputs, SwiGluGateTrainFwdEpilogue,
             SwiGluGateTrainFwdOutputs,
         },
     },
@@ -161,6 +162,83 @@ fn sky_matmul_swiglu_gate_train_fwd() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn sky_matmul_swiglu_down_train_dgrad() -> anyhow::Result<()> {
+    let cx = new_context()?;
+    let stream = cx.cuda().create_stream()?;
+
+    for (format_a, format_b) in FORMATS {
+        let executor = SkyMatmulExecutor::get(
+            SkyMatmulConfig {
+                tune_for_m: TUNE_M as u32,
+                tune_for_n: TUNE_N as u32,
+                tune_for_k: TUNE_K as u32,
+                format_a,
+                format_b,
+                epilogue: SwiGluDownTrainDgradEpilogue,
+            },
+            &cx,
+        )?;
+        println!(
+            "A {format_a:?}, B {format_b:?}: using native backend: {}",
+            executor.is_native()
+        );
+
+        for (m, n, k) in CASES {
+            let inputs = Inputs::new_random(&cx, &stream, m, n, k, format_a, format_b)?;
+
+            let mut rng = StdRng::seed_from_u64(0xbeef + (m * n * k) as u64);
+            let gate_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
+            let x_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
+            let mut gate = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
+            let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
+            cx.upload_to_device(&gate_host, gate.storage_mut(), &stream)?;
+            cx.upload_to_device(&x_host, x.storage_mut(), &stream)?;
+
+            let SwiGluDownTrainDgradOutputs { dgate, dx } = executor.execute(
+                &inputs.a_view(),
+                &inputs.b_view(),
+                SwiGluDownTrainDgradArgs {
+                    gate: &gate.view(),
+                    x: &x.view(),
+                },
+                &stream,
+            )?;
+            for out in [&dgate, &dx] {
+                assert_eq!(out.shape(), Shape::new([m, n]));
+                assert!(out.is_packed_row_major());
+            }
+
+            let dgate_host = download(&cx, &stream, &dgate)?;
+            let dx_host = download(&cx, &stream, &dx)?;
+            let dactivation_ref = inputs.reference_product();
+
+            let max_dx_error = check_matrix(
+                &dx_host,
+                &inputs,
+                |i, j| swish(gate_host[i * n + j].to_f32()) * dactivation_ref[(i, j)],
+                "dx",
+            )?;
+            let max_dgate_error = check_matrix(
+                &dgate_host,
+                &inputs,
+                |i, j| {
+                    swish_derivative(gate_host[i * n + j].to_f32())
+                        * x_host[i * n + j].to_f32()
+                        * dactivation_ref[(i, j)]
+                },
+                "dgate",
+            )?;
+            println!(
+                "A {format_a:?}, B {format_b:?}, {m}x{n}x{k}: results match the reference \
+                 (max absolute error: dx {max_dx_error}, dgate {max_dgate_error})"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 const BF16: ElementType = ElementType::Float(FloatType::Bf16);
 
 /// Random matmul inputs: A is `[m, k]` and B is `[k, n]`, each stored in the given format.
@@ -304,4 +382,10 @@ fn check_matrix(
 /// Swish (SiLU) activation: `x * sigmoid(x)`.
 fn swish(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Derivative of swish: `sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))`.
+fn swish_derivative(x: f32) -> f32 {
+    let sigmoid = 1.0 / (1.0 + (-x).exp());
+    sigmoid + x * sigmoid * (1.0 - sigmoid)
 }

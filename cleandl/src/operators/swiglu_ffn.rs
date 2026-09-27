@@ -2,14 +2,19 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use skycuda::stream::Stream;
-use skycuda_cudnn::{DataType, MatmulAttributes, PointwiseAttributes, PointwiseMode, TensorId};
 use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, ResourceKey},
-    cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
-    tensor::{Tensor, TensorView, VirtTensorView},
+    operators::{
+        matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
+        sky_matmul::{
+            SkyMatmulConfig, SkyMatmulExecutor, SwiGluDownTrainDgradArgs,
+            SwiGluDownTrainDgradEpilogue, SwiGluDownTrainDgradOutputs, SwiGluGateTrainFwdEpilogue,
+            SwiGluGateTrainFwdOutputs,
+        },
+    },
+    tensor::{Tensor, TensorView},
 };
 
 /// SwiGLU FFN forward and backward pass executor.
@@ -20,34 +25,16 @@ use crate::{
 #[derive(Debug)]
 pub struct SwiGluFfnExecutor {
     config: SwiGluConfig,
-    cx: Context,
     fwd_up_proj: Arc<MatmulExecutor>,
     fwd_down_proj: Arc<MatmulExecutor>,
 
-    fwd_fused_gate_graph: ExecutableCudnnGraph,
-    fwd_fused_gate_data: TensorId,
-    fwd_fused_gate_up: TensorId,
-    fwd_fused_gate_weight: TensorId,
-    fwd_fused_gate_out_gate: TensorId,
-    fwd_fused_gate_out_activation: TensorId,
+    fwd_fused_gate: Arc<SkyMatmulExecutor<SwiGluGateTrainFwdEpilogue>>,
 
     bwd_down_proj_wgrad: Arc<MatmulExecutor>,
     bwd_up_gate_proj_wgrad: Arc<MatmulExecutor>,
     bwd_up_proj_dgrad: Arc<MatmulExecutor>,
-
-    bwd_gate_proj_dgrad_graph: ExecutableCudnnGraph,
-    bwd_gate_proj_dgrad_weight: TensorId,
-    bwd_gate_proj_dgrad_dgate: TensorId,
-    bwd_gate_proj_dgrad_dup_in: TensorId,
-    bwd_gate_proj_dgrad_out_dffn: TensorId,
-
-    bwd_down_proj_dgrad_graph: ExecutableCudnnGraph,
-    bwd_down_proj_dgrad_weight: TensorId,
-    bwd_down_proj_dgrad_dy: TensorId,
-    bwd_down_proj_dgrad_gate: TensorId,
-    bwd_down_proj_dgrad_up: TensorId,
-    bwd_down_proj_dgrad_out_dgate: TensorId,
-    bwd_down_proj_dgrad_out_dup: TensorId,
+    bwd_gate_proj_dgrad: Arc<MatmulExecutor>,
+    bwd_down_proj_dgrad: Arc<SkyMatmulExecutor<SwiGluDownTrainDgradEpilogue>>,
 }
 
 /// Outputs of [`SwiGluFfnExecutor::forward_gate_proj`].
@@ -93,29 +80,9 @@ impl SwiGluFfnExecutor {
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<GateProjForwardOutput> {
-        let mut out_gate = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
-        let mut out_activation = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
-
-        self.fwd_fused_gate_graph.execute(
-            &[
-                (self.fwd_fused_gate_data, &data.unsqueezed()),
-                (self.fwd_fused_gate_up, &up.unsqueezed()),
-                (self.fwd_fused_gate_weight, &weight.unsqueezed()),
-            ],
-            &mut [
-                (self.fwd_fused_gate_out_gate, out_gate.unsqueezed_mut()),
-                (
-                    self.fwd_fused_gate_out_activation,
-                    out_activation.unsqueezed_mut(),
-                ),
-            ],
-            stream,
-        )?;
-
-        Ok(GateProjForwardOutput {
-            gate: out_gate,
-            activation: out_activation,
-        })
+        let SwiGluGateTrainFwdOutputs { gate, activation } =
+            self.fwd_fused_gate.execute(data, weight, up, stream)?;
+        Ok(GateProjForwardOutput { gate, activation })
     }
 
     /// Returns the FFN output `[batch_size, out_features]`, with the residual added.
@@ -138,33 +105,13 @@ impl SwiGluFfnExecutor {
         up: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<DownProjDgradOutput> {
-        let mut out_dgate = Tensor::new_zeroed(gate.shape(), gate.element_type(), &self.cx)?;
-        let mut out_dup = Tensor::new_zeroed(up.shape(), up.element_type(), &self.cx)?;
-
-        self.bwd_down_proj_dgrad_graph.execute(
-            &[
-                (
-                    self.bwd_down_proj_dgrad_weight,
-                    &weight.transposed(0, 1).unsqueezed(),
-                ),
-                (self.bwd_down_proj_dgrad_dy, &dy.unsqueezed()),
-                (self.bwd_down_proj_dgrad_gate, &gate.unsqueezed()),
-                (self.bwd_down_proj_dgrad_up, &up.unsqueezed()),
-            ],
-            &mut [
-                (
-                    self.bwd_down_proj_dgrad_out_dgate,
-                    out_dgate.unsqueezed_mut(),
-                ),
-                (self.bwd_down_proj_dgrad_out_dup, out_dup.unsqueezed_mut()),
-            ],
+        let SwiGluDownTrainDgradOutputs { dgate, dx } = self.bwd_down_proj_dgrad.execute(
+            dy,
+            &weight.transposed(0, 1),
+            SwiGluDownTrainDgradArgs { gate, x: up },
             stream,
         )?;
-
-        Ok(DownProjDgradOutput {
-            dgate: out_dgate,
-            dup: out_dup,
-        })
+        Ok(DownProjDgradOutput { dgate, dup: dx })
     }
 
     /// Returns the down-projection weight gradient
@@ -211,21 +158,8 @@ impl SwiGluFfnExecutor {
         ddata_up: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        let mut out_dffn = Tensor::new_zeroed(ddata_up.shape(), ddata_up.element_type(), &self.cx)?;
-
-        self.bwd_gate_proj_dgrad_graph.execute(
-            &[
-                (self.bwd_gate_proj_dgrad_dgate, &dout.unsqueezed()),
-                (self.bwd_gate_proj_dgrad_dup_in, &ddata_up.unsqueezed()),
-                (
-                    self.bwd_gate_proj_dgrad_weight,
-                    &weight.transposed(0, 1).unsqueezed(),
-                ),
-            ],
-            &mut [(self.bwd_gate_proj_dgrad_out_dffn, out_dffn.unsqueezed_mut())],
-            stream,
-        )?;
-        Ok(out_dffn)
+        self.bwd_gate_proj_dgrad
+            .matmul(dout, &weight.transposed(0, 1), Some(ddata_up), stream)
     }
 }
 
@@ -237,31 +171,14 @@ pub struct SwiGluConfig {
     pub out_features: usize,
 }
 
-fn matmul_attrs() -> MatmulAttributes {
-    MatmulAttributes::new().compute_data_type(DataType::Float)
-}
-
-fn pointwise_attrs(mode: PointwiseMode) -> PointwiseAttributes {
-    PointwiseAttributes::new(mode).compute_data_type(DataType::Float)
-}
-
 impl ResourceKey for SwiGluConfig {
     type Resource = SwiGluFfnExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        let bf16 = ElementType::Float(FloatType::Bf16);
-        let data_layout =
-            VirtTensorView::new([1, self.estimated_batch_size, self.in_features], bf16);
-        let intermediate_layout = VirtTensorView::new(
-            [1, self.estimated_batch_size, self.intermediate_features],
-            bf16,
-        );
-        let out_layout =
-            VirtTensorView::new([1, self.estimated_batch_size, self.out_features], bf16);
-        let up_gate_weight_layout =
-            VirtTensorView::new([1, self.in_features, self.intermediate_features], bf16);
-        let down_weight_layout =
-            VirtTensorView::new([1, self.intermediate_features, self.out_features], bf16);
+        let batch_size = u32::try_from(self.estimated_batch_size)?;
+        let in_features = u32::try_from(self.in_features)?;
+        let intermediate_features = u32::try_from(self.intermediate_features)?;
+        let out_features = u32::try_from(self.out_features)?;
 
         let fwd_up_proj = MatmulExecutor::get(
             MatmulConfig {
@@ -297,36 +214,17 @@ impl ResourceKey for SwiGluConfig {
             cx,
         )?;
 
-        let fwd_fused_gate_graph = CudnnGraphBuilder::new(cx)?;
-        fwd_fused_gate_graph
-            .graph()
-            .set_override_shape_enabled(true);
-        let fwd_fused_gate_data = fwd_fused_gate_graph.bind_tensor(&data_layout);
-        let fwd_fused_gate_up = fwd_fused_gate_graph.bind_tensor(&intermediate_layout);
-        let fwd_fused_gate_weight = fwd_fused_gate_graph.bind_tensor(&up_gate_weight_layout);
-
-        let gate = fwd_fused_gate_graph.graph().matmul(
-            fwd_fused_gate_data,
-            fwd_fused_gate_weight,
-            &matmul_attrs(),
+        let fwd_fused_gate = SkyMatmulExecutor::get(
+            SkyMatmulConfig {
+                tune_for_m: batch_size,
+                tune_for_n: intermediate_features,
+                tune_for_k: in_features,
+                format_a: MatrixFormat::RowMajor,
+                format_b: MatrixFormat::RowMajor,
+                epilogue: SwiGluGateTrainFwdEpilogue,
+            },
+            cx,
         )?;
-        let fwd_fused_gate_out_gate = fwd_fused_gate_graph.mark_output(gate, &intermediate_layout);
-        let tmp = fwd_fused_gate_graph
-            .graph()
-            .pointwise_unary(gate, &pointwise_attrs(PointwiseMode::SwishFwd))?;
-        let activation = fwd_fused_gate_graph.graph().pointwise_binary(
-            tmp,
-            fwd_fused_gate_up,
-            &pointwise_attrs(PointwiseMode::Mul),
-        )?;
-        let fwd_fused_gate_out_activation =
-            fwd_fused_gate_graph.mark_output(activation, &intermediate_layout);
-        let (fwd_fused_gate_data, fwd_fused_gate_up, fwd_fused_gate_weight) = (
-            fwd_fused_gate_data.uid(),
-            fwd_fused_gate_up.uid(),
-            fwd_fused_gate_weight.uid(),
-        );
-        let fwd_fused_gate_graph = fwd_fused_gate_graph.build()?;
 
         let bwd_down_proj_wgrad = MatmulExecutor::get(
             MatmulConfig {
@@ -375,119 +273,47 @@ impl ResourceKey for SwiGluConfig {
             cx,
         )?;
 
-        let bwd_gate_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
-        bwd_gate_proj_dgrad_graph
-            .graph()
-            .set_override_shape_enabled(true);
-        let bwd_gate_proj_dgrad_dgate = bwd_gate_proj_dgrad_graph.bind_tensor(&intermediate_layout);
-        let bwd_gate_proj_dgrad_weight =
-            bwd_gate_proj_dgrad_graph.bind_tensor(&up_gate_weight_layout.transposed(1, 2));
-        let bwd_gate_proj_dgrad_dup_in = bwd_gate_proj_dgrad_graph.bind_tensor(&data_layout);
-
-        let tmp_dgate_in = bwd_gate_proj_dgrad_graph.graph().matmul(
-            bwd_gate_proj_dgrad_dgate,
-            bwd_gate_proj_dgrad_weight,
-            &matmul_attrs(),
-        )?;
-        let dffn = bwd_gate_proj_dgrad_graph.graph().pointwise_binary(
-            tmp_dgate_in,
-            bwd_gate_proj_dgrad_dup_in,
-            &pointwise_attrs(PointwiseMode::Add),
-        )?;
-        let bwd_gate_proj_dgrad_out_dffn =
-            bwd_gate_proj_dgrad_graph.mark_output(dffn, &data_layout);
-        let (bwd_gate_proj_dgrad_dgate, bwd_gate_proj_dgrad_weight, bwd_gate_proj_dgrad_dup_in) = (
-            bwd_gate_proj_dgrad_dgate.uid(),
-            bwd_gate_proj_dgrad_weight.uid(),
-            bwd_gate_proj_dgrad_dup_in.uid(),
-        );
-        let bwd_gate_proj_dgrad_graph = bwd_gate_proj_dgrad_graph.build()?;
-
-        let bwd_down_proj_dgrad_graph = CudnnGraphBuilder::new(cx)?;
-        bwd_down_proj_dgrad_graph
-            .graph()
-            .set_override_shape_enabled(true);
-
-        let bwd_down_proj_dgrad_weight =
-            bwd_down_proj_dgrad_graph.bind_tensor(&down_weight_layout.transposed(1, 2));
-        let bwd_down_proj_dgrad_dy = bwd_down_proj_dgrad_graph.bind_tensor(&out_layout);
-        let bwd_down_proj_dgrad_gate = bwd_down_proj_dgrad_graph.bind_tensor(&intermediate_layout);
-        let bwd_down_proj_dgrad_up = bwd_down_proj_dgrad_graph.bind_tensor(&intermediate_layout);
-
-        let tmp_grad = bwd_down_proj_dgrad_graph.graph().matmul(
-            bwd_down_proj_dgrad_dy,
-            bwd_down_proj_dgrad_weight,
-            &matmul_attrs(),
+        let bwd_gate_proj_dgrad = MatmulExecutor::get(
+            MatmulConfig {
+                m: self.estimated_batch_size,
+                n: self.in_features,
+                k: self.intermediate_features,
+                residual: Some(ResidualConfig {
+                    format: MatrixFormat::RowMajor,
+                    element_type: ElementType::Float(FloatType::Bf16),
+                }),
+                a_format: MatrixFormat::RowMajor,
+                b_format: MatrixFormat::ColumnMajor, // transposed
+                out_format: MatrixFormat::RowMajor,
+                allow_shape_override: true,
+                ab_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::Bf16),
+            },
+            cx,
         )?;
 
-        // Recompute swish forward
-        let tmp_gate_swish = bwd_down_proj_dgrad_graph.graph().pointwise_unary(
-            bwd_down_proj_dgrad_gate,
-            &pointwise_attrs(PointwiseMode::SwishFwd),
+        let bwd_down_proj_dgrad = SkyMatmulExecutor::get(
+            SkyMatmulConfig {
+                tune_for_m: batch_size,
+                tune_for_n: intermediate_features,
+                tune_for_k: out_features,
+                format_a: MatrixFormat::RowMajor,
+                format_b: MatrixFormat::ColumnMajor, // transposed
+                epilogue: SwiGluDownTrainDgradEpilogue,
+            },
+            cx,
         )?;
-
-        // Apply product rule
-        // (1) dup
-        let dup = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
-            tmp_gate_swish,
-            tmp_grad,
-            &pointwise_attrs(PointwiseMode::Mul),
-        )?;
-        let bwd_down_proj_dgrad_out_dup =
-            bwd_down_proj_dgrad_graph.mark_output(dup, &intermediate_layout);
-        // (2) dgate, requiring dswish operation
-        let tmp_dswish = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
-            tmp_grad,
-            bwd_down_proj_dgrad_up,
-            &pointwise_attrs(PointwiseMode::Mul),
-        )?;
-        let dgate = bwd_down_proj_dgrad_graph.graph().pointwise_binary(
-            tmp_dswish,
-            bwd_down_proj_dgrad_gate,
-            &pointwise_attrs(PointwiseMode::SwishBwd),
-        )?;
-        let bwd_down_proj_dgrad_out_dgate =
-            bwd_down_proj_dgrad_graph.mark_output(dgate, &intermediate_layout);
-        let (
-            bwd_down_proj_dgrad_weight,
-            bwd_down_proj_dgrad_dy,
-            bwd_down_proj_dgrad_gate,
-            bwd_down_proj_dgrad_up,
-        ) = (
-            bwd_down_proj_dgrad_weight.uid(),
-            bwd_down_proj_dgrad_dy.uid(),
-            bwd_down_proj_dgrad_gate.uid(),
-            bwd_down_proj_dgrad_up.uid(),
-        );
-        let bwd_down_proj_dgrad_graph = bwd_down_proj_dgrad_graph.build()?;
 
         Ok(SwiGluFfnExecutor {
             config: *self,
-            cx: cx.clone(),
             fwd_up_proj,
             fwd_down_proj,
-            fwd_fused_gate_graph,
-            fwd_fused_gate_data,
-            fwd_fused_gate_up,
-            fwd_fused_gate_weight,
-            fwd_fused_gate_out_gate,
-            fwd_fused_gate_out_activation,
+            fwd_fused_gate,
             bwd_down_proj_wgrad,
             bwd_up_gate_proj_wgrad,
-
-            bwd_down_proj_dgrad_graph,
-            bwd_down_proj_dgrad_weight,
-            bwd_down_proj_dgrad_dy,
-            bwd_down_proj_dgrad_gate,
-            bwd_down_proj_dgrad_up,
-            bwd_down_proj_dgrad_out_dgate,
-            bwd_down_proj_dgrad_out_dup,
             bwd_up_proj_dgrad,
-            bwd_gate_proj_dgrad_graph,
-            bwd_gate_proj_dgrad_weight,
-            bwd_gate_proj_dgrad_dgate,
-            bwd_gate_proj_dgrad_dup_in,
-            bwd_gate_proj_dgrad_out_dffn,
+            bwd_gate_proj_dgrad,
+            bwd_down_proj_dgrad,
         })
     }
 }
