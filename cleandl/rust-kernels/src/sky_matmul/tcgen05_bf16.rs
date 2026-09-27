@@ -871,14 +871,31 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
 }
 
 #[inline(always)]
-fn silu(x: f32) -> f32 {
-    x * rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-x * LOG2_E))
+fn sigmoid(x: f32) -> f32 {
+    rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-x * LOG2_E))
 }
 
 #[inline(always)]
+fn silu(x: f32) -> f32 {
+    silu_using_sigmoid(x, sigmoid(x))
+}
+
+/// SiLU with precomputed sigmoid(x).
+#[inline(always)]
+fn silu_using_sigmoid(x: f32, sigmoid_x: f32) -> f32 {
+    x * sigmoid_x
+}
+
+#[inline(always)]
+#[allow(unused)]
 fn dsilu(dy: f32, x: f32) -> f32 {
-    let sigmoid = rcp_approx_ftz_f32(1.0 + ex2_approx_ftz_f32(-x * LOG2_E));
-    dy * (sigmoid + x * sigmoid * (1.0 - sigmoid))
+    dsilu_using_sigmoid(dy, x, sigmoid(x))
+}
+
+/// dSiLU with precomputed sigmoid(x).
+#[inline(always)]
+fn dsilu_using_sigmoid(dy: f32, x: f32, sigmoid_x: f32) -> f32 {
+    dy * (sigmoid_x + x * sigmoid_x * (1.0 - sigmoid_x))
 }
 
 /// Epilogue with two outputs:
@@ -963,6 +980,7 @@ struct SwiGluDownTrainDgradEpilogue<'a> {
 
     mma_result: [f32; EPI_ELEMENTS_PER_THREAD],
     g: [f32; EPI_ELEMENTS_PER_THREAD],
+    sigmoid_g: [f32; EPI_ELEMENTS_PER_THREAD],
 }
 
 impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
@@ -1016,7 +1034,8 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
                 #[llvm_unroll]
                 for i in 0..EPI_ELEMENTS_PER_THREAD {
                     self.g[i] = aux_data[i];
-                    dx[i] = silu(self.g[i]) * self.mma_result[i];
+                    self.sigmoid_g[i] = sigmoid(self.g[i]);
+                    dx[i] = silu_using_sigmoid(self.g[i], self.sigmoid_g[i]) * self.mma_result[i];
                 }
                 write_output(&dx);
             }
@@ -1026,7 +1045,7 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
                 #[llvm_unroll]
                 for i in 0..EPI_ELEMENTS_PER_THREAD {
                     let dy_i = self.mma_result[i] * aux_data[i];
-                    dg[i] = dsilu(dy_i, self.g[i]);
+                    dg[i] = dsilu_using_sigmoid(dy_i, self.g[i], self.sigmoid_g[i]);
                 }
                 write_output(&dg);
             }
@@ -1226,7 +1245,8 @@ kernel_with_variants! {
         #[grid_constant] dx_desc: TmaDescriptor,
         #[grid_constant] dg_desc: TmaDescriptor,
     ),
-    epilogue = SwiGluDownTrainDgradEpilogue { g_desc, x_desc, dg_desc, dx_desc, mma_result: [0.0; EPI_ELEMENTS_PER_THREAD], g: [0.0; EPI_ELEMENTS_PER_THREAD] },
+    epilogue = SwiGluDownTrainDgradEpilogue { g_desc, x_desc, dg_desc, dx_desc,
+        mma_result: [0.0; EPI_ELEMENTS_PER_THREAD], g: [0.0; EPI_ELEMENTS_PER_THREAD], sigmoid_g: [0.0; EPI_ELEMENTS_PER_THREAD] },
     AB_PIPE_DEPTH = 6,
     EPILOGUE_PIPE_DEPTH = 1
 }
