@@ -26,16 +26,16 @@
 //! * Warp 0: A/B TMA loads
 //! * Warp 1: MMA issue
 //! * Warp 2: Epilogue TMA loads
-//! * Warp 3: Unused / register donor for epilogue warps
-//! * Warps 4..12: Epilogue warps; TMA stores issued by warp 4
+//! * Warp 3: Epilogue TMA stores
+//! * Warps 4..12: Epilogue compute warps
 
 use core::{f32::consts::LOG2_E, mem};
 
 use cuda_device::{
     Barrier, DynamicSharedArray, TmaDescriptor,
     barrier::{
-        barrier_cta_sync, fence_mbarrier_init_release_cluster, fence_proxy_async_shared_cta,
-        mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
+        fence_mbarrier_init_release_cluster, fence_proxy_async_shared_cta, mbarrier_arrive,
+        mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
         mbarrier_try_wait_parity, mbarrier_try_wait_parity_cluster,
     },
     blockIdx_x, cache_policy,
@@ -51,8 +51,7 @@ use cuda_device::{
         tcgen05_fence_before_thread_sync, tcgen05_ld_32x32b_x32_raw, tcgen05_load_wait,
         tcgen05_mma_f16_cg2, tcgen05_relinquish_alloc_permit_cg2,
     },
-    threadIdx_x,
-    tma::{self, cp_async_bulk_wait_group_read},
+    threadIdx_x, tma,
     uniform::grid_dim_x,
     warp::{is_elected_sync, warp_id},
 };
@@ -75,14 +74,12 @@ const TM_EPI: u32 = 128;
 const TN_EPI: u32 = 64;
 const EPI_ELEMENTS_PER_THREAD: usize = 32;
 
-const EPILOGUE_HELPER_BARRIER_ID: u32 = 1;
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum WarpRole {
     AbTmaLoad,
     MmaIssue,
     EpilogueTmaLoad,
-    Unused,
+    EpilogueTmaStore,
     Epilogue,
 }
 
@@ -92,7 +89,7 @@ fn warp_role() -> WarpRole {
         0 => WarpRole::AbTmaLoad,
         1 => WarpRole::MmaIssue,
         2 => WarpRole::EpilogueTmaLoad,
-        3 => WarpRole::Unused,
+        3 => WarpRole::EpilogueTmaStore,
         _ => WarpRole::Epilogue,
     }
 }
@@ -110,6 +107,8 @@ struct Barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
     epi_load_slot_consumed: [Barrier; EPILOGUE_PIPE_DEPTH],
     accumulator_slot_produced: [Barrier; 2],
     accumulator_slot_consumed: [Barrier; 2],
+    epi_store_produced: Barrier,
+    epi_store_consumed: Barrier,
 }
 
 #[derive(Copy, Clone)]
@@ -214,6 +213,8 @@ fn init_barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>(
         for bar in &mut barriers.epi_load_slot_consumed {
             mbarrier_init(bar, 256);
         }
+        mbarrier_init(&mut barriers.epi_store_produced, 256);
+        mbarrier_init(&mut barriers.epi_store_consumed, 1);
     }
 }
 
@@ -610,6 +611,52 @@ impl<
 
     #[inline(always)]
     #[cuda_annotate]
+    pub fn run_epi_store_warp<E: Epilogue<'a>>(&mut self, epilogue: E)
+    where
+        [(); E::NUM_OUTPUTS]:,
+    {
+        unsafe {
+            let is_elected = is_elected_sync(u32::MAX);
+            if is_elected {
+                let mut store_parity = 0;
+                loop {
+                    #[llvm_unroll]
+                    for subtile_n in 0..(TN_CTA / TN_EPI) {
+                        #[llvm_unroll]
+                        for &(tma_desc, cache_hint) in &epilogue.output_descs() {
+                            // Wait for epilogue warps to stage to SMEM
+                            while !mbarrier_try_wait_parity(
+                                &self.smem.barriers().epi_store_produced,
+                                store_parity,
+                            ) {}
+
+                            tma::cp_async_bulk_tensor_2d_s2g_cache_hint(
+                                self.smem.epi_store_staging_slot(),
+                                tma_desc,
+                                (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
+                                (self.current_cta_tm * TM_CTA) as i32,
+                                cache_hint,
+                            );
+                            tma::cp_async_bulk_commit_group();
+
+                            tma::cp_async_bulk_wait_group_read(0);
+                            mbarrier_arrive(&self.smem.barriers().epi_store_consumed);
+
+                            store_parity ^= 1;
+                        }
+                    }
+
+                    if !self.advance_to_next_tile() {
+                        break;
+                    }
+                }
+                tma::cp_async_bulk_wait_group(0);
+            }
+        }
+    }
+
+    #[inline(always)]
+    #[cuda_annotate]
     pub fn run_epi_warps<E: Epilogue<'a>>(&mut self, mut epilogue: E) {
         unsafe {
             let thread_m = (threadIdx_x() - 128) % 128;
@@ -622,6 +669,7 @@ impl<
             let mut epi_slot_idx = 0;
             let mut epi_parity = 0;
             let mut has_stored = false;
+            let mut store_parity = 0;
 
             loop {
                 // Wait for accumulator to be ready in TMEM
@@ -646,57 +694,44 @@ impl<
                         [f32; EPI_ELEMENTS_PER_THREAD],
                     >(mma_result.to_array());
 
-                    let mut write_output =
-                        #[inline(always)]
-                        |thr_row: &[f32; EPI_ELEMENTS_PER_THREAD],
-                         tma_desc: &TmaDescriptor,
-                         cache_hint: CacheHint| {
-                            // Convert to bf16.
-                            let mut thr_row_bf16 = [bf16x2::ZERO; EPI_ELEMENTS_PER_THREAD / 2];
-                            #[llvm_unroll]
-                            for i in 0..EPI_ELEMENTS_PER_THREAD / 2 {
-                                thr_row_bf16[i] =
-                                    bf16x2::from_f32_pair(thr_row[i * 2], thr_row[i * 2 + 1]);
-                            }
+                    let mut write_output = #[inline(always)]
+                    |thr_row: &[f32; EPI_ELEMENTS_PER_THREAD]| {
+                        // Convert to bf16.
+                        let mut thr_row_bf16 = [bf16x2::ZERO; EPI_ELEMENTS_PER_THREAD / 2];
+                        #[llvm_unroll]
+                        for i in 0..EPI_ELEMENTS_PER_THREAD / 2 {
+                            thr_row_bf16[i] =
+                                bf16x2::from_f32_pair(thr_row[i * 2], thr_row[i * 2 + 1]);
+                        }
 
-                            let smem = self.smem.epi_store_staging_slot().cast::<bf16>();
-                            let row = thread_m;
-                            let smem_row = smem.add((row * TN_EPI) as usize).cast::<u128>();
+                        let smem = self.smem.epi_store_staging_slot().cast::<bf16>();
+                        let row = thread_m;
+                        let smem_row = smem.add((row * TN_EPI) as usize).cast::<u128>();
 
-                            if has_stored {
-                                // Wait for the previous TMA store to finish reading smem.
-                                if warp_id() == 4 && lane_id() == 0 {
-                                    cp_async_bulk_wait_group_read(0);
-                                }
-                                barrier_cta_sync(EPILOGUE_HELPER_BARRIER_ID, 256);
-                            }
+                        if has_stored {
+                            // Wait for the previous TMA store to finish reading smem.
+                            while !mbarrier_try_wait_parity(
+                                &self.smem.barriers().epi_store_consumed,
+                                store_parity,
+                            ) {}
+                            store_parity ^= 1;
+                        }
 
-                            // Store to SMEM panel with vectorized stores, in TMA 128B swizzled layout
-                            // (noting that the swizzle pattern width of 128 B = 64 elements = TN_EPI)
-                            #[llvm_unroll]
-                            for chunk in 0..EPI_ELEMENTS_PER_THREAD / 8 {
-                                let src = thr_row_bf16.as_ptr().cast::<u128>().add(chunk);
-                                let col = chunk as u32 + warp_n / 8;
-                                let col_swizzle = col ^ (row & 0b111);
-                                smem_row.add(col_swizzle as usize).write(src.read());
-                            }
+                        // Store to SMEM panel with vectorized stores, in TMA 128B swizzled layout
+                        // (noting that the swizzle pattern width of 128 B = 64 elements = TN_EPI)
+                        #[llvm_unroll]
+                        for chunk in 0..EPI_ELEMENTS_PER_THREAD / 8 {
+                            let src = thr_row_bf16.as_ptr().cast::<u128>().add(chunk);
+                            let col = chunk as u32 + warp_n / 8;
+                            let col_swizzle = col ^ (row & 0b111);
+                            smem_row.add(col_swizzle as usize).write(src.read());
+                        }
 
-                            fence_proxy_async_shared_cta();
-                            barrier_cta_sync(EPILOGUE_HELPER_BARRIER_ID, 256);
+                        fence_proxy_async_shared_cta();
+                        mbarrier_arrive(&self.smem.barriers().epi_store_produced);
 
-                            if warp_id() == 4 && lane_id() == 0 {
-                                tma::cp_async_bulk_tensor_2d_s2g_cache_hint(
-                                    smem.cast(),
-                                    tma_desc,
-                                    (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
-                                    (self.current_cta_tm * TM_CTA) as i32,
-                                    cache_hint,
-                                );
-                                tma::cp_async_bulk_commit_group();
-                            }
-
-                            has_stored = true;
-                        };
+                        has_stored = true;
+                    };
 
                     epilogue.visit_mma_result(mma_result, &mut write_output);
 
@@ -762,10 +797,6 @@ impl<
                     accum_parity ^= 1;
                 }
             }
-
-            if has_stored && warp_id() == 4 && lane_id() == 0 {
-                tma::cp_async_bulk_wait_group(0);
-            }
         }
     }
 }
@@ -776,20 +807,23 @@ impl<
 /// written to all its output tensors via write_output.
 trait Epilogue<'a> {
     const NUM_AUX_INPUTS: usize;
+    const NUM_OUTPUTS: usize;
 
     fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS];
+
+    fn output_descs(&self) -> [(&'a TmaDescriptor, CacheHint); Self::NUM_OUTPUTS];
 
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     );
 
     fn visit_aux_input(
         &mut self,
         idx: u32,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     );
 }
 
@@ -801,6 +835,7 @@ struct IdentityEpilogue<'a> {
 
 impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     const NUM_AUX_INPUTS: usize = 0;
+    const NUM_OUTPUTS: usize = 1;
 
     #[inline(always)]
     fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS] {
@@ -808,16 +843,20 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     }
 
     #[inline(always)]
+    fn output_descs(&self) -> [(&'a TmaDescriptor, CacheHint); Self::NUM_OUTPUTS] {
+        [(
+            self.out_tma,
+            cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+        )]
+    }
+
+    #[inline(always)]
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
-        write_output(
-            &result,
-            self.out_tma,
-            cache_policy::createpolicy_fractional_evict_unchanged(1.0),
-        );
+        write_output(&result);
     }
 
     #[inline(always)]
@@ -825,7 +864,7 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
         &mut self,
         _idx: u32,
         _aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
         unreachable!()
     }
@@ -854,11 +893,25 @@ struct SwiGluGateTrainFwdEpilogue<'a> {
 
 impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
     const NUM_AUX_INPUTS: usize = 1;
+    const NUM_OUTPUTS: usize = 2;
 
     #[inline(always)]
-    #[cuda_annotate]
     fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS] {
         [self.x_desc]
+    }
+
+    #[inline(always)]
+    fn output_descs(&self) -> [(&'a TmaDescriptor, CacheHint); Self::NUM_OUTPUTS] {
+        [
+            (
+                self.g_desc,
+                cache_policy::createpolicy_fractional_evict_first(1.0),
+            ),
+            (
+                self.y_desc,
+                cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+            ),
+        ]
     }
 
     #[inline(always)]
@@ -866,12 +919,9 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
-        // This output won't be accessed again until the backward pass,
-        // so no reason to keep it in L2.
-        let cache_hint = cache_policy::createpolicy_fractional_evict_first(1.0);
-        write_output(&result, self.g_desc, cache_hint);
+        write_output(&result);
 
         // Apply SiLU
         #[llvm_unroll]
@@ -886,15 +936,14 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
         &mut self,
         _idx: u32,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
         // Apply Hadamard product
         #[llvm_unroll]
         for i in 0..EPI_ELEMENTS_PER_THREAD {
             self.vals[i] *= aux_data[i];
         }
-        let cache_hint = cache_policy::createpolicy_fractional_evict_unchanged(1.0);
-        write_output(&self.vals, self.y_desc, cache_hint);
+        write_output(&self.vals);
     }
 }
 
@@ -918,6 +967,7 @@ struct SwiGluDownTrainDgradEpilogue<'a> {
 
 impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
     const NUM_AUX_INPUTS: usize = 2;
+    const NUM_OUTPUTS: usize = 2;
 
     #[inline(always)]
     fn aux_input_descs(&self) -> [&'a TmaDescriptor; Self::NUM_AUX_INPUTS] {
@@ -925,11 +975,25 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
     }
 
     #[inline(always)]
+    fn output_descs(&self) -> [(&'a TmaDescriptor, CacheHint); Self::NUM_OUTPUTS] {
+        [
+            (
+                self.dx_desc,
+                cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+            ),
+            (
+                self.dg_desc,
+                cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+            ),
+        ]
+    }
+
+    #[inline(always)]
     #[cuda_annotate]
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
         #[llvm_unroll]
         for i in 0..EPI_ELEMENTS_PER_THREAD {
@@ -943,7 +1007,7 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
         &mut self,
         idx: u32,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD]),
     ) {
         match idx {
             0 => {
@@ -954,11 +1018,7 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
                     self.g[i] = aux_data[i];
                     dx[i] = silu(self.g[i]) * self.mma_result[i];
                 }
-                write_output(
-                    &dx,
-                    self.dx_desc,
-                    cache_policy::createpolicy_fractional_evict_unchanged(1.0),
-                );
+                write_output(&dx);
             }
             1 => {
                 // aux_data contains X; compute dG.
@@ -968,11 +1028,7 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
                     let dy_i = self.mma_result[i] * aux_data[i];
                     dg[i] = dsilu(dy_i, self.g[i]);
                 }
-                write_output(
-                    &dg,
-                    self.dg_desc,
-                    cache_policy::createpolicy_fractional_evict_unchanged(1.0),
-                );
+                write_output(&dg);
             }
             _ => unreachable!(),
         }
@@ -1000,6 +1056,7 @@ fn kernel_template<
     epilogue: E,
 ) where
     [(); E::NUM_AUX_INPUTS]:,
+    [(); E::NUM_OUTPUTS]:,
 {
     unsafe {
         let mut smem = Smem::<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
@@ -1053,7 +1110,7 @@ fn kernel_template<
                     WarpRole::EpilogueTmaLoad => {
                         state.run_epi_load_warp(epilogue.aux_input_descs());
                     }
-                    WarpRole::Unused => {}
+                    WarpRole::EpilogueTmaStore => state.run_epi_store_warp(epilogue),
                     WarpRole::Epilogue => unreachable!(),
                 }
             }
