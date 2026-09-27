@@ -289,6 +289,7 @@ dependencies = [
  "cuda-device",
  "cuda-device-ext",
  "cuda-macros",
+ "pastey",
 ]
 
 [[package]]
@@ -386,7 +387,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#0890df47f4ee8899ce48ab1195afa0885412cd87"
+source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
 dependencies = [
  "cuda-macros",
 ]
@@ -402,7 +403,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#0890df47f4ee8899ce48ab1195afa0885412cd87"
+source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1217,6 +1218,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pest"
 version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1572,7 +1579,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#0890df47f4ee8899ce48ab1195afa0885412cd87"
+source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
 
 [[package]]
 name = "rustc-hash"

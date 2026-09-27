@@ -27,8 +27,6 @@ const NATIVE_TM_CGA: usize = 256;
 const NATIVE_TN_CGA: usize = 256;
 const NATIVE_CGA_SIZE: u32 = 2;
 const NATIVE_CTA_THREADS: u32 = 384;
-const NATIVE_TMA_BOX_ROWS: u32 = 128;
-const NATIVE_TMA_BOX_COLS: u32 = 64;
 
 /// Executes custom matrix multiplications with high-performance fused epilogues,
 /// with kernels implemented in `rust-kernels` crate. Currently only supports SM10x
@@ -114,6 +112,7 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         assert!(m > 0 && n > 0 && k > 0, "empty matmuls are unsupported");
         assert!(k.is_multiple_of(8), "K must be a multiple of 8");
         assert!(n.is_multiple_of(8), "N must be a multiple of 8");
+        assert!(m.is_multiple_of(8));
 
         let (m_u32, n_u32, k_u32) = (u32::try_from(m)?, u32::try_from(n)?, u32::try_from(k)?);
         let (raster_along_m, cga_panel_length) =
@@ -126,8 +125,14 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
 
         let mut outputs = self.config.epilogue.alloc_outputs(m, n, &self.cx)?;
         {
-            let a_tma = TensorMap::new(a.storage(), bf16_row_major_box128x64_tma_desc(m, k));
-            let b_tma = TensorMap::new(b.storage(), bf16_row_major_box128x64_tma_desc(n, k));
+            let a_tma = TensorMap::new(
+                a.storage(),
+                bf16_tma_desc(m, k, self.config.format_a == MatrixFormat::RowMajor),
+            );
+            let b_tma = TensorMap::new(
+                b.storage(),
+                bf16_tma_desc(n, k, self.config.format_b == MatrixFormat::ColumnMajor),
+            );
 
             let mut launch = stream.launch_builder(&native.kernel);
             launch
@@ -164,13 +169,22 @@ fn validate_matrix(tensor: &TensorView, rows: usize, cols: usize, format: Matrix
     }
 }
 
-fn bf16_row_major_box128x64_tma_desc(rows: usize, cols: usize) -> TensorMapDesc {
-    TensorMapDesc::new(
-        TensorMapDataType::BF16,
-        &[cols as u64, rows as u64],
-        &[cols as u64 * 2],
-        &[NATIVE_TMA_BOX_COLS, NATIVE_TMA_BOX_ROWS],
-    )
+fn bf16_tma_desc(rows: usize, cols: usize, is_k_major: bool) -> TensorMapDesc {
+    if is_k_major {
+        TensorMapDesc::new(
+            TensorMapDataType::BF16,
+            &[cols as u64, rows as u64],
+            &[cols as u64 * 2],
+            &[64, 128],
+        )
+    } else {
+        TensorMapDesc::new(
+            TensorMapDataType::BF16,
+            &[rows as u64, cols as u64],
+            &[rows as u64 * 2],
+            &[64, 64],
+        )
+    }
     .swizzle(TensorMapSwizzle::B128)
     .oob_fill(TensorMapOobFill::Zero)
 }
@@ -242,13 +256,24 @@ impl<E: Epilogue> ResourceKey for SkyMatmulConfig<E> {
     type Resource = SkyMatmulExecutor<E>;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        let native_supported = cx.cuda().compute_capability_major() == 10
-            && self.format_a == MatrixFormat::RowMajor
-            && self.format_b == MatrixFormat::ColumnMajor;
+        let native_supported = cx.cuda().compute_capability_major() == 10;
 
         let backend = if native_supported {
             let module = cx.get_or_create_resource(RustKernels)?;
-            let kernel = module.get_function(self.epilogue.native_kernel_name())?;
+
+            let a_format_suffix = match self.format_a {
+                MatrixFormat::RowMajor => "arow",
+                MatrixFormat::ColumnMajor => "acol",
+            };
+            let b_format_suffix = match self.format_b {
+                MatrixFormat::RowMajor => "brow",
+                MatrixFormat::ColumnMajor => "bcol",
+            };
+            let kernel_name = format!(
+                "{}_{a_format_suffix}_{b_format_suffix}",
+                self.epilogue.native_kernel_name()
+            );
+            let kernel = module.get_function(&kernel_name)?;
             let dynamic_smem = cx.cuda().max_dynamic_smem_per_cta();
             kernel.set_max_dynamic_smem(dynamic_smem)?;
             Backend::Native(NativeBackend {
@@ -294,7 +319,7 @@ impl Epilogue for IdentityEpilogue {
     type Outputs = Tensor;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_sm10x_128x256_2cta_64x6_arow_bcol"
+        "sky_matmul_sm10x_128x256_2cta_64x6"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
@@ -324,7 +349,7 @@ impl Epilogue for IdentityEpilogue {
         };
         builder.arg(TensorMapMut::new(
             outputs.storage_mut(),
-            bf16_row_major_box128x64_tma_desc(m, n),
+            bf16_tma_desc(m, n, true),
         ))?;
         Ok(())
     }
@@ -358,7 +383,7 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
     type Outputs = SwiGluGateTrainFwdOutputs;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1_arow_bcol"
+        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
@@ -400,17 +425,14 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         validate_matrix(x, m, n, MatrixFormat::RowMajor);
         let SwiGluGateTrainFwdOutputs { gate, activation } = outputs;
         builder
-            .arg(TensorMap::new(
-                x.storage(),
-                bf16_row_major_box128x64_tma_desc(m, n),
-            ))?
+            .arg(TensorMap::new(x.storage(), bf16_tma_desc(m, n, true)))?
             .arg(TensorMapMut::new(
                 gate.storage_mut(),
-                bf16_row_major_box128x64_tma_desc(m, n),
+                bf16_tma_desc(m, n, true),
             ))?
             .arg(TensorMapMut::new(
                 activation.storage_mut(),
-                bf16_row_major_box128x64_tma_desc(m, n),
+                bf16_tma_desc(m, n, true),
             ))?;
         Ok(())
     }

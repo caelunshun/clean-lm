@@ -9,7 +9,7 @@
 //! and thus does not use TMA multicast.
 //! It supports bf16 inputs and outputs only.
 //!
-//! A must be row-major and B must be column-major (i.e. both K-major). Outputs must be row-major.
+//! A and B can be either row- or column-major. Outputs and auxiliary inputs must be row-major.
 //!
 //! Epilogues can consume auxiliary bf16 row-major inputs and produce multiple
 //! row-major bf16 outputs. Epilogue is overlapped with MMA via accumulator double-buffering.
@@ -38,7 +38,7 @@ use cuda_device::{
         mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
         mbarrier_try_wait_parity, mbarrier_try_wait_parity_cluster,
     },
-    blockIdx_x,
+    blockIdx_x, cache_policy,
     cluster::{cluster_ctaidX, map_shared_rank},
     cooperative_groups::{ThreadGroup, this_cluster},
     float::{ex2_approx_ftz_f32, rcp_approx_ftz_f32},
@@ -217,7 +217,13 @@ fn init_barriers<const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>(
     }
 }
 
-struct State<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
+struct State<
+    'a,
+    const AB_PIPE_DEPTH: usize,
+    const EPILOGUE_PIPE_DEPTH: usize,
+    const A_K_MAJOR: bool,
+    const B_K_MAJOR: bool,
+> {
     m: u32,
     n: u32,
     k: u32,
@@ -232,8 +238,13 @@ struct State<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize> {
     b_tma: &'a TmaDescriptor,
 }
 
-impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
-    State<'a, AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH>
+impl<
+    'a,
+    const AB_PIPE_DEPTH: usize,
+    const EPILOGUE_PIPE_DEPTH: usize,
+    const A_K_MAJOR: bool,
+    const B_K_MAJOR: bool,
+> State<'a, AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH, A_K_MAJOR, B_K_MAJOR>
 {
     fn advance_to_next_tile(&mut self) -> bool {
         self.current_work_id += grid_dim_x().get() / CGA_SIZE;
@@ -317,22 +328,71 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                         let produced_bar = leader_cta_barrier(
                             &mut self.smem.barriers_mut().ab_slot_produced[slot_idx as usize],
                         );
-                        tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                            self.smem.a_staging_slot(slot_idx),
-                            self.a_tma,
-                            (k_tile_idx * TK_CTA) as i32,
-                            (self.current_cta_tm * TM_CTA) as i32,
-                            produced_bar,
-                            cta_mask,
-                        );
-                        tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
-                            self.smem.b_staging_slot(slot_idx),
-                            self.b_tma,
-                            (k_tile_idx * TK_CTA) as i32,
-                            (self.current_cta_tn * TN_CTA + self.cta_rank * TN_B_CTA) as i32,
-                            produced_bar,
-                            cta_mask,
-                        );
+
+                        if A_K_MAJOR {
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem.a_staging_slot(slot_idx),
+                                self.a_tma,
+                                (k_tile_idx * TK_CTA) as i32,
+                                (self.current_cta_tm * TM_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                        } else {
+                            // A is M-major. Split our 128x64 tile into two panels, each 64x64,
+                            // packed next to each other.
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem.a_staging_slot(slot_idx),
+                                self.a_tma,
+                                (self.current_cta_tm * TM_CTA) as i32,
+                                (k_tile_idx * TK_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem
+                                    .a_staging_slot(slot_idx)
+                                    .add(64 * 64 * size_of::<bf16>()),
+                                self.a_tma,
+                                (self.current_cta_tm * TM_CTA + 64) as i32,
+                                (k_tile_idx * TK_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                        }
+
+                        if B_K_MAJOR {
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem.b_staging_slot(slot_idx),
+                                self.b_tma,
+                                (k_tile_idx * TK_CTA) as i32,
+                                (self.current_cta_tn * TN_CTA + self.cta_rank * TN_B_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                        } else {
+                            // B is N-major. Split our 64x128 tile into two panels, each 64x64,
+                            // packed next to each other.
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem.b_staging_slot(slot_idx),
+                                self.b_tma,
+                                (self.current_cta_tn * TN_CTA + self.cta_rank * TN_B_CTA) as i32,
+                                (k_tile_idx * TK_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                            tma::cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                                self.smem
+                                    .b_staging_slot(slot_idx)
+                                    .add(64 * 64 * size_of::<bf16>()),
+                                self.b_tma,
+                                (self.current_cta_tn * TN_CTA + self.cta_rank * TN_B_CTA + 64)
+                                    as i32,
+                                (k_tile_idx * TK_CTA) as i32,
+                                produced_bar,
+                                cta_mask,
+                            );
+                        }
 
                         slot_idx = (slot_idx + 1) % AB_PIPE_DEPTH as u32;
                         if slot_idx == 0 {
@@ -383,21 +443,43 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                         for k_subtile_idx in 0..(TK_CTA / TK_MMA) {
                             let k_offset =
                                 (k_subtile_idx * TK_MMA * size_of::<bf16>() as u32) as u64;
-                            let a_smem_desc = Tcgen05SmemDescriptorBuilder::new()
-                                .address(a_smem_addr + k_offset)
-                                .base_offset(0)
-                                .swizzle(Tcgen05SwizzleMode::Swizzle128B)
-                                .stride_bytes(8 * 128)
-                                .build();
-                            let b_smem_desc = Tcgen05SmemDescriptorBuilder::new()
-                                .address(b_smem_addr + k_offset)
-                                .base_offset(0)
-                                .swizzle(Tcgen05SwizzleMode::Swizzle128B)
-                                .stride_bytes(8 * 128)
-                                .build();
+                            let a_smem_desc = if A_K_MAJOR {
+                                Tcgen05SmemDescriptorBuilder::new()
+                                    .address(a_smem_addr + k_offset)
+                                    .base_offset(0)
+                                    .swizzle(Tcgen05SwizzleMode::Swizzle128B)
+                                    .stride_bytes(8 * 128)
+                                    .build()
+                            } else {
+                                Tcgen05SmemDescriptorBuilder::new()
+                                    .address(a_smem_addr + k_offset * 64)
+                                    .base_offset(0)
+                                    .swizzle(Tcgen05SwizzleMode::Swizzle128B)
+                                    .stride_bytes(128 * 8)
+                                    .leading_dim_bytes((64 * 64 * size_of::<bf16>()) as u32)
+                                    .build()
+                            };
+                            let b_smem_desc = if B_K_MAJOR {
+                                Tcgen05SmemDescriptorBuilder::new()
+                                    .address(b_smem_addr + k_offset)
+                                    .base_offset(0)
+                                    .swizzle(Tcgen05SwizzleMode::Swizzle128B)
+                                    .stride_bytes(8 * 128)
+                                    .build()
+                            } else {
+                                Tcgen05SmemDescriptorBuilder::new()
+                                    .address(b_smem_addr + k_offset * 64)
+                                    .base_offset(0)
+                                    .swizzle(Tcgen05SwizzleMode::Swizzle128B)
+                                    .stride_bytes(128 * 8)
+                                    .leading_dim_bytes((64 * 64 * size_of::<bf16>()) as u32)
+                                    .build()
+                            };
                             let instr_desc = Tcgen05InstructionDescriptorBuilder::new()
                                 .a_type(Tcgen05ElementType::BF16)
                                 .b_type(Tcgen05ElementType::BF16)
+                                .transpose_a(!A_K_MAJOR)
+                                .transpose_b(!B_K_MAJOR)
                                 .accumulator_type(Tcgen05AccumulatorType::F32)
                                 .m(TM_CGA)
                                 .n(TN_CGA)
@@ -495,13 +577,17 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                                 1,
                                 bytes,
                             );
-                            tma::cp_async_bulk_tensor_2d_g2s(
+
+                            // We expect that auxiliary inputs likely won't be re-accessed soon.
+                            let cache_hint = cache_policy::createpolicy_fractional_evict_first(1.0);
+                            tma::cp_async_bulk_tensor_2d_g2s_cache_hint(
                                 self.smem.epi_load_staging_slot(epi_slot_idx),
                                 aux_input,
                                 (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
                                 (self.current_cta_tm * TM_CTA) as i32,
                                 &mut self.smem.barriers_mut().epi_load_slot_produced
                                     [epi_slot_idx as usize],
+                                cache_hint,
                             );
 
                             epi_slot_idx = (epi_slot_idx + 1) % EPILOGUE_PIPE_DEPTH as u32;
@@ -562,7 +648,9 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
 
                     let mut write_output =
                         #[inline(always)]
-                        |thr_row: &[f32; EPI_ELEMENTS_PER_THREAD], tma_desc: &TmaDescriptor| {
+                        |thr_row: &[f32; EPI_ELEMENTS_PER_THREAD],
+                         tma_desc: &TmaDescriptor,
+                         cache_hint: CacheHint| {
                             // Convert to bf16.
                             let mut thr_row_bf16 = [bf16x2::ZERO; EPI_ELEMENTS_PER_THREAD / 2];
                             #[llvm_unroll]
@@ -597,11 +685,12 @@ impl<'a, const AB_PIPE_DEPTH: usize, const EPILOGUE_PIPE_DEPTH: usize>
                             barrier_cta_sync(EPILOGUE_HELPER_BARRIER_ID, 256);
 
                             if warp_id() == 4 && lane_id() == 0 {
-                                tma::cp_async_bulk_tensor_2d_s2g(
+                                tma::cp_async_bulk_tensor_2d_s2g_cache_hint(
                                     smem.cast(),
                                     tma_desc,
                                     (self.current_cta_tn * TN_CTA + subtile_n * TN_EPI) as i32,
                                     (self.current_cta_tm * TM_CTA) as i32,
+                                    cache_hint,
                                 );
                                 tma::cp_async_bulk_commit_group();
                             }
@@ -693,15 +782,17 @@ trait Epilogue<'a> {
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     );
 
     fn visit_aux_input(
         &mut self,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     );
 }
+
+type CacheHint = u64;
 
 struct IdentityEpilogue<'a> {
     out_tma: &'a TmaDescriptor,
@@ -719,16 +810,20 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
-        write_output(&result, self.out_tma);
+        write_output(
+            &result,
+            self.out_tma,
+            cache_policy::createpolicy_fractional_evict_unchanged(1.0),
+        );
     }
 
     #[inline(always)]
     fn visit_aux_input(
         &mut self,
         _aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        _write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
         unreachable!()
     }
@@ -758,9 +853,12 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
     fn visit_mma_result(
         &mut self,
         result: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
-        write_output(&result, self.g_desc);
+        // This output won't be accessed again until the backward pass,
+        // so no reason to keep it in L2.
+        let cache_hint = cache_policy::createpolicy_fractional_evict_first(1.0);
+        write_output(&result, self.g_desc, cache_hint);
 
         // Apply SiLU
         #[llvm_unroll]
@@ -775,14 +873,15 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
     fn visit_aux_input(
         &mut self,
         aux_data: [f32; EPI_ELEMENTS_PER_THREAD],
-        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor),
+        mut write_output: impl FnMut(&[f32; EPI_ELEMENTS_PER_THREAD], &TmaDescriptor, CacheHint),
     ) {
         // Apply Hadamard product
         #[llvm_unroll]
         for i in 0..EPI_ELEMENTS_PER_THREAD {
             self.vals[i] *= aux_data[i];
         }
-        write_output(&self.vals, self.y_desc);
+        let cache_hint = cache_policy::createpolicy_fractional_evict_unchanged(1.0);
+        write_output(&self.vals, self.y_desc, cache_hint);
     }
 }
 
@@ -794,6 +893,8 @@ fn kernel_template<
     E: Epilogue<'a>,
     const AB_PIPE_DEPTH: usize,
     const EPILOGUE_PIPE_DEPTH: usize,
+    const A_K_MAJOR: bool,
+    const B_K_MAJOR: bool,
 >(
     m: u32,
     n: u32,
@@ -826,7 +927,7 @@ fn kernel_template<
         this_cluster().sync();
         tcgen05_fence_after_thread_sync();
 
-        let mut state = State {
+        let mut state = State::<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH, A_K_MAJOR, B_K_MAJOR> {
             m,
             n,
             k,
@@ -873,59 +974,96 @@ fn kernel_template<
     }
 }
 
-#[kernel]
-#[launch_bounds(384, 1)]
-#[cluster_launch(2, 1, 1)]
-pub fn sky_matmul_sm10x_128x256_2cta_64x6_arow_bcol(
-    m: u32,
-    n: u32,
-    k: u32,
-    raster_along_m: bool,
-    cga_panel_length: u32,
-    #[grid_constant] a_tma: &TmaDescriptor,
-    #[grid_constant] b_tma: &TmaDescriptor,
-    #[grid_constant] out_tma: &TmaDescriptor,
-) {
-    kernel_template::<_, 6, 1>(
-        m,
-        n,
-        k,
-        raster_along_m,
-        cga_panel_length,
-        a_tma,
-        b_tma,
-        IdentityEpilogue { out_tma },
-    );
+macro_rules! kernel_variant {
+    (
+        $name_base:ident $name_suffix:ident($($(#[$attr:tt])? $arg_i:ident: $arg_t:ty),* $(,)?),
+        epilogue = $epilogue:expr,
+        AB_PIPE_DEPTH = $ab_pipe_depth:literal,
+        EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth:literal,
+        A_K_MAJOR = $a_k_major:literal,
+        B_K_MAJOR = $b_k_major:literal
+        $(,)?
+    ) => {
+        pastey::paste! {
+            #[kernel]
+            #[launch_bounds(384, 1)]
+            #[cluster_launch(2, 1, 1)]
+            pub fn [< $name_base _ $name_suffix >](m: u32, n: u32, k: u32, raster_along_m: bool, cga_panel_length: u32, #[grid_constant] a_tma: &TmaDescriptor,
+                    #[grid_constant] b_tma: &TmaDescriptor, $($(#[$attr])? $arg_i: &$arg_t),*) {
+                kernel_template::<_, $ab_pipe_depth, $epilogue_pipe_depth, $a_k_major, $b_k_major>(
+                    m,
+                    n,
+                    k,
+                    raster_along_m,
+                    cga_panel_length,
+                    a_tma,
+                    b_tma,
+                    $epilogue
+                );
+            }
+        }
+    };
 }
 
-#[kernel]
-#[launch_bounds(384, 1)]
-#[cluster_launch(2, 1, 1)]
-pub fn sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1_arow_bcol(
-    m: u32,
-    n: u32,
-    k: u32,
-    raster_along_m: bool,
-    cga_panel_length: u32,
-    #[grid_constant] a_tma: &TmaDescriptor,
-    #[grid_constant] b_tma: &TmaDescriptor,
-    #[grid_constant] x_tma: &TmaDescriptor,
-    #[grid_constant] g_tma: &TmaDescriptor,
-    #[grid_constant] y_tma: &TmaDescriptor,
-) {
-    kernel_template::<_, 6, 1>(
-        m,
-        n,
-        k,
-        raster_along_m,
-        cga_panel_length,
-        a_tma,
-        b_tma,
-        SwiGluGateTrainFwdEpilogue {
-            x_desc: x_tma,
-            g_desc: g_tma,
-            y_desc: y_tma,
-            vals: [0.0; EPI_ELEMENTS_PER_THREAD],
-        },
-    );
+macro_rules! kernel_with_variants {
+    (
+        $name_base:ident($($(#[$attr:tt])? $arg_i:ident: $arg_t:ty),* $(,)?),
+        epilogue = $epilogue:expr,
+        AB_PIPE_DEPTH = $ab_pipe_depth:literal,
+        EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth:literal
+        $(,)?
+    ) => {
+        kernel_variant! {
+            $name_base arow_brow($($(#[$attr])? $arg_i: $arg_t),*),
+            epilogue = $epilogue,
+            AB_PIPE_DEPTH = $ab_pipe_depth,
+            EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth,
+            A_K_MAJOR = true,
+            B_K_MAJOR = false
+        }
+        kernel_variant! {
+            $name_base arow_bcol($($(#[$attr])? $arg_i: $arg_t),*),
+            epilogue = $epilogue,
+            AB_PIPE_DEPTH = $ab_pipe_depth,
+            EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth,
+            A_K_MAJOR = true,
+            B_K_MAJOR = true
+        }
+        kernel_variant! {
+            $name_base acol_brow($($(#[$attr])? $arg_i: $arg_t),*),
+            epilogue = $epilogue,
+            AB_PIPE_DEPTH = $ab_pipe_depth,
+            EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth,
+            A_K_MAJOR = false,
+            B_K_MAJOR = false
+        }
+        kernel_variant! {
+            $name_base acol_bcol($($(#[$attr])? $arg_i: $arg_t),*),
+            epilogue = $epilogue,
+            AB_PIPE_DEPTH = $ab_pipe_depth,
+            EPILOGUE_PIPE_DEPTH = $epilogue_pipe_depth,
+            A_K_MAJOR = false,
+            B_K_MAJOR = true
+        }
+    };
+}
+
+kernel_with_variants! {
+    sky_matmul_sm10x_128x256_2cta_64x6(
+        #[grid_constant] out_tma: TmaDescriptor
+    ),
+    epilogue = IdentityEpilogue { out_tma },
+    AB_PIPE_DEPTH = 6,
+    EPILOGUE_PIPE_DEPTH = 1
+}
+
+kernel_with_variants! {
+    sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1(
+        #[grid_constant] x_tma: TmaDescriptor,
+        #[grid_constant] g_tma: TmaDescriptor,
+        #[grid_constant] y_tma: TmaDescriptor,
+    ),
+    epilogue = SwiGluGateTrainFwdEpilogue { x_desc: x_tma, g_desc: g_tma, y_desc: y_tma, vals: [0.0; EPI_ELEMENTS_PER_THREAD] },
+    AB_PIPE_DEPTH = 6,
+    EPILOGUE_PIPE_DEPTH = 1
 }
