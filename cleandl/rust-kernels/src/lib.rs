@@ -26,8 +26,8 @@ use cuda_device::{
 };
 use cuda_macros::device;
 
-pub mod matmul;
 pub mod norm;
+pub mod sky_matmul;
 
 const WARP_SIZE: u32 = 32;
 

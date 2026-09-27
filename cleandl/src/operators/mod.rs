@@ -8,4 +8,5 @@ pub mod loss;
 pub mod matmul;
 pub mod norm;
 pub mod rope;
+pub mod sky_matmul;
 pub mod swiglu_ffn;
