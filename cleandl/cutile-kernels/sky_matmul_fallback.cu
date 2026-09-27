@@ -26,7 +26,7 @@ extern "C" __tile_global__ void swiglu_gate_train_fwd_bf16_4096(
     auto gate_tile = ct::element_cast<float>(gate_view.load_masked(ct::bid().x));
 
     auto silu = ct::div(
-        x_tile,
+        gate_tile,
         1.0f + ct::exp(-gate_tile, ct::round_approximate_t{}),
         ct::round_approximate_t{},
         ct::round_subnormals_to_zero_t{});

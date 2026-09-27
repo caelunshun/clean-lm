@@ -14,6 +14,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     context::{Context, ResourceKey},
+    include_cubins,
     kernel::RustKernels,
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
     tensor::{Tensor, TensorView},
@@ -76,15 +77,13 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
                 self.execute_native(native, a, b, m, n, k, epilogue_args, stream)
             }
             Backend::Fallback { matmul, epilogue } => {
-                let mut product = matmul.matmul(a, b, None, stream)?;
-                let Some(epilogue_kernel) = epilogue else {
-                    return Ok(self.config.epilogue.fallback_outputs_from_product(product));
-                };
-
-                let mut outputs = self.config.epilogue.alloc_outputs(m, n, &self.cx)?;
-                {
+                let product = matmul.matmul(a, b, None, stream)?;
+                let mut outputs = self
+                    .config
+                    .epilogue
+                    .alloc_fallback_outputs(product, &self.cx)?;
+                if let Some(epilogue_kernel) = epilogue {
                     let mut launch = stream.launch_builder(epilogue_kernel);
-                    launch.arg(product.storage_mut())?;
                     let (grid_x, grid_y, grid_z) =
                         self.config.epilogue.pass_args_to_fallback_epilogue_kernel(
                             epilogue_args,
@@ -201,9 +200,14 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs>;
     #[doc(hidden)]
     fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>>;
-    /// Used instead of the fallback epilogue kernel when there is no fallback epilogue kernel.
+    /// Allocates the fallback outputs, possibly reusing the row-major `[m, n]` bf16
+    /// matmul product. The outputs are returned as-is if there is no fallback epilogue kernel.
     #[doc(hidden)]
-    fn fallback_outputs_from_product(&self, product: Tensor) -> Self::Outputs;
+    fn alloc_fallback_outputs(
+        &self,
+        product: Tensor,
+        cx: &Context,
+    ) -> anyhow::Result<Self::Outputs>;
     /// Called after the common arguments (m, n, k, raster params, A/B descriptors)
     /// have been passed.
     #[doc(hidden)]
@@ -213,8 +217,8 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
         outputs: &'b mut Self::Outputs,
         builder: &mut LaunchBuilder<'b>,
     ) -> anyhow::Result<()>;
-    /// Called after the row-major `[m, n]` bf16 matmul product has been passed
-    /// as the first argument. Must set the block size and return the grid size
+    /// Must pass all kernel arguments (the matmul product is held in `outputs`),
+    /// set the block size if needed, and return the grid size.
     #[doc(hidden)]
     fn pass_args_to_fallback_epilogue_kernel<'a: 'b, 'b>(
         &self,
@@ -301,8 +305,12 @@ impl Epilogue for IdentityEpilogue {
         Ok(None)
     }
 
-    fn fallback_outputs_from_product(&self, product: Tensor) -> Self::Outputs {
-        product
+    fn alloc_fallback_outputs(
+        &self,
+        product: Tensor,
+        _cx: &Context,
+    ) -> anyhow::Result<Self::Outputs> {
+        Ok(product)
     }
 
     fn pass_args_to_native_kernel<'a: 'b, 'b>(
@@ -328,6 +336,103 @@ impl Epilogue for IdentityEpilogue {
         _builder: &mut LaunchBuilder<'b>,
     ) -> anyhow::Result<(u32, u32, u32)> {
         unreachable!()
+    }
+}
+
+/// SwiGLU gate projection for the training forward pass. Outputs the pre-activation
+/// gate `G = A @ B` and the activation `Y = swish(G) * X`, where `X` is the result of up-projection.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwiGluGateTrainFwdEpilogue;
+
+#[derive(Debug)]
+pub struct SwiGluGateTrainFwdOutputs {
+    /// Gate projection, before the activation.
+    pub gate: Tensor,
+    /// `swish(gate) * x`.
+    pub activation: Tensor,
+}
+
+impl Epilogue for SwiGluGateTrainFwdEpilogue {
+    /// The up projection `x`, a packed row-major bf16 `[m, n]` tensor.
+    type Args<'a> = &'a TensorView<'a>;
+    type Outputs = SwiGluGateTrainFwdOutputs;
+
+    fn native_kernel_name(&self) -> &'static str {
+        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1_arow_bcol"
+    }
+
+    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
+        Ok(SwiGluGateTrainFwdOutputs {
+            gate: Tensor::new_zeroed([m, n], BF16, cx)?,
+            activation: Tensor::new_zeroed([m, n], BF16, cx)?,
+        })
+    }
+
+    fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>> {
+        let module =
+            cx.get_or_create_resource(include_cubins!("../../cutile-kernels/sky_matmul_fallback"))?;
+        Ok(Some(
+            module.get_function("swiglu_gate_train_fwd_bf16_4096")?,
+        ))
+    }
+
+    fn alloc_fallback_outputs(
+        &self,
+        product: Tensor,
+        cx: &Context,
+    ) -> anyhow::Result<Self::Outputs> {
+        let activation = Tensor::new_zeroed(product.shape(), BF16, cx)?;
+        Ok(SwiGluGateTrainFwdOutputs {
+            gate: product,
+            activation,
+        })
+    }
+
+    fn pass_args_to_native_kernel<'a: 'b, 'b>(
+        &self,
+        x: Self::Args<'a>,
+        outputs: &'b mut Self::Outputs,
+        builder: &mut LaunchBuilder<'b>,
+    ) -> anyhow::Result<()> {
+        let &[m, n] = outputs.gate.shape().dims_slice() else {
+            unreachable!()
+        };
+        validate_matrix(x, m, n, MatrixFormat::RowMajor);
+        let SwiGluGateTrainFwdOutputs { gate, activation } = outputs;
+        builder
+            .arg(TensorMap::new(
+                x.storage(),
+                bf16_row_major_box128x64_tma_desc(m, n),
+            ))?
+            .arg(TensorMapMut::new(
+                gate.storage_mut(),
+                bf16_row_major_box128x64_tma_desc(m, n),
+            ))?
+            .arg(TensorMapMut::new(
+                activation.storage_mut(),
+                bf16_row_major_box128x64_tma_desc(m, n),
+            ))?;
+        Ok(())
+    }
+
+    fn pass_args_to_fallback_epilogue_kernel<'a: 'b, 'b>(
+        &self,
+        x: Self::Args<'a>,
+        outputs: &'b mut Self::Outputs,
+        builder: &mut LaunchBuilder<'b>,
+    ) -> anyhow::Result<(u32, u32, u32)> {
+        let &[m, n] = outputs.gate.shape().dims_slice() else {
+            unreachable!()
+        };
+        validate_matrix(x, m, n, MatrixFormat::RowMajor);
+        let count = m * n;
+        let SwiGluGateTrainFwdOutputs { gate, activation } = outputs;
+        builder
+            .arg(x.storage())?
+            .arg(gate.storage())?
+            .arg(activation.storage_mut())?
+            .arg(u32::try_from(count)?)?;
+        Ok((u32::try_from(count.div_ceil(4096))?, 1, 1))
     }
 }
 
