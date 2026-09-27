@@ -738,11 +738,11 @@ fn kernel_template<
         let role = warp_role();
         match role {
             WarpRole::Epilogue => {
-                setmaxnreg_inc::<232>();
+                setmaxnreg_inc::<224>();
                 state.run_epi_warps(epilogue);
             }
             _ => {
-                setmaxnreg_dec::<32>();
+                setmaxnreg_dec::<48>();
                 match role {
                     WarpRole::AbTmaLoad => {
                         state.run_ab_load_warp();
