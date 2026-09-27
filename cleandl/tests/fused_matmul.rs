@@ -1,13 +1,15 @@
 use cleandl::{
     context::Context,
     cudnn::CudnnGraphBuilder,
+    par_random::par_vec_from_distr,
     tensor::{Tensor, VirtTensorView},
 };
-use faer::Mat;
+use faer::MatRef;
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
@@ -47,12 +49,12 @@ fn fused_matmul() -> anyhow::Result<()> {
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (K as f32).sqrt().recip();
-    let a_host: Vec<bf16> = (0..M_ACTUAL * K)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
-        .collect();
-    let b_host: Vec<bf16> = (0..K * N)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-        .collect();
+    let a_host = par_vec_from_distr(
+        StandardNormal.map(|x: f32| bf16::from_f32(x * scale)),
+        M_ACTUAL * K,
+        &mut rng,
+    );
+    let b_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), K * N, &mut rng);
 
     cx.upload_to_device(&a_host, a.storage_mut(), &stream)?;
     cx.upload_to_device(&b_host, b.storage_mut(), &stream)?;
@@ -92,33 +94,43 @@ fn fused_matmul() -> anyhow::Result<()> {
     stream.block_on()?;
     let c_host: &[bf16] = bytemuck::cast_slice(c_staging.view()?);
 
-    let a_ref = Mat::from_fn(M_ACTUAL, K, |i, j| a_host[i * K + j].to_f32());
-    let b_ref = Mat::from_fn(K, N, |i, j| b_host[i * N + j].to_f32());
+    let a_f32 = to_f32(&a_host);
+    let b_f32 = to_f32(&b_host);
+    let a_ref = MatRef::from_row_major_slice(&a_f32, M_ACTUAL, K);
+    let b_ref = MatRef::from_row_major_slice(&b_f32, K, N);
     let c_ref = a_ref * b_ref;
 
-    let mut max_error = 0.0f32;
-    for i in 0..M_ACTUAL {
-        for j in 0..N {
-            let expected = swish(c_ref[(i, j)]);
-            let actual = c_host[i * N + j].to_f32();
-            assert!(actual.is_finite());
+    let max_error = (0..M_ACTUAL * N)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_error, idx| -> anyhow::Result<f32> {
+                let (i, j) = (idx / N, idx % N);
+                let expected = swish(c_ref[(i, j)]);
+                let actual = c_host[idx].to_f32();
+                assert!(actual.is_finite());
 
-            max_error = max_error.max((actual - expected).abs());
+                let margin = F32Margin {
+                    epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
+                    ulps: 0,
+                };
+                anyhow::ensure!(
+                    actual.approx_eq(expected, margin),
+                    "mismatch at ({i}, {j}): expected {expected}, got {actual}"
+                );
 
-            let margin = F32Margin {
-                epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
-                ulps: 0,
-            };
-            anyhow::ensure!(
-                actual.approx_eq(expected, margin),
-                "mismatch at ({i}, {j}): expected {expected}, got {actual}"
-            );
-        }
-    }
+                Ok(max_error.max((actual - expected).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))?;
 
     println!("results match the reference (max absolute error: {max_error})");
 
     Ok(())
+}
+
+fn to_f32(data: &[bf16]) -> Vec<f32> {
+    data.par_iter().map(|x| x.to_f32()).collect()
 }
 
 /// Swish (SiLU) activation: `x * sigmoid(x)`.

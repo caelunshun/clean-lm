@@ -4,12 +4,14 @@ use cleandl::{
         AttentionBackwardOutput, AttentionConfig, AttentionExecutor, AttentionForwardOutput,
         RaggedSeqlenTensors,
     },
+    par_random::par_vec_from_distr,
     tensor::Tensor,
 };
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
@@ -67,20 +69,23 @@ fn attention() -> anyhow::Result<()> {
 
     let mut rng = StdRng::seed_from_u64(555);
     let mut sample = |count: usize| -> Vec<bf16> {
-        (0..count)
-            .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-            .collect()
+        par_vec_from_distr(StandardNormal.map(bf16::from_f32), count, &mut rng)
     };
     let q_host = sample(total_tokens * Q_HEADS * HEAD_DIM);
     let k_host = sample(total_tokens * KV_HEADS * HEAD_DIM);
     let v_host = sample(total_tokens * KV_HEADS * HEAD_DIM);
 
-    let mut qkv_host = Vec::with_capacity(total_tokens * PACKED_HEADS * HEAD_DIM);
-    for token in 0..total_tokens {
-        qkv_host.extend_from_slice(&q_host[token * Q_HEADS * HEAD_DIM..][..Q_HEADS * HEAD_DIM]);
-        qkv_host.extend_from_slice(&k_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
-        qkv_host.extend_from_slice(&v_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
-    }
+    let mut qkv_host = vec![bf16::ZERO; total_tokens * PACKED_HEADS * HEAD_DIM];
+    qkv_host
+        .par_chunks_mut(PACKED_HEADS * HEAD_DIM)
+        .enumerate()
+        .for_each(|(token, row)| {
+            let (q, kv) = row.split_at_mut(Q_HEADS * HEAD_DIM);
+            let (k, v) = kv.split_at_mut(KV_HEADS * HEAD_DIM);
+            q.copy_from_slice(&q_host[token * Q_HEADS * HEAD_DIM..][..Q_HEADS * HEAD_DIM]);
+            k.copy_from_slice(&k_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
+            v.copy_from_slice(&v_host[token * KV_HEADS * HEAD_DIM..][..KV_HEADS * HEAD_DIM]);
+        });
     cx.upload_to_device(&qkv_host, qkv.storage_mut(), &stream)?;
 
     // Cumulative sequence offsets, in tokens.
@@ -102,16 +107,17 @@ fn attention() -> anyhow::Result<()> {
 
     let expected = reference_attention(&q_host, &k_host, &v_host, &cu_seqlens_host);
 
-    let mut max_error = 0.0f32;
-    for token_idx in 0..total_tokens {
-        for head in 0..Q_HEADS {
-            for d in 0..HEAD_DIM {
-                let idx = (token_idx * Q_HEADS + head) * HEAD_DIM + d;
+    let max_error = (0..total_tokens * Q_HEADS * HEAD_DIM)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_error, idx| -> anyhow::Result<f32> {
+                let token_idx = idx / (Q_HEADS * HEAD_DIM);
+                let head = idx / HEAD_DIM % Q_HEADS;
+                let d = idx % HEAD_DIM;
                 let expected = expected[idx];
                 assert!(out_host[idx].is_finite());
                 let actual = out_host[idx].to_f32();
-
-                max_error = max_error.max((actual - expected).abs());
 
                 let margin = F32Margin {
                     epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
@@ -122,9 +128,11 @@ fn attention() -> anyhow::Result<()> {
                     "mismatch at token {token_idx}, head {head}, dim {d}: \
                      expected {expected}, got {actual}"
                 );
-            }
-        }
-    }
+
+                Ok(max_error.max((actual - expected).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))?;
 
     println!("results match the reference (max absolute error: {max_error})");
 
@@ -152,14 +160,15 @@ fn attention() -> anyhow::Result<()> {
         ("dk", Q_HEADS..Q_HEADS + KV_HEADS),
         ("dv", Q_HEADS + KV_HEADS..PACKED_HEADS),
     ] {
-        let mut any_nonzero = false;
-        for token in 0..total_tokens {
-            for head in head_range.clone() {
+        let any_nonzero = (0..total_tokens)
+            .into_par_iter()
+            .flat_map_iter(|token| head_range.clone().map(move |head| (token, head)))
+            .map(|(token, head)| {
                 let row = &dqkv_host[(token * PACKED_HEADS + head) * HEAD_DIM..][..HEAD_DIM];
                 assert!(row.iter().all(|x| x.is_finite()), "{name} not finite");
-                any_nonzero |= row.iter().any(|x| x.to_f32() != 0.0);
-            }
-        }
+                row.iter().any(|x| x.to_f32() != 0.0)
+            })
+            .reduce(|| false, |a, b| a || b);
         assert!(any_nonzero, "{name} was never written");
     }
 
@@ -173,43 +182,43 @@ fn reference_attention(q: &[bf16], k: &[bf16], v: &[bf16], cu_seqlens: &[i64]) -
     let scale = (HEAD_DIM as f32).sqrt().recip();
     let group_size = Q_HEADS / KV_HEADS;
 
-    for seq in 0..cu_seqlens.len() - 1 {
-        let base = cu_seqlens[seq] as usize;
-        let seqlen = cu_seqlens[seq + 1] as usize - base;
-
-        for head in 0..Q_HEADS {
+    out.par_chunks_mut(HEAD_DIM)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            let token = row / Q_HEADS;
+            let head = row % Q_HEADS;
             let kv_head = head / group_size;
 
-            for i in 0..seqlen {
-                let q_offset = ((base + i) * Q_HEADS + head) * HEAD_DIM;
+            let seq = cu_seqlens.partition_point(|&offset| offset as usize <= token) - 1;
+            let base = cu_seqlens[seq] as usize;
+            let i = token - base;
 
-                let mut scores = vec![0.0f32; i + 1];
-                for (j, score) in scores.iter_mut().enumerate() {
-                    let k_offset = ((base + j) * KV_HEADS + kv_head) * HEAD_DIM;
-                    let dot: f32 = (0..HEAD_DIM)
-                        .map(|d| q[q_offset + d].to_f32() * k[k_offset + d].to_f32())
-                        .sum();
-                    *score = dot * scale;
-                }
+            let q_offset = row * HEAD_DIM;
 
-                let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum_exp = 0.0f32;
-                for score in &mut scores {
-                    *score = (*score - max_score).exp();
-                    sum_exp += *score;
-                }
+            let mut scores = vec![0.0f32; i + 1];
+            for (j, score) in scores.iter_mut().enumerate() {
+                let k_offset = ((base + j) * KV_HEADS + kv_head) * HEAD_DIM;
+                let dot: f32 = (0..HEAD_DIM)
+                    .map(|d| q[q_offset + d].to_f32() * k[k_offset + d].to_f32())
+                    .sum();
+                *score = dot * scale;
+            }
 
-                let out_offset = q_offset;
-                for (j, weight) in scores.iter().enumerate() {
-                    let weight = weight / sum_exp;
-                    let v_offset = ((base + j) * KV_HEADS + kv_head) * HEAD_DIM;
-                    for d in 0..HEAD_DIM {
-                        out[out_offset + d] += weight * v[v_offset + d].to_f32();
-                    }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max_score).exp();
+                sum_exp += *score;
+            }
+
+            for (j, weight) in scores.iter().enumerate() {
+                let weight = weight / sum_exp;
+                let v_offset = ((base + j) * KV_HEADS + kv_head) * HEAD_DIM;
+                for d in 0..HEAD_DIM {
+                    out_row[d] += weight * v[v_offset + d].to_f32();
                 }
             }
-        }
-    }
+        });
 
     out
 }

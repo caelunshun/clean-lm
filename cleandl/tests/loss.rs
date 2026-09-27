@@ -1,12 +1,14 @@
 use cleandl::{
     context::Context,
     operators::loss::{CrossEntropyLossOutput, LossExecutor},
+    par_random::par_vec_from_distr,
     tensor::Tensor,
 };
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
@@ -51,9 +53,11 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     )?;
 
     let mut rng = StdRng::seed_from_u64(0x105);
-    let logits_host: Vec<bf16> = (0..BATCH_SIZE * NUM_CLASSES)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * 3.0))
-        .collect();
+    let logits_host = par_vec_from_distr(
+        StandardNormal.map(|x: f32| bf16::from_f32(x * 3.0)),
+        BATCH_SIZE * NUM_CLASSES,
+        &mut rng,
+    );
     let labels_host: Vec<i32> = (0..BATCH_SIZE)
         .map(|_| rng.random_range(0..NUM_CLASSES as i32))
         .collect();
@@ -93,29 +97,34 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
             Ok(())
         };
 
-    for i in 0..BATCH_SIZE {
+    (0..BATCH_SIZE).into_par_iter().try_for_each(|i| {
         check(
             "logsumexp",
             i,
             stats_out[i],
             expected.stats[i],
             STATS_REL_TOLERANCE,
-        )?;
-    }
+        )
+    })?;
 
-    let mut max_grad_error = 0.0f32;
-    for i in 0..BATCH_SIZE * NUM_CLASSES {
-        let actual = grad_out[i].to_f32();
-        assert!(actual.is_finite());
-        max_grad_error = max_grad_error.max((actual - expected.grad[i]).abs());
-        check(
-            "logits_grad",
-            i,
-            actual,
-            expected.grad[i],
-            GRAD_REL_TOLERANCE,
-        )?;
-    }
+    let max_grad_error = (0..BATCH_SIZE * NUM_CLASSES)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_grad_error, i| -> anyhow::Result<f32> {
+                let actual = grad_out[i].to_f32();
+                assert!(actual.is_finite());
+                check(
+                    "logits_grad",
+                    i,
+                    actual,
+                    expected.grad[i],
+                    GRAD_REL_TOLERANCE,
+                )?;
+                Ok(max_grad_error.max((actual - expected.grad[i]).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))?;
 
     check("loss", 0, loss_out, expected.loss, LOSS_REL_TOLERANCE)?;
 
@@ -133,34 +142,37 @@ struct Reference {
 }
 
 fn reference_loss(logits: &[bf16], labels: &[i32]) -> Reference {
-    let mut out = Reference {
-        stats: Vec::with_capacity(BATCH_SIZE),
-        loss: 0.0,
-        grad: vec![0.0; BATCH_SIZE * NUM_CLASSES],
-    };
+    let mut grad = vec![0.0; BATCH_SIZE * NUM_CLASSES];
 
-    let mut loss_sum = 0.0f64;
-    for row in 0..BATCH_SIZE {
-        let row_logits: Vec<f32> = logits[row * NUM_CLASSES..(row + 1) * NUM_CLASSES]
-            .iter()
-            .map(|x| x.to_f32())
-            .collect();
+    let (stats, row_losses): (Vec<f32>, Vec<f64>) = grad
+        .par_chunks_mut(NUM_CLASSES)
+        .enumerate()
+        .map(|(row, row_grad)| {
+            let row_logits: Vec<f32> = logits[row * NUM_CLASSES..(row + 1) * NUM_CLASSES]
+                .iter()
+                .map(|x| x.to_f32())
+                .collect();
 
-        let max = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f64 = row_logits.iter().map(|&x| ((x - max) as f64).exp()).sum();
-        let logsumexp = max + (sum_exp as f32).ln();
-        out.stats.push(logsumexp);
+            let max = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f64 = row_logits.iter().map(|&x| ((x - max) as f64).exp()).sum();
+            let logsumexp = max + (sum_exp as f32).ln();
 
-        let label = labels[row] as usize;
-        loss_sum += -(row_logits[label] - logsumexp) as f64;
+            let label = labels[row] as usize;
+            let row_loss = -(row_logits[label] - logsumexp) as f64;
 
-        for class in 0..NUM_CLASSES {
-            let prob = (row_logits[class] - logsumexp).exp();
-            let target = f32::from(class == label);
-            out.grad[row * NUM_CLASSES + class] = (prob - target) / BATCH_SIZE as f32;
-        }
+            for (class, grad) in row_grad.iter_mut().enumerate() {
+                let prob = (row_logits[class] - logsumexp).exp();
+                let target = f32::from(class == label);
+                *grad = (prob - target) / BATCH_SIZE as f32;
+            }
+
+            (logsumexp, row_loss)
+        })
+        .unzip();
+
+    Reference {
+        stats,
+        loss: (row_losses.iter().sum::<f64>() / BATCH_SIZE as f64) as f32,
+        grad,
     }
-
-    out.loss = (loss_sum / BATCH_SIZE as f64) as f32;
-    out
 }

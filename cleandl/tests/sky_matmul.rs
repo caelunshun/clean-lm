@@ -9,13 +9,15 @@ use cleandl::{
             SwiGluGateTrainFwdOutputs,
         },
     },
+    par_random::par_vec_from_distr,
     tensor::Tensor,
 };
-use faer::Mat;
+use faer::{Mat, MatRef};
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions, stream::Stream,
@@ -106,9 +108,7 @@ fn sky_matmul_swiglu_gate_train_fwd() -> anyhow::Result<()> {
         let inputs = Inputs::new_random(&cx, &stream, m, n, k)?;
 
         let mut rng = StdRng::seed_from_u64(0xf00d + (m * n * k) as u64);
-        let x_host: Vec<bf16> = (0..m * n)
-            .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-            .collect();
+        let x_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
         let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
         cx.upload_to_device(&x_host, x.storage_mut(), &stream)?;
 
@@ -167,12 +167,12 @@ impl Inputs {
     ) -> anyhow::Result<Self> {
         let mut rng = StdRng::seed_from_u64(0x5c1 + (m * n * k) as u64);
         let scale = (k as f32).sqrt().recip();
-        let a_host: Vec<bf16> = (0..m * k)
-            .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
-            .collect();
-        let b_host: Vec<bf16> = (0..n * k)
-            .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-            .collect();
+        let a_host = par_vec_from_distr(
+            StandardNormal.map(|x: f32| bf16::from_f32(x * scale)),
+            m * k,
+            &mut rng,
+        );
+        let b_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), n * k, &mut rng);
 
         let mut a = Tensor::new_zeroed(Shape::new([m, k]), BF16, cx)?;
         let mut b_t = Tensor::new_zeroed(Shape::new([n, k]), BF16, cx)?;
@@ -192,8 +192,10 @@ impl Inputs {
 
     fn reference_product(&self) -> Mat<f32> {
         let (m, n, k) = (self.m, self.n, self.k);
-        let a_ref = Mat::from_fn(m, k, |i, j| self.a_host[i * k + j].to_f32());
-        let b_ref = Mat::from_fn(k, n, |i, j| self.b_host[j * k + i].to_f32());
+        let a_f32: Vec<f32> = self.a_host.par_iter().map(|x| x.to_f32()).collect();
+        let b_f32: Vec<f32> = self.b_host.par_iter().map(|x| x.to_f32()).collect();
+        let a_ref = MatRef::from_row_major_slice(&a_f32, m, k);
+        let b_ref = MatRef::from_column_major_slice(&b_f32, k, n);
         a_ref * b_ref
     }
 }
@@ -208,29 +210,32 @@ fn download(cx: &Context, stream: &Stream, tensor: &Tensor) -> anyhow::Result<Ve
 fn check_matrix(
     actual: &[bf16],
     (m, n, k): (usize, usize, usize),
-    expected: impl Fn(usize, usize) -> f32,
+    expected: impl Fn(usize, usize) -> f32 + Sync,
     name: &str,
 ) -> anyhow::Result<f32> {
-    let mut max_error = 0.0f32;
-    for i in 0..m {
-        for j in 0..n {
-            let expected = expected(i, j);
-            let actual = actual[i * n + j].to_f32();
-            assert!(actual.is_finite());
+    (0..m * n)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_error, idx| -> anyhow::Result<f32> {
+                let (i, j) = (idx / n, idx % n);
+                let expected = expected(i, j);
+                let actual = actual[idx].to_f32();
+                assert!(actual.is_finite());
 
-            max_error = max_error.max((actual - expected).abs());
+                let margin = F32Margin {
+                    epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
+                    ulps: 0,
+                };
+                anyhow::ensure!(
+                    actual.approx_eq(expected, margin),
+                    "{m}x{n}x{k}: {name} mismatch at ({i}, {j}): expected {expected}, got {actual}"
+                );
 
-            let margin = F32Margin {
-                epsilon: ABS_TOLERANCE.max(REL_TOLERANCE * expected.abs()),
-                ulps: 0,
-            };
-            anyhow::ensure!(
-                actual.approx_eq(expected, margin),
-                "{m}x{n}x{k}: {name} mismatch at ({i}, {j}): expected {expected}, got {actual}"
-            );
-        }
-    }
-    Ok(max_error)
+                Ok(max_error.max((actual - expected).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))
 }
 
 /// Swish (SiLU) activation: `x * sigmoid(x)`.

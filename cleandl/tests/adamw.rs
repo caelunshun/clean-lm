@@ -1,8 +1,12 @@
-use cleandl::{context::Context, operators::adamw::AdamWExecutor, tensor::Tensor};
+use cleandl::{
+    context::Context, operators::adamw::AdamWExecutor, par_random::par_vec_from_distr,
+    tensor::Tensor,
+};
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
@@ -54,15 +58,13 @@ fn adamw_weight_update() -> anyhow::Result<()> {
 
     let mut rng = StdRng::seed_from_u64(0xADA3);
     let mut sample = |count: usize, scale: f32| -> Vec<f32> {
-        (0..count)
-            .map(|_| rng.sample::<f32, _>(StandardNormal) * scale)
-            .collect()
+        par_vec_from_distr(StandardNormal.map(|x: f32| x * scale), count, &mut rng)
     };
 
-    let gradient_host: Vec<f32> = sample(N, 1.0).into_iter().collect();
+    let gradient_host = sample(N, 1.0);
     let weight_host = sample(N, 0.1);
     let adam_m_host = sample(N, 0.01);
-    let adam_v_host: Vec<f32> = sample(N, 0.01).into_iter().map(f32::abs).collect();
+    let adam_v_host: Vec<f32> = sample(N, 0.01).into_par_iter().map(f32::abs).collect();
 
     cx.upload_to_device(&gradient_host, gradient.storage_mut(), &stream)?;
     for (tensor, host) in [
@@ -121,28 +123,34 @@ fn adamw_weight_update() -> anyhow::Result<()> {
             Ok(())
         };
 
-    let mut max_error = 0.0f32;
-    for i in 0..N {
-        assert!(weight_out[i].is_finite());
-        max_error = max_error.max((weight_out[i] - expected.weight[i]).abs());
+    let max_error = (0..N)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_error, i| -> anyhow::Result<f32> {
+                assert!(weight_out[i].is_finite());
 
-        check(
-            "weight",
-            i,
-            weight_out[i],
-            expected.weight[i],
-            REL_TOLERANCE,
-        )?;
-        check(
-            "bf16 replica",
-            i,
-            replica_out[i].to_f32(),
-            expected.weight[i],
-            REPLICA_REL_TOLERANCE,
-        )?;
-        check("adam_m", i, m_out[i], expected.m[i], REL_TOLERANCE)?;
-        check("adam_v", i, v_out[i], expected.v[i], REL_TOLERANCE)?;
-    }
+                check(
+                    "weight",
+                    i,
+                    weight_out[i],
+                    expected.weight[i],
+                    REL_TOLERANCE,
+                )?;
+                check(
+                    "bf16 replica",
+                    i,
+                    replica_out[i].to_f32(),
+                    expected.weight[i],
+                    REPLICA_REL_TOLERANCE,
+                )?;
+                check("adam_m", i, m_out[i], expected.m[i], REL_TOLERANCE)?;
+                check("adam_v", i, v_out[i], expected.v[i], REL_TOLERANCE)?;
+
+                Ok(max_error.max((weight_out[i] - expected.weight[i]).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))?;
 
     println!("results match the reference (max absolute weight error: {max_error})");
 
@@ -157,7 +165,7 @@ struct Reference {
 
 fn reference_adamw(gradient: &[f32], weight: &[f32], m: &[f32], v: &[f32]) -> Reference {
     let sum_squares: f64 = gradient
-        .iter()
+        .par_iter()
         .map(|g| {
             let g = *g as f64;
             g * g
@@ -169,27 +177,22 @@ fn reference_adamw(gradient: &[f32], weight: &[f32], m: &[f32], v: &[f32]) -> Re
     let bias_correction1 = 1.0 - BETA1.powf(TRAIN_STEP as f32);
     let bias_correction2 = 1.0 - BETA2.powf(TRAIN_STEP as f32);
 
-    let mut out = Reference {
-        weight: Vec::with_capacity(weight.len()),
-        m: Vec::with_capacity(weight.len()),
-        v: Vec::with_capacity(weight.len()),
-    };
+    let (weight, (m, v)) = (0..weight.len())
+        .into_par_iter()
+        .map(|i| {
+            let g = gradient[i] * clip_scale;
 
-    for i in 0..weight.len() {
-        let g = gradient[i] * clip_scale;
+            let m_new = BETA1 * m[i] + (1.0 - BETA1) * g;
+            let v_new = BETA2 * v[i] + (1.0 - BETA2) * (g * g);
 
-        let m_new = BETA1 * m[i] + (1.0 - BETA1) * g;
-        let v_new = BETA2 * v[i] + (1.0 - BETA2) * (g * g);
+            let m_hat = m_new / bias_correction1;
+            let v_hat = v_new / bias_correction2;
 
-        let m_hat = m_new / bias_correction1;
-        let v_hat = v_new / bias_correction2;
+            let w = weight[i] - LR * (m_hat / (v_hat.sqrt() + EPS) + WEIGHT_DECAY * weight[i]);
 
-        let w = weight[i] - LR * (m_hat / (v_hat.sqrt() + EPS) + WEIGHT_DECAY * weight[i]);
+            (w, (m_new, v_new))
+        })
+        .unzip();
 
-        out.weight.push(w);
-        out.m.push(m_new);
-        out.v.push(v_new);
-    }
-
-    out
+    Reference { weight, m, v }
 }

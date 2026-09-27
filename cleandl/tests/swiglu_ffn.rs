@@ -1,13 +1,15 @@
 use cleandl::{
     context::Context,
     operators::swiglu_ffn::{GateProjForwardOutput, SwiGluConfig, SwiGluFfnExecutor},
+    par_random::par_vec_from_distr,
     tensor::Tensor,
 };
-use faer::Mat;
+use faer::MatRef;
 use float_cmp::{ApproxEq, F32Margin};
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
@@ -53,15 +55,21 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
 
     let mut rng = StdRng::seed_from_u64(555);
     let scale = (IN_FEATURES as f32).sqrt().recip();
-    let data_host: Vec<bf16> = (0..BATCH_SIZE * IN_FEATURES)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
-        .collect();
-    let weight_host: Vec<bf16> = (0..IN_FEATURES * INTERMEDIATE_FEATURES)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-        .collect();
-    let up_host: Vec<bf16> = (0..BATCH_SIZE * INTERMEDIATE_FEATURES)
-        .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal)))
-        .collect();
+    let data_host = par_vec_from_distr(
+        StandardNormal.map(|x: f32| bf16::from_f32(x * scale)),
+        BATCH_SIZE * IN_FEATURES,
+        &mut rng,
+    );
+    let weight_host = par_vec_from_distr(
+        StandardNormal.map(bf16::from_f32),
+        IN_FEATURES * INTERMEDIATE_FEATURES,
+        &mut rng,
+    );
+    let up_host = par_vec_from_distr(
+        StandardNormal.map(bf16::from_f32),
+        BATCH_SIZE * INTERMEDIATE_FEATURES,
+        &mut rng,
+    );
 
     cx.upload_to_device(&data_host, data.storage_mut(), &stream)?;
     cx.upload_to_device(&weight_host, weight.storage_mut(), &stream)?;
@@ -80,34 +88,39 @@ fn swiglu_ffn_forward_gate_proj() -> anyhow::Result<()> {
     let gate_host: &[bf16] = bytemuck::cast_slice(gate_staging.view()?);
     let activation_host: &[bf16] = bytemuck::cast_slice(activation_staging.view()?);
 
-    let data_ref = Mat::from_fn(BATCH_SIZE, IN_FEATURES, |i, j| {
-        data_host[i * IN_FEATURES + j].to_f32()
-    });
-    let weight_ref = Mat::from_fn(IN_FEATURES, INTERMEDIATE_FEATURES, |i, j| {
-        weight_host[i * INTERMEDIATE_FEATURES + j].to_f32()
-    });
+    let data_f32 = to_f32(&data_host);
+    let weight_f32 = to_f32(&weight_host);
+    let data_ref = MatRef::from_row_major_slice(&data_f32, BATCH_SIZE, IN_FEATURES);
+    let weight_ref = MatRef::from_row_major_slice(&weight_f32, IN_FEATURES, INTERMEDIATE_FEATURES);
     let gate_ref = data_ref * weight_ref;
 
-    let mut max_gate_error = 0.0f32;
-    let mut max_activation_error = 0.0f32;
-    for i in 0..BATCH_SIZE {
-        for j in 0..INTERMEDIATE_FEATURES {
-            let idx = i * INTERMEDIATE_FEATURES + j;
+    let (max_gate_error, max_activation_error) = (0..BATCH_SIZE * INTERMEDIATE_FEATURES)
+        .into_par_iter()
+        .try_fold(
+            || (0.0f32, 0.0f32),
+            |(max_gate_error, max_activation_error), idx| -> anyhow::Result<(f32, f32)> {
+                let (i, j) = (idx / INTERMEDIATE_FEATURES, idx % INTERMEDIATE_FEATURES);
 
-            let expected_gate = gate_ref[(i, j)];
-            let actual_gate = gate_host[idx].to_f32();
-            assert!(actual_gate.is_finite());
-            max_gate_error = max_gate_error.max((actual_gate - expected_gate).abs());
-            check(expected_gate, actual_gate, "gate", i, j)?;
+                let expected_gate = gate_ref[(i, j)];
+                let actual_gate = gate_host[idx].to_f32();
+                assert!(actual_gate.is_finite());
+                check(expected_gate, actual_gate, "gate", i, j)?;
 
-            let expected_activation = swish(expected_gate) * up_host[idx].to_f32();
-            let actual_activation = activation_host[idx].to_f32();
-            assert!(actual_activation.is_finite());
-            max_activation_error =
-                max_activation_error.max((actual_activation - expected_activation).abs());
-            check(expected_activation, actual_activation, "activation", i, j)?;
-        }
-    }
+                let expected_activation = swish(expected_gate) * up_host[idx].to_f32();
+                let actual_activation = activation_host[idx].to_f32();
+                assert!(actual_activation.is_finite());
+                check(expected_activation, actual_activation, "activation", i, j)?;
+
+                Ok((
+                    max_gate_error.max((actual_gate - expected_gate).abs()),
+                    max_activation_error.max((actual_activation - expected_activation).abs()),
+                ))
+            },
+        )
+        .try_reduce(
+            || (0.0, 0.0),
+            |(a_gate, a_act), (b_gate, b_act)| Ok((a_gate.max(b_gate), a_act.max(b_act))),
+        )?;
 
     println!(
         "results match the reference (max absolute error: gate {max_gate_error}, \
@@ -127,6 +140,10 @@ fn check(expected: f32, actual: f32, name: &str, i: usize, j: usize) -> anyhow::
         "{name} mismatch at ({i}, {j}): expected {expected}, got {actual}"
     );
     Ok(())
+}
+
+fn to_f32(data: &[bf16]) -> Vec<f32> {
+    data.par_iter().map(|x| x.to_f32()).collect()
 }
 
 /// Swish (SiLU) activation: `x * sigmoid(x)`.

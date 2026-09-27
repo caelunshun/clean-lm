@@ -1,11 +1,13 @@
 use cleandl::{
     context::Context,
     operators::norm::{NormExecutor, RmsNormForwardOutput},
+    par_random::par_vec_from_distr,
     tensor::Tensor,
 };
 use half::bf16;
-use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rand_distr::StandardNormal;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions, stream::Stream,
@@ -54,18 +56,18 @@ fn run_case(
     with_residuals: bool,
 ) -> anyhow::Result<()> {
     let mut rng = StdRng::seed_from_u64(0x9e11);
-    let mut normal = |scale: f32| -> Vec<bf16> {
-        (0..BATCH_SIZE * INNER_DIM)
-            .map(|_| bf16::from_f32(rng.sample::<f32, _>(StandardNormal) * scale))
-            .collect()
+    let mut normal = |mean: f32, scale: f32, len: usize| -> Vec<bf16> {
+        par_vec_from_distr(
+            StandardNormal.map(|x: f32| bf16::from_f32(mean + x * scale)),
+            len,
+            &mut rng,
+        )
     };
 
-    let prev_layer_output_host = normal(1.0);
-    let dy_host = normal(1.0);
-    let residual_gradient_stream_host = normal(0.5);
-    let gamma_host: Vec<bf16> = (0..INNER_DIM)
-        .map(|_| bf16::from_f32(1.0 + rng.sample::<f32, _>(StandardNormal) * 0.1))
-        .collect();
+    let prev_layer_output_host = normal(0.0, 1.0, BATCH_SIZE * INNER_DIM);
+    let dy_host = normal(0.0, 1.0, BATCH_SIZE * INNER_DIM);
+    let residual_gradient_stream_host = normal(0.0, 0.5, BATCH_SIZE * INNER_DIM);
+    let gamma_host = normal(1.0, 0.1, INNER_DIM);
 
     let matrix_shape = Shape::new([BATCH_SIZE, INNER_DIM]);
     let bf16_type = ElementType::Float(FloatType::Bf16);
@@ -129,56 +131,70 @@ fn run_case(
         Ok(())
     };
 
-    let mut max_y_error = 0.0f32;
-    let mut max_dx_error = 0.0f32;
-
-    for row in 0..BATCH_SIZE {
+    (0..BATCH_SIZE).into_par_iter().try_for_each(|row| {
         check(
             "r_inv",
             row,
             r_inv_out[row],
             expected.r_inv[row],
             R_INV_REL_TOLERANCE * expected.r_inv[row].abs(),
-        )?;
-    }
+        )
+    })?;
 
-    for i in 0..BATCH_SIZE * INNER_DIM {
-        let y_actual = y_out[i].to_f32();
-        assert!(y_actual.is_finite());
-        max_y_error = max_y_error.max((y_actual - expected.y[i]).abs());
-        check(
-            "y",
-            i,
-            y_actual,
-            expected.y[i],
-            Y_REL_TOLERANCE * expected.y[i].abs(),
+    let (max_y_error, max_dx_error) = (0..BATCH_SIZE * INNER_DIM)
+        .into_par_iter()
+        .try_fold(
+            || (0.0f32, 0.0f32),
+            |(max_y_error, max_dx_error), i| -> anyhow::Result<(f32, f32)> {
+                let y_actual = y_out[i].to_f32();
+                assert!(y_actual.is_finite());
+                check(
+                    "y",
+                    i,
+                    y_actual,
+                    expected.y[i],
+                    Y_REL_TOLERANCE * expected.y[i].abs(),
+                )?;
+
+                let dx_actual = dx_out[i].to_f32();
+                check(
+                    "dx",
+                    i,
+                    dx_actual,
+                    expected.dx[i],
+                    DX_ABS_TOLERANCE.max(DX_REL_TOLERANCE * expected.dx[i].abs()),
+                )?;
+
+                Ok((
+                    max_y_error.max((y_actual - expected.y[i]).abs()),
+                    max_dx_error.max((dx_actual - expected.dx[i]).abs()),
+                ))
+            },
+        )
+        .try_reduce(
+            || (0.0, 0.0),
+            |(a_y, a_dx), (b_y, b_dx)| Ok((a_y.max(b_y), a_dx.max(b_dx))),
         )?;
 
-        let dx_actual = dx_out[i].to_f32();
-        max_dx_error = max_dx_error.max((dx_actual - expected.dx[i]).abs());
-        check(
-            "dx",
-            i,
-            dx_actual,
-            expected.dx[i],
-            DX_ABS_TOLERANCE.max(DX_REL_TOLERANCE * expected.dx[i].abs()),
-        )?;
-    }
-
-    let mut max_dgamma_error = 0.0f32;
-    for i in 0..INNER_DIM {
-        assert!(dgamma_out[i].is_finite());
-        max_dgamma_error = max_dgamma_error.max((dgamma_out[i] - expected.dgamma[i]).abs());
-        // dgamma accumulates over the whole batch, so tolerate error relative
-        // to the magnitude of the summed terms rather than of the result.
-        check(
-            "dgamma",
-            i,
-            dgamma_out[i],
-            expected.dgamma[i],
-            DGAMMA_REL_TOLERANCE * expected.dgamma_abs_sum[i],
-        )?;
-    }
+    let max_dgamma_error = (0..INNER_DIM)
+        .into_par_iter()
+        .try_fold(
+            || 0.0f32,
+            |max_dgamma_error, i| -> anyhow::Result<f32> {
+                assert!(dgamma_out[i].is_finite());
+                // dgamma accumulates over the whole batch, so tolerate error relative
+                // to the magnitude of the summed terms rather than of the result.
+                check(
+                    "dgamma",
+                    i,
+                    dgamma_out[i],
+                    expected.dgamma[i],
+                    DGAMMA_REL_TOLERANCE * expected.dgamma_abs_sum[i],
+                )?;
+                Ok(max_dgamma_error.max((dgamma_out[i] - expected.dgamma[i]).abs()))
+            },
+        )
+        .try_reduce(|| 0.0, |a, b| Ok(a.max(b)))?;
 
     println!(
         "results match the reference (with_residuals: {with_residuals}, max absolute errors: \
@@ -202,51 +218,81 @@ fn reference(
     residual_gradient_stream: Option<&[bf16]>,
     gamma: &[bf16],
 ) -> Reference {
-    let mut out = Reference {
-        r_inv: Vec::with_capacity(BATCH_SIZE),
-        y: vec![0.0; BATCH_SIZE * INNER_DIM],
-        dx: vec![0.0; BATCH_SIZE * INNER_DIM],
-        dgamma: vec![0.0; INNER_DIM],
-        dgamma_abs_sum: vec![0.0; INNER_DIM],
-    };
-
     let gamma: Vec<f32> = gamma.iter().map(|x| x.to_f32()).collect();
 
-    for row in 0..BATCH_SIZE {
-        let range = row * INNER_DIM..(row + 1) * INNER_DIM;
-        let x: Vec<f32> = (range.clone())
-            .map(|i| prev_layer_output[i].to_f32())
-            .collect();
+    let r_inv: Vec<f32> = prev_layer_output
+        .par_chunks(INNER_DIM)
+        .map(|x| {
+            let mean_square = x
+                .iter()
+                .map(|v| (v.to_f32() * v.to_f32()) as f64)
+                .sum::<f64>()
+                / INNER_DIM as f64;
+            (mean_square as f32 + EPSILON).sqrt().recip()
+        })
+        .collect();
 
-        let mean_square = x.iter().map(|&v| (v * v) as f64).sum::<f64>() / INNER_DIM as f64;
-        let r_inv = (mean_square as f32 + EPSILON).sqrt().recip();
-        out.r_inv.push(r_inv);
+    let mut y = vec![0.0; BATCH_SIZE * INNER_DIM];
+    let mut dx = vec![0.0; BATCH_SIZE * INNER_DIM];
 
-        // Forward pass.
-        for (col, &v) in x.iter().enumerate() {
-            out.y[row * INNER_DIM + col] = v * r_inv * gamma[col];
-        }
+    let (dgamma, dgamma_abs_sum) = y
+        .par_chunks_mut(INNER_DIM)
+        .zip(dx.par_chunks_mut(INNER_DIM))
+        .enumerate()
+        .fold(
+            || (vec![0.0f32; INNER_DIM], vec![0.0f32; INNER_DIM]),
+            |(mut dgamma, mut dgamma_abs_sum), (row, (y, dx))| {
+                let range = row * INNER_DIM..(row + 1) * INNER_DIM;
+                let x: Vec<f32> = prev_layer_output[range]
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                let r_inv = r_inv[row];
 
-        // Backward pass.
-        let x_hat: Vec<f32> = x.iter().map(|&v| v * r_inv).collect();
-        let g: Vec<f32> = (0..INNER_DIM)
-            .map(|col| dy[row * INNER_DIM + col].to_f32() * gamma[col])
-            .collect();
-        let c = (0..INNER_DIM)
-            .map(|col| (g[col] * x_hat[col]) as f64)
-            .sum::<f64>() as f32
-            / INNER_DIM as f32;
+                // Forward pass.
+                for (col, &v) in x.iter().enumerate() {
+                    y[col] = v * r_inv * gamma[col];
+                }
 
-        for col in 0..INNER_DIM {
-            let i = row * INNER_DIM + col;
-            out.dx[i] = r_inv * (g[col] - x_hat[col] * c)
-                + residual_gradient_stream.map_or(0.0, |residual| residual[i].to_f32());
+                // Backward pass.
+                let x_hat: Vec<f32> = x.iter().map(|&v| v * r_inv).collect();
+                let g: Vec<f32> = (0..INNER_DIM)
+                    .map(|col| dy[row * INNER_DIM + col].to_f32() * gamma[col])
+                    .collect();
+                let c = (0..INNER_DIM)
+                    .map(|col| (g[col] * x_hat[col]) as f64)
+                    .sum::<f64>() as f32
+                    / INNER_DIM as f32;
 
-            let dgamma_term = dy[i].to_f32() * x_hat[col];
-            out.dgamma[col] += dgamma_term;
-            out.dgamma_abs_sum[col] += dgamma_term.abs();
-        }
+                for col in 0..INNER_DIM {
+                    let i = row * INNER_DIM + col;
+                    dx[col] = r_inv * (g[col] - x_hat[col] * c)
+                        + residual_gradient_stream.map_or(0.0, |residual| residual[i].to_f32());
+
+                    let dgamma_term = dy[i].to_f32() * x_hat[col];
+                    dgamma[col] += dgamma_term;
+                    dgamma_abs_sum[col] += dgamma_term.abs();
+                }
+
+                (dgamma, dgamma_abs_sum)
+            },
+        )
+        .reduce(
+            || (vec![0.0f32; INNER_DIM], vec![0.0f32; INNER_DIM]),
+            |(mut dgamma, mut dgamma_abs_sum), (other_dgamma, other_abs_sum)| {
+                for col in 0..INNER_DIM {
+                    dgamma[col] += other_dgamma[col];
+                    dgamma_abs_sum[col] += other_abs_sum[col];
+                }
+                (dgamma, dgamma_abs_sum)
+            },
+        );
+
+    Reference {
+        r_inv,
+        y,
+        dx,
+        dgamma,
+        dgamma_abs_sum,
     }
-
-    out
 }
