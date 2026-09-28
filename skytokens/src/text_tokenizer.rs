@@ -1,6 +1,6 @@
 use hashbrown::HashMap;
 
-use crate::vocab::TokenId;
+use crate::vocab::{Token, TokenId, Vocab};
 
 /// Fast text tokenizer for a vocabulary,
 /// backed by a hash-array mapped trie with instruction-parallel
@@ -30,6 +30,17 @@ struct Node {
 }
 
 impl TextTokenizer {
+    /// Note that special tokens are ignored.
+    pub fn new(vocab: &Vocab) -> Self {
+        let mut tokenizer = Self::empty();
+        for (token_id, token) in vocab.tokens() {
+            if let Token::Text(text_token) = token {
+                tokenizer.add_token(&text_token.0, token_id);
+            }
+        }
+        tokenizer
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             nodes: [Node {
