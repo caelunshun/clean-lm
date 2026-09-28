@@ -2,9 +2,11 @@ use bstr::{ByteSlice, ByteVec};
 use compact_bytes::CompactBytes;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Vocab {
-    pub tokens: Vec<Token>,
+    tokens: Vec<Token>,
+    text_token_index: hashbrown::HashMap<CompactBytes, u32>,
+    special_token_index: hashbrown::HashMap<u64, u32>,
 }
 
 pub type TokenId = u32;
@@ -47,5 +49,5 @@ impl<'de> Deserialize<'de> for TextToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialToken {
     #[serde(rename = "special")]
-    pub data: u64,
+    pub tag: u64,
 }

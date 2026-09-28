@@ -18,3 +18,5 @@ memchr = "2.8.3"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+simple-semaphore = "1.1.0"
+zstd = "0.14.0"
