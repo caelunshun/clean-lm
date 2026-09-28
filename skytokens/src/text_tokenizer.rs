@@ -47,6 +47,7 @@ impl TextTokenizer {
     }
 
     pub(crate) fn add_token(&mut self, token_text: &[u8], token_id: TokenId) {
+        assert_ne!(token_id, u32::MAX);
         let mut remaining_token_text = token_text;
 
         // (1) traverse shared token prefix with existing tokens
@@ -183,6 +184,7 @@ impl TextTokenizer {
                 remaining_text = text_at_prev_token;
 
                 let token = self.nodes[node.anchor as usize].token;
+                assert_ne!(token, u32::MAX);
                 emit_token(token);
 
                 node_idx = self.root;
@@ -217,6 +219,7 @@ impl TextTokenizer {
         if text_at_prev_token.len() != remaining_text.len() {
             let node = &self.nodes[node_idx as usize];
             let token = self.nodes[node.anchor as usize].token;
+            assert_ne!(token, u32::MAX);
             emit_token(token);
         }
     }
@@ -241,8 +244,8 @@ mod tests {
         tokenizer.add_token(b"themselves", 3);
 
         assert_eq!(
-            tokenizer.tokenize_to_vec(b"the them themselves them "),
-            vec![1, 0, 2, 0, 3, 0, 2, 0]
+            tokenizer.tokenize_to_vec(b"the them themselves them  "),
+            vec![1, 0, 2, 0, 3, 0, 2, 0, 0]
         );
     }
 }

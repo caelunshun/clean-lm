@@ -1,18 +1,16 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     io::Cursor,
     iter, mem,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        nonpoison::Mutex,
     },
     thread::available_parallelism,
 };
 
 use simple_semaphore::Semaphore;
 
-use crate::training::{config::InMemoryCompression, token_id_for_byte};
+use crate::training::config::InMemoryCompression;
 
 /// Approx. size of uncompressed text data in each chunk.
 pub(super) const CHUNK_SIZE: usize = 64 * 1024;
@@ -107,17 +105,17 @@ impl CorpusBuilder {
             .map(|c| c.wait().clone())
             .collect::<Vec<_>>();
 
-        let mut token_pair_occurrences = hashbrown::HashMap::new();
+        let mut byte_pair_occurrences = hashbrown::HashMap::new();
         for (i, count) in self.byte_pair_occurrences.iter().enumerate() {
-            let a = (i & 0xFF) as u32;
-            let b = ((i >> 8) & 0xFF) as u32;
-            token_pair_occurrences.insert((a, b), count.load(Ordering::Relaxed));
+            let a = (i & 0xFF) as u8;
+            let b = ((i >> 8) & 0xFF) as u8;
+            byte_pair_occurrences.insert((a, b), count.load(Ordering::Relaxed));
         }
 
         Corpus {
             chunks,
             total_uncompressed_bytes: self.total_uncompressed_bytes,
-            token_pair_occurrences,
+            byte_pair_occurrences,
             compression: self.compression,
         }
     }
@@ -145,8 +143,9 @@ pub(super) fn decompress(compressed_data: &[u8], compression: InMemoryCompressio
 pub struct Corpus {
     pub(super) compression: Option<InMemoryCompression>,
     pub(super) chunks: Vec<Chunk>,
+    #[allow(unused)]
     pub(super) total_uncompressed_bytes: usize,
-    token_pair_occurrences: hashbrown::HashMap<(u32, u32), usize>,
+    pub(super) byte_pair_occurrences: hashbrown::HashMap<(u8, u8), usize>,
 }
 
 impl Corpus {
