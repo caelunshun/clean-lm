@@ -385,7 +385,7 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
     type Outputs = SwiGluGateTrainFwdOutputs;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x5_epi3"
+        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
@@ -488,7 +488,7 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
     type Outputs = SwiGluDownTrainDgradOutputs;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x5_epi3"
+        "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {

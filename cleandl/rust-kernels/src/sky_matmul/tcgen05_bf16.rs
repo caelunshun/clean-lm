@@ -1233,18 +1233,18 @@ kernel_with_variants! {
 }
 
 kernel_with_variants! {
-    sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x5_epi3(
+    sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1(
         #[grid_constant] x_tma: TmaDescriptor,
         #[grid_constant] g_tma: TmaDescriptor,
         #[grid_constant] y_tma: TmaDescriptor,
     ),
     epilogue = SwiGluGateTrainFwdEpilogue { x_desc: x_tma, g_desc: g_tma, y_desc: y_tma, vals: [0.0; EPI_ELEMENTS_PER_THREAD] },
-    AB_PIPE_DEPTH = 5,
-    EPILOGUE_PIPE_DEPTH = 3
+    AB_PIPE_DEPTH = 6,
+    EPILOGUE_PIPE_DEPTH = 1
 }
 
 kernel_with_variants! {
-    sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x5_epi3(
+    sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1(
         #[grid_constant] g_desc: TmaDescriptor,
         #[grid_constant] x_desc: TmaDescriptor,
         #[grid_constant] dx_desc: TmaDescriptor,
@@ -1252,6 +1252,6 @@ kernel_with_variants! {
     ),
     epilogue = SwiGluDownTrainDgradEpilogue { g_desc, x_desc, dg_desc, dx_desc,
         mma_result: [0.0; EPI_ELEMENTS_PER_THREAD], g: [0.0; EPI_ELEMENTS_PER_THREAD], sigmoid_g: [0.0; EPI_ELEMENTS_PER_THREAD] },
-    AB_PIPE_DEPTH = 5,
-    EPILOGUE_PIPE_DEPTH = 3
+    AB_PIPE_DEPTH = 6,
+    EPILOGUE_PIPE_DEPTH = 1
 }
