@@ -681,14 +681,29 @@ impl<
 
                 let base_tmem_addr = *self.smem.tmem_addr_dst() + (accum_slot_idx << 8);
 
+                let num_subtiles_n = TN_CTA / TN_EPI;
                 #[llvm_unroll]
-                for subtile_n in 0..(TN_CTA / TN_EPI) {
+                for subtile_n in 0..num_subtiles_n {
                     let tmem_addr = base_tmem_addr
                         + (warp_tmem_lane_base << 16)
                         + (subtile_n * TN_EPI)
                         + warp_n;
                     let mma_result = tcgen05_ld_32x32b_x32_raw(tmem_addr);
                     tcgen05_load_wait();
+
+                    if subtile_n == num_subtiles_n - 1 {
+                        // We're done with the TMEM accumulator once we've loaded the last subtile.
+                        tcgen05_fence_before_thread_sync();
+                        mbarrier_arrive_cluster(cvta_generic_to_shared_offset(
+                            map_shared_rank(
+                                &self.smem.barriers_mut().accumulator_slot_consumed
+                                    [accum_slot_idx as usize],
+                                0,
+                            )
+                            .cast::<u8>(),
+                        ));
+                    }
+
                     let mma_result = mem::transmute::<
                         [u32; EPI_ELEMENTS_PER_THREAD],
                         [f32; EPI_ELEMENTS_PER_THREAD],
@@ -777,16 +792,6 @@ impl<
                         }
                     }
                 }
-
-                tcgen05_fence_before_thread_sync();
-                mbarrier_arrive_cluster(cvta_generic_to_shared_offset(
-                    map_shared_rank(
-                        &self.smem.barriers_mut().accumulator_slot_consumed
-                            [accum_slot_idx as usize],
-                        0,
-                    )
-                    .cast::<u8>(),
-                ));
 
                 if !self.advance_to_next_tile() {
                     break;
@@ -1228,18 +1233,18 @@ kernel_with_variants! {
 }
 
 kernel_with_variants! {
-    sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1(
+    sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x5_epi3(
         #[grid_constant] x_tma: TmaDescriptor,
         #[grid_constant] g_tma: TmaDescriptor,
         #[grid_constant] y_tma: TmaDescriptor,
     ),
     epilogue = SwiGluGateTrainFwdEpilogue { x_desc: x_tma, g_desc: g_tma, y_desc: y_tma, vals: [0.0; EPI_ELEMENTS_PER_THREAD] },
-    AB_PIPE_DEPTH = 6,
-    EPILOGUE_PIPE_DEPTH = 1
+    AB_PIPE_DEPTH = 5,
+    EPILOGUE_PIPE_DEPTH = 3
 }
 
 kernel_with_variants! {
-    sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1(
+    sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x5_epi3(
         #[grid_constant] g_desc: TmaDescriptor,
         #[grid_constant] x_desc: TmaDescriptor,
         #[grid_constant] dx_desc: TmaDescriptor,
@@ -1247,6 +1252,6 @@ kernel_with_variants! {
     ),
     epilogue = SwiGluDownTrainDgradEpilogue { g_desc, x_desc, dg_desc, dx_desc,
         mma_result: [0.0; EPI_ELEMENTS_PER_THREAD], g: [0.0; EPI_ELEMENTS_PER_THREAD], sigmoid_g: [0.0; EPI_ELEMENTS_PER_THREAD] },
-    AB_PIPE_DEPTH = 6,
-    EPILOGUE_PIPE_DEPTH = 1
+    AB_PIPE_DEPTH = 5,
+    EPILOGUE_PIPE_DEPTH = 3
 }

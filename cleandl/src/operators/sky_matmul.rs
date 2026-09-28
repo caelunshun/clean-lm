@@ -385,7 +385,7 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
     type Outputs = SwiGluGateTrainFwdOutputs;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1"
+        "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x5_epi3"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
@@ -427,7 +427,10 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         validate_matrix(x, m, n, MatrixFormat::RowMajor);
         let SwiGluGateTrainFwdOutputs { gate, activation } = outputs;
         builder
-            .arg(TensorMap::new(x.storage(), bf16_tma_desc(m, n, true)))?
+            .arg(TensorMap::new(
+                x.storage(),
+                bf16_tma_desc(m, n, true).l2_promotion(TensorMapL2Promotion::B256),
+            ))?
             .arg(TensorMapMut::new(
                 gate.storage_mut(),
                 bf16_tma_desc(m, n, true),
@@ -485,7 +488,7 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
     type Outputs = SwiGluDownTrainDgradOutputs;
 
     fn native_kernel_name(&self) -> &'static str {
-        "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1"
+        "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x5_epi3"
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
@@ -525,8 +528,14 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
         validate_matrix(x, m, n, MatrixFormat::RowMajor);
         let SwiGluDownTrainDgradOutputs { dgate, dx } = outputs;
         builder
-            .arg(TensorMap::new(gate.storage(), bf16_tma_desc(m, n, true)))?
-            .arg(TensorMap::new(x.storage(), bf16_tma_desc(m, n, true)))?
+            .arg(TensorMap::new(
+                gate.storage(),
+                bf16_tma_desc(m, n, true).l2_promotion(TensorMapL2Promotion::B256),
+            ))?
+            .arg(TensorMap::new(
+                x.storage(),
+                bf16_tma_desc(m, n, true).l2_promotion(TensorMapL2Promotion::B256),
+            ))?
             .arg(TensorMapMut::new(
                 dx.storage_mut(),
                 bf16_tma_desc(m, n, true),
