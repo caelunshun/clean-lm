@@ -19,7 +19,7 @@ use skycuda::stream::Stream;
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
-    training::{config::TrainingConfig, model::MetaTensors, parameter::Parameter},
+    training::{weight_update_params::WeightUpdateParams, model::MetaTensors, parameter::Parameter},
 };
 
 #[derive(Debug)]
@@ -599,7 +599,7 @@ impl DecoderExecutor {
         &self,
         weights: &mut DecoderWeights,
         gradients_sum2: &TensorView,
-        config: &TrainingConfig,
+        config: &WeightUpdateParams,
         train_step: u32,
         stream: &Stream,
     ) -> anyhow::Result<()> {

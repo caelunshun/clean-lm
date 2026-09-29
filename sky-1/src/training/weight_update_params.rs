@@ -1,5 +1,5 @@
 #[derive(Debug, Clone)]
-pub struct TrainingConfig {
+pub struct WeightUpdateParams {
     pub adam_beta1: f32,
     pub adam_beta2: f32,
     pub weight_decay: f32,

@@ -20,7 +20,7 @@ use skytens_core::data_type::{ElementType, FloatType};
 
 use crate::{
     model::Sky1Config,
-    training::{config::TrainingConfig, parameter::Parameter},
+    training::{parameter::Parameter, weight_update_params::WeightUpdateParams},
 };
 use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
 
@@ -277,7 +277,7 @@ impl Sky1Executor {
     pub fn weight_update(
         &self,
         weights: &mut Sky1Weights,
-        config: &TrainingConfig,
+        config: &WeightUpdateParams,
         train_step: u32,
         stream: &Stream,
     ) -> anyhow::Result<()> {
