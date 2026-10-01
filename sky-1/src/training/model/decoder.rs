@@ -19,7 +19,9 @@ use skycuda::stream::Stream;
 
 use crate::{
     model::{BlocksConfig, Sky1Config},
-    training::{weight_update_params::WeightUpdateParams, model::MetaTensors, parameter::Parameter},
+    training::{
+        model::MetaTensors, parameter::Parameter, weight_update_params::WeightUpdateParams,
+    },
 };
 
 #[derive(Debug)]

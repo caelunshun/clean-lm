@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use compact_str::CompactString;
 use serde::Deserialize;
+use skytens_core::FastIndexSet;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub dataset: DatasetConfig,
     pub training: TrainingConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DatasetConfig {
     pub seed: u64,
     pub work_dir: PathBuf,
@@ -18,13 +19,13 @@ pub struct DatasetConfig {
     pub post_sample_size: u32,
     pub subreddit_sampling_bias: f64,
     pub year_sampling_bias: f64,
-    pub prune_texts: Vec<CompactString>,
-    pub prune_authors: Vec<CompactString>,
+    pub prune_texts: FastIndexSet<CompactString>,
+    pub prune_authors: FastIndexSet<CompactString>,
     /// Total vocabulary size including special tokens.
     pub total_vocab_size: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TrainingConfig {
     pub seed: u64,
     pub microbatch_size: u32,
@@ -37,7 +38,7 @@ pub struct TrainingConfig {
     pub lr_warmup_steps: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum LrSchedule {
     Constant(f32),
