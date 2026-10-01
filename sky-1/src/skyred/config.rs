@@ -41,5 +41,5 @@ pub struct TrainingConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum LrSchedule {
-    Constant(f32),
+    Constant { lr: f32 },
 }
