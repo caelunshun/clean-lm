@@ -1,10 +1,12 @@
 use compact_str::CompactString;
+use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 /// One post and a list of nested comments replying to it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub subreddit: CompactString,
+    pub date: Date,
     pub title: String,
     pub author: CompactString,
     pub selftext: CompactString,

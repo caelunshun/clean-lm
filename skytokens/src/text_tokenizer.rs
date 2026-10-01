@@ -240,6 +240,10 @@ impl TextTokenizer {
         self.tokenize(text, |tok| tokens.push(tok));
         tokens
     }
+
+    pub fn tokenize_into(&self, text: impl AsRef<[u8]>, v: &mut Vec<TokenId>) {
+        self.tokenize(text, |tok| v.push(tok));
+    }
 }
 
 #[cfg(test)]

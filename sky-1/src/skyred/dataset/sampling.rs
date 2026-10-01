@@ -298,7 +298,11 @@ fn sample_batch(
         };
 
         let title = title.value(row).to_owned();
-        let selftext = selftext.value(row).to_compact_string();
+        let selftext = if selftext.is_null(row) {
+            CompactString::default()
+        } else {
+            selftext.value(row).to_compact_string()
+        };
 
         let author = if author.is_null(row) {
             DELETED_AUTHOR.to_compact_string()
@@ -322,6 +326,7 @@ fn sample_batch(
         }
 
         let mut doc = Document {
+            date,
             subreddit: subreddit.value(row).into(),
             title,
             author,
