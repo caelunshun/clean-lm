@@ -1,3 +1,3 @@
 pub mod model;
-pub mod redsky;
+pub mod skyred;
 pub mod training;
