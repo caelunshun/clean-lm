@@ -388,20 +388,33 @@ impl CommentColumns<'_> {
             return Vec::new();
         }
 
-        let id_to_index: FastHashMap<&str, usize> = valid_indices
+        let mut id_to_index: FastHashMap<&str, usize> = valid_indices
             .iter()
             .copied()
             .map(|i| (self.id.value(i), i))
             .collect();
 
-        // Remove comments whose parent is dangling.
-        valid_indices.retain(|&i| match self.parent_id.value(i).strip_prefix("t1_") {
-            Some(s) => id_to_index.contains_key(s),
-            None => {
-                // Parent ID starts with t3 so is the post, which is never dangling.
-                true
+        // Remove comments whose parent is dangling, to fixpoint.
+        let mut prev_len = valid_indices.len();
+        loop {
+            valid_indices.retain(|&i| match self.parent_id.value(i).strip_prefix("t1_") {
+                Some(s) => {
+                    let keep = id_to_index.contains_key(s);
+                    if !keep {
+                        id_to_index.remove(self.id.value(i));
+                    }
+                    keep
+                }
+                None => {
+                    // Parent ID starts with t3 so is the post, which is never dangling.
+                    true
+                }
+            });
+            if valid_indices.len() == prev_len {
+                break;
             }
-        });
+            prev_len = valid_indices.len();
+        }
 
         let parents: FastHashMap<usize, Option<usize>> = valid_indices
             .iter()
@@ -418,6 +431,10 @@ impl CommentColumns<'_> {
             .collect();
 
         let mut depths: FastHashMap<usize, usize> = Default::default();
+        for &i in &valid_indices {
+            depths.insert(i, 0);
+        }
+
         let mut stack = Vec::new();
         for &i in &valid_indices {
             let mut cur = Some(i);
@@ -436,7 +453,9 @@ impl CommentColumns<'_> {
             }
         }
 
-        let max_depth = *depths.values().max().unwrap();
+        let Some(max_depth) = depths.values().max().copied() else {
+            return Vec::new();
+        };
         let deepest: Vec<usize> = valid_indices
             .iter()
             .copied()
@@ -444,10 +463,10 @@ impl CommentColumns<'_> {
             .collect();
         let leaf = *deepest.choose(rng).unwrap();
 
-        let mut chain = Vec::with_capacity(max_depth as usize);
+        let mut chain = Vec::with_capacity(max_depth);
         let mut cur = Some(leaf);
         while let Some(i) = cur
-            && chain.len() < max_depth as usize
+            && chain.len() < max_depth
         {
             chain.push(Comment {
                 author: self.author.value(i).into(),
