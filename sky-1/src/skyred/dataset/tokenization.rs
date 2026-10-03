@@ -2,85 +2,80 @@ use std::io::BufWriter;
 
 use anyhow::Context;
 use jiff::civil::Date;
-use skytens_core::FastHashMap;
+use serde::{Deserialize, Serialize};
 use skytokens::{
     text_tokenizer::TextTokenizer,
-    training::Corpus,
-    vocab::{TokenId, Vocab},
+    training::CorpusBuilder,
+    vocab::{SpecialTokenData, Token, TokenId, Vocab},
 };
-use strum::{EnumIter, FromRepr, IntoEnumIterator};
+use strum::{EnumIter, IntoEnumIterator};
 
 use crate::skyred::{config::DatasetConfig, dataset::schema::Document};
 
 pub struct SkyredTokenizer {
-    vocab: Vocab,
-    special_token_map: FastHashMap<SpecialToken, TokenId>,
+    vocab: Vocab<SpecialToken>,
     text_tokenizer: TextTokenizer,
 }
 
 impl SkyredTokenizer {
-    pub fn new(vocab: Vocab) -> anyhow::Result<Self> {
-        let mut special_token_map = FastHashMap::default();
-        for tok in SpecialToken::iter() {
-            special_token_map.insert(
-                tok,
-                vocab
-                    .special_token_tag_to_id(tok as u64)
-                    .with_context(|| format!("vocab is missing a token for {tok:?}"))?,
-            );
-        }
+    pub fn new(vocab: Vocab<SpecialToken>) -> anyhow::Result<Self> {
         Ok(Self {
             text_tokenizer: TextTokenizer::new(&vocab),
             vocab,
-            special_token_map,
         })
     }
 
-    pub fn tokenize_document(&self, document: &Document) -> Vec<TokenId> {
+    pub fn tokenize_document(&self, document: &Document) -> anyhow::Result<Vec<TokenId>> {
         let mut tokens = Vec::new();
 
-        self.text_tokenizer
-            .tokenize_into(&document.subreddit, &mut tokens);
+        self.push_text(&mut tokens, &document.subreddit)?;
 
-        tokens.push(self.special_token_map[&SpecialToken::BeginDate]);
-        self.text_tokenizer
-            .tokenize_into(format_date(document.date), &mut tokens);
+        self.push_special(&mut tokens, SpecialToken::BeginDate)?;
+        self.push_text(&mut tokens, format_date(document.date))?;
 
-        tokens.push(self.special_token_map[&SpecialToken::BeginPostTitle]);
-        self.text_tokenizer
-            .tokenize_into(&document.title, &mut tokens);
+        self.push_special(&mut tokens, SpecialToken::BeginPostTitle)?;
+        self.push_text(&mut tokens, &document.title)?;
 
-        tokens.push(self.special_token_map[&SpecialToken::BeginAuthor]);
-        self.text_tokenizer
-            .tokenize_into(&document.author, &mut tokens);
+        self.push_special(&mut tokens, SpecialToken::BeginAuthor)?;
+        self.push_text(&mut tokens, &document.author)?;
 
-        tokens.push(self.special_token_map[&SpecialToken::BeginText]);
-        self.text_tokenizer
-            .tokenize_into(&document.selftext, &mut tokens);
+        self.push_special(&mut tokens, SpecialToken::BeginText)?;
+        self.push_text(&mut tokens, &document.selftext)?;
 
         for comment in &document.comment_chain {
-            tokens.push(self.special_token_map[&SpecialToken::BeginAuthor]);
-            self.text_tokenizer
-                .tokenize_into(&comment.author, &mut tokens);
+            self.push_special(&mut tokens, SpecialToken::BeginAuthor)?;
+            self.push_text(&mut tokens, &comment.author)?;
 
-            tokens.push(self.special_token_map[&SpecialToken::BeginText]);
-            self.text_tokenizer
-                .tokenize_into(&comment.text, &mut tokens);
+            self.push_special(&mut tokens, SpecialToken::BeginText)?;
+            self.push_text(&mut tokens, &comment.text)?;
         }
 
-        tokens.push(self.special_token_map[&SpecialToken::EndChain]);
+        self.push_special(&mut tokens, SpecialToken::EndChain)?;
 
-        tokens
+        Ok(tokens)
     }
 
-    pub fn vocab(&self) -> &Vocab {
+    fn push_text(&self, tokens: &mut Vec<TokenId>, text: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        tokens.extend(self.text_tokenizer.tokenize(text)?);
+        Ok(())
+    }
+
+    fn push_special(&self, tokens: &mut Vec<TokenId>, special: SpecialToken) -> anyhow::Result<()> {
+        tokens.push(
+            self.vocab
+                .special_token_to_id(&special)
+                .context("special token missing from vocab")?,
+        );
+        Ok(())
+    }
+
+    pub fn vocab(&self) -> &Vocab<SpecialToken> {
         &self.vocab
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, EnumIter, FromRepr)]
-#[repr(u64)]
-enum SpecialToken {
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, EnumIter, Serialize, Deserialize)]
+pub enum SpecialToken {
     BeginDate,
     BeginPostTitle,
     BeginAuthor,
@@ -88,8 +83,10 @@ enum SpecialToken {
     EndChain,
 }
 
+impl SpecialTokenData for SpecialToken {}
+
 pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
-    let mut corpus = Corpus::builder(None);
+    let mut corpus = CorpusBuilder::new();
 
     let documents: Vec<Document> = postcard::from_io((
         zstd::Decoder::new(fs_err::File::open(config.work_dir.join("posts.zst"))?)?,
@@ -98,28 +95,33 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
     .0;
 
     for document in documents {
-        corpus.add_document(&document.subreddit)?;
-        corpus.add_document(format_date(document.date))?;
-        corpus.add_document(&document.author)?;
-        corpus.add_document(&document.title)?;
-        corpus.add_document(&document.selftext)?;
+        corpus.add_document(&document.subreddit);
+        corpus.add_document(format_date(document.date));
+        corpus.add_document(&document.author);
+        corpus.add_document(&document.title);
+        corpus.add_document(&document.selftext);
 
         for comment in document.comment_chain {
-            corpus.add_document(&comment.author)?;
-            corpus.add_document(&comment.text)?;
+            corpus.add_document(&comment.author);
+            corpus.add_document(&comment.text);
         }
     }
 
     let corpus = corpus.build();
     tracing::info!("built corpus");
 
-    let vocab = skytokens::training::train_vocab(
+    let mut vocab = skytokens::training::train_vocab::<SpecialToken>(
         &corpus,
         config
             .total_vocab_size
             .checked_sub(SpecialToken::iter().count() as u32)
             .context("too few tokens")?,
     )?;
+    for special in SpecialToken::iter() {
+        vocab.add_token(Token::Special(skytokens::vocab::SpecialToken {
+            data: special,
+        }))?;
+    }
 
     serde_json::to_writer_pretty(
         BufWriter::new(fs_err::File::create(config.work_dir.join("vocab.json"))?),
