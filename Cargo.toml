@@ -1,5 +1,11 @@
 [workspace]
-members = ["cleandl", "sky-1", "cleandl/rust-kernels", "cleandl/rust-kernels/cuda-device-ext", "skytokens"]
+members = [
+    "cleandl",
+    "sky-1",
+    "cleandl/rust-kernels",
+    "cleandl/rust-kernels/cuda-device-ext",
+    "skytokens",
+]
 resolver = "3"
 
 [profile.dev.package.'*']
@@ -13,4 +19,5 @@ debug = "limited"
 
 [profile.max-perf]
 inherits = "release"
+codegen-units = 1
 lto = "thin"

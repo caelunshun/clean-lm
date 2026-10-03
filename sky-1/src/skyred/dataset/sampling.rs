@@ -1,18 +1,19 @@
 #![allow(deprecated)]
 
-use std::{cmp::Reverse, collections::BinaryHeap, io::Cursor, ops::Range, sync::Arc};
+use std::{
+    cmp::Reverse, collections::BinaryHeap, future::Future, io::Cursor, ops::Range, sync::Arc,
+};
 
 use anyhow::{Context, ensure};
 use arrow_array::{
-    Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, StructArray,
-    cast::AsArray,
-    types::{Date32Type, Int64Type, UInt64Type},
+    Array, ArrayRef, LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    cast::AsArray, types::Int64Type,
 };
 use compact_str::CompactString;
+use jiff::civil::Date;
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
 use parquet::arrow::{
     ProjectionMask,
-    arrow_reader::ArrowReaderMetadata,
     async_reader::{
         ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
     },
@@ -23,10 +24,7 @@ use rand::{
     seq::{IndexedRandom, SliceRandom},
 };
 use reddit_ingest::{
-    assemble::{
-        index_json::{INDEX_FILE_NAME, IndexJson},
-        subreddit_daily::SUBREDDIT_DAILY_FILE_NAME,
-    },
+    assemble::index_json::{INDEX_FILE_NAME, IndexJson},
     stats::day_to_date,
 };
 use skytens_core::FastHashMap;
@@ -44,7 +42,6 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// Used to impute author name when null.
 const DELETED_AUTHOR: &str = "[deleted]";
 const MAX_COMMENT_CHAIN_DEPTH: usize = 16;
-const POST_COUNT_ROW_GROUPS_IN_FLIGHT: usize = 32;
 
 type Year = i16;
 
@@ -83,122 +80,136 @@ async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<Vec<Docume
     ))?)?;
 
     let mut rng = StdRng::seed_from_u64(config.seed);
+    let paths: Vec<ObjectPath> = index
+        .files
+        .iter()
+        .map(|entry| ingest_path(&entry.file))
+        .collect();
 
-    let post_counts =
-        read_post_counts(object_store.clone(), ingest_path(SUBREDDIT_DAILY_FILE_NAME)).await?;
+    let mut post_counts = Strata::<u64>::default();
+    let mut files_done = 0;
+    for_each_file(
+        paths.iter().cloned(),
+        |path| {
+            let object_store = object_store.clone();
+            let config = config.clone();
+            async move {
+                count_file(object_store, &path, &config)
+                    .await
+                    .with_context(|| format!("failed to count posts in {path}"))
+            }
+        },
+        |file_counts| {
+            merge_counts(&mut post_counts, file_counts);
+            files_done += 1;
+            tracing::info!("counted posts in {files_done}/{} files", paths.len());
+        },
+    )
+    .await?;
+
     let quotas = Arc::new(allocate_quotas(&post_counts, config));
     tracing::info!(
         strata = quotas.values().map(FastHashMap::len).sum::<usize>(),
         "allocated sample quotas"
     );
 
-    let max_in_flight = 2 * std::thread::available_parallelism()?.get();
-    let mut files = index
-        .files
+    let files: Vec<_> = paths
         .iter()
-        .map(|entry| (ingest_path(&entry.file), rng.random::<u64>()))
-        .collect::<Vec<_>>()
-        .into_iter();
-    let mut tasks = JoinSet::new();
+        .map(|path| (path.clone(), rng.random::<u64>()))
+        .collect();
     let mut sample = Sample::default();
     let mut files_done = 0;
-    loop {
-        while tasks.len() < max_in_flight
-            && let Some((path, seed)) = files.next()
-        {
+    for_each_file(
+        files,
+        |(path, seed)| {
             let (object_store, quotas) = (object_store.clone(), quotas.clone());
             let config = config.clone();
-            tasks.spawn(async move {
+            async move {
                 sample_file(object_store, &path, &quotas, seed, &config)
                     .await
                     .with_context(|| format!("failed to sample from {path}"))
-            });
-        }
-        let Some(file_sample) = tasks.join_next().await else {
-            break;
-        };
-        sample.merge(file_sample??, &quotas);
-        files_done += 1;
-        tracing::info!("sampled {files_done}/{} files", index.files.len());
-    }
+            }
+        },
+        |file_sample| {
+            sample.merge(file_sample, &quotas);
+            files_done += 1;
+            tracing::info!("sampled {files_done}/{} files", paths.len());
+        },
+    )
+    .await?;
 
     Ok(sample.into_documents(&mut rng))
 }
 
-/// Reads the number of posts per (year, subreddit), excluding posts without a subreddit.
-/// Row groups are fetched and decoded concurrently.
-async fn read_post_counts(
-    object_store: Arc<dyn ObjectStore>,
-    path: ObjectPath,
-) -> anyhow::Result<Strata<u64>> {
-    let mut reader = ParquetObjectReader::new(object_store, path);
-    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-    let schema = metadata.parquet_schema();
-    let leaves = schema
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(_, col)| matches!(col.name(), "date" | "subreddit" | "posts"))
-        .map(|(i, _)| i);
-    let projection = ProjectionMask::leaves(schema, leaves);
-
-    let mut row_groups = 0..metadata.metadata().num_row_groups();
+/// Runs a task per file with bounded concurrency, merging results in completion order.
+async fn for_each_file<I, T, Fut>(
+    items: impl IntoIterator<Item = I>,
+    mut spawn: impl FnMut(I) -> Fut,
+    mut merge: impl FnMut(T),
+) -> anyhow::Result<()>
+where
+    Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let max_in_flight = 2 * std::thread::available_parallelism()?.get();
+    let mut items = items.into_iter();
     let mut tasks = JoinSet::new();
-    let mut counts = Strata::<u64>::default();
     loop {
-        while tasks.len() < POST_COUNT_ROW_GROUPS_IN_FLIGHT
-            && let Some(row_group) = row_groups.next()
+        while tasks.len() < max_in_flight
+            && let Some(item) = items.next()
         {
-            let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                reader.clone(),
-                metadata.clone(),
-            )
-            .with_projection(projection.clone())
-            .with_row_groups(vec![row_group])
-            .build()?;
-            tasks.spawn(count_posts(stream));
+            tasks.spawn(spawn(item));
         }
-        let Some(partial) = tasks.join_next().await else {
+        let Some(result) = tasks.join_next().await else {
             break;
         };
-        for (year, partial_by_subreddit) in partial?? {
-            let by_subreddit = counts.entry(year).or_default();
-            for (subreddit, count) in partial_by_subreddit {
-                *by_subreddit.entry(subreddit).or_default() += count;
-            }
+        merge(result??);
+    }
+    Ok(())
+}
+
+fn merge_counts(counts: &mut Strata<u64>, other: Strata<u64>) {
+    for (year, other_by_subreddit) in other {
+        let by_subreddit = counts.entry(year).or_default();
+        for (subreddit, count) in other_by_subreddit {
+            *by_subreddit.entry(subreddit).or_default() += count;
+        }
+    }
+}
+
+/// Counts posts per (year, subreddit) that pass the filters applied during sampling.
+async fn count_file(
+    object_store: Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    config: &DatasetConfig,
+) -> anyhow::Result<Strata<u64>> {
+    let mut stream = open_posts(object_store, path, false).await?;
+    let mut counts = Strata::<u64>::default();
+    while let Some(reader) = stream.next_row_group().await? {
+        for batch in reader {
+            count_batch(&batch?, config, &mut counts)?;
         }
     }
     Ok(counts)
 }
 
-async fn count_posts(
-    mut stream: ParquetRecordBatchStream<ParquetObjectReader>,
-) -> anyhow::Result<Strata<u64>> {
-    let mut counts = Strata::<u64>::default();
-    while let Some(reader) = stream.next_row_group().await? {
-        for batch in reader {
-            let batch = StructArray::from(batch?);
-            let dates = column(&batch, "date")?.as_primitive::<Date32Type>();
-            let entries = column(&batch, "subreddits")?.as_list::<i32>();
-            let entry_fields = entries.values().as_struct();
-            let subreddits = column(entry_fields, "subreddit")?.as_string::<i32>();
-            let posts = column(entry_fields, "posts")?.as_primitive::<UInt64Type>();
-            let offsets = entries.value_offsets();
-            for row in 0..batch.len() {
-                let Some(date) = day_to_date(dates.value(row).into()) else {
-                    continue;
-                };
-                let by_subreddit = counts.entry(date.year()).or_default();
-                for i in offsets[row] as usize..offsets[row + 1] as usize {
-                    if subreddits.is_null(i) || posts.value(i) == 0 {
-                        continue;
-                    }
-                    *by_subreddit.entry(subreddits.value(i).into()).or_default() += posts.value(i);
-                }
-            }
+fn count_batch(
+    batch: &RecordBatch,
+    config: &DatasetConfig,
+    counts: &mut Strata<u64>,
+) -> anyhow::Result<()> {
+    let batch = StructArray::from(batch.clone());
+    let posts = PostColumns::new(&batch)?;
+    for row in 0..batch.len() {
+        if let Some((date, subreddit)) = posts.stratum(row, config) {
+            *counts
+                .entry(date.year())
+                .or_default()
+                .entry(subreddit.into())
+                .or_default() += 1;
         }
     }
-    Ok(counts)
+    Ok(())
 }
 
 fn allocate_quotas(post_counts: &Strata<u64>, config: &DatasetConfig) -> Strata<u64> {
@@ -273,13 +284,13 @@ fn apportion(total: u64, counts: &[u64], uniform_mix: f64) -> Vec<u64> {
     }
 }
 
-async fn sample_file(
+/// Opens a stream over a posts file, projecting the post-level columns used for
+/// stratification and filtering and, if `with_comments`, the comment columns.
+async fn open_posts(
     object_store: Arc<dyn ObjectStore>,
     path: &ObjectPath,
-    quotas: &Strata<u64>,
-    seed: u64,
-    config: &DatasetConfig,
-) -> anyhow::Result<Sample> {
+    with_comments: bool,
+) -> anyhow::Result<ParquetRecordBatchStream<ParquetObjectReader>> {
     let builder =
         ParquetRecordBatchStreamBuilder::new(ParquetObjectReader::new(object_store, path.clone()))
             .await?;
@@ -292,7 +303,7 @@ async fn sample_file(
             let parts = col.path().parts();
             let (top, leaf) = (parts[0].as_str(), parts[parts.len() - 1].as_str());
             if top == "comments" {
-                matches!(leaf, "id" | "parent_id" | "author_name" | "body")
+                with_comments && matches!(leaf, "id" | "parent_id" | "author_name" | "body")
             } else {
                 parts.len() == 1
                     && matches!(
@@ -303,7 +314,17 @@ async fn sample_file(
         })
         .map(|(i, _)| i);
     let projection = ProjectionMask::leaves(schema, leaves);
-    let mut stream = builder.with_projection(projection).build()?;
+    Ok(builder.with_projection(projection).build()?)
+}
+
+async fn sample_file(
+    object_store: Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+    quotas: &Strata<u64>,
+    seed: u64,
+    config: &DatasetConfig,
+) -> anyhow::Result<Sample> {
+    let mut stream = open_posts(object_store, path, true).await?;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut sample = Sample::default();
@@ -323,11 +344,7 @@ fn sample_batch(
     config: &DatasetConfig,
 ) -> anyhow::Result<()> {
     let batch = StructArray::from(batch.clone());
-    let created_utc = column(&batch, "created_utc")?.as_primitive::<Int64Type>();
-    let subreddit = column(&batch, "subreddit")?.as_string::<i32>();
-    let title = column(&batch, "title")?.as_string::<i32>();
-    let selftext = column(&batch, "selftext")?.as_string::<i64>();
-    let author = column(&batch, "author_name")?.as_string::<i32>();
+    let posts = PostColumns::new(&batch)?;
     let comments = column(&batch, "comments")?.as_list::<i32>();
     let comment_fields = comments.values().as_struct();
     let comments = CommentColumns {
@@ -339,33 +356,10 @@ fn sample_batch(
     };
 
     for row in 0..batch.len() {
-        if subreddit.is_null(row) {
-            continue;
-        }
-        let Some(date) = day_to_date(created_utc.value(row).div_euclid(SECONDS_PER_DAY)) else {
+        let Some((date, subreddit)) = posts.stratum(row, config) else {
             continue;
         };
-
-        let title = title.value(row);
-        let selftext = if selftext.is_null(row) {
-            ""
-        } else {
-            selftext.value(row)
-        };
-        let author = if author.is_null(row) {
-            DELETED_AUTHOR
-        } else {
-            author.value(row)
-        };
-
-        if config.prune_texts.contains(title.trim())
-            || config.prune_texts.contains(selftext.trim())
-            || config.prune_authors.contains(author.trim())
-        {
-            continue;
-        }
-
-        let Some(reservoir) = sample.reservoir(quotas, date.year(), subreddit.value(row)) else {
+        let Some(reservoir) = sample.reservoir(quotas, date.year(), subreddit) else {
             continue;
         };
         let key = rng.random::<u64>();
@@ -375,10 +369,10 @@ fn sample_batch(
 
         let mut doc = Document {
             date,
-            subreddit: subreddit.value(row).into(),
-            title: title.to_owned(),
-            author: author.into(),
-            selftext: selftext.into(),
+            subreddit: subreddit.into(),
+            title: posts.title.value(row).to_owned(),
+            author: posts.author(row).into(),
+            selftext: posts.selftext(row).into(),
             comment_chain: comments.deepest_chain(comments.range(row), rng, config),
         };
         doc.comment_chain.truncate(MAX_COMMENT_CHAIN_DEPTH);
@@ -392,6 +386,58 @@ fn column<'a>(array: &'a StructArray, name: &str) -> anyhow::Result<&'a ArrayRef
     array
         .column_by_name(name)
         .with_context(|| format!("missing column `{name}`"))
+}
+
+struct PostColumns<'a> {
+    created_utc: &'a PrimitiveArray<Int64Type>,
+    subreddit: &'a StringArray,
+    title: &'a StringArray,
+    selftext: &'a LargeStringArray,
+    author: &'a StringArray,
+}
+
+impl<'a> PostColumns<'a> {
+    fn new(batch: &'a StructArray) -> anyhow::Result<Self> {
+        Ok(Self {
+            created_utc: column(batch, "created_utc")?.as_primitive(),
+            subreddit: column(batch, "subreddit")?.as_string(),
+            title: column(batch, "title")?.as_string(),
+            selftext: column(batch, "selftext")?.as_string(),
+            author: column(batch, "author_name")?.as_string(),
+        })
+    }
+
+    fn selftext(&self, row: usize) -> &'a str {
+        if self.selftext.is_null(row) {
+            ""
+        } else {
+            self.selftext.value(row)
+        }
+    }
+
+    fn author(&self, row: usize) -> &'a str {
+        if self.author.is_null(row) {
+            DELETED_AUTHOR
+        } else {
+            self.author.value(row)
+        }
+    }
+
+    /// Returns the post's date and subreddit, or `None` if the post is excluded
+    /// by missing data or the author and text filters.
+    fn stratum(&self, row: usize, config: &DatasetConfig) -> Option<(Date, &'a str)> {
+        if self.subreddit.is_null(row) {
+            return None;
+        }
+        let date = day_to_date(self.created_utc.value(row).div_euclid(SECONDS_PER_DAY))?;
+        if config.prune_texts.contains(self.title.value(row).trim())
+            || config.prune_texts.contains(self.selftext(row).trim())
+            || config.prune_authors.contains(self.author(row).trim())
+        {
+            return None;
+        }
+        Some((date, self.subreddit.value(row)))
+    }
 }
 
 struct CommentColumns<'a> {
@@ -632,44 +678,83 @@ impl Sample {
 
 #[cfg(test)]
 mod tests {
-    use object_store::local::LocalFileSystem;
-    use reddit_ingest::{assemble::subreddit_daily::write_subreddit_daily, stats::SubredditDaily};
+    use arrow_array::{Int64Array, LargeStringArray, StringArray};
 
     use super::*;
 
-    #[tokio::test]
-    async fn post_counts_across_row_groups() {
-        // 2024-11-01T00:00:00Z; 200 days spans a year boundary and several row groups.
-        let start = 1_730_419_200;
-        let mut stats = SubredditDaily::default();
-        let mut expected = Strata::<u64>::default();
-        for day in 0..200i64 {
-            let created_utc = start + day * SECONDS_PER_DAY;
-            let year = day_to_date(created_utc / SECONDS_PER_DAY).unwrap().year();
-            for (i, subreddit) in ["a", "b", "c"].into_iter().enumerate() {
-                let subreddit = CompactString::from(subreddit);
-                let posts = (day as u64 + i as u64) % 4;
-                for _ in 0..posts {
-                    stats.add_post(created_utc, Some(&subreddit));
-                }
-                stats.add_comment(created_utc, &subreddit);
-                if posts > 0 {
-                    *expected
-                        .entry(year)
-                        .or_default()
-                        .entry(subreddit)
-                        .or_default() += posts;
-                }
-            }
-            stats.add_post(created_utc, None);
-        }
+    /// (created_utc, subreddit, title, selftext, author_name)
+    type PostRow = (
+        i64,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
 
-        let dir = tempfile::tempdir().unwrap();
-        write_subreddit_daily(dir.path(), &stats, 3).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let counts = read_post_counts(object_store, ObjectPath::from(SUBREDDIT_DAILY_FILE_NAME))
-            .await
-            .unwrap();
+    fn test_config() -> DatasetConfig {
+        DatasetConfig {
+            seed: 0,
+            work_dir: Default::default(),
+            reddit_ingest_bucket: String::new(),
+            reddit_ingest_path: String::new(),
+            post_sample_size: 0,
+            subreddit_uniform_mix: 0.0,
+            year_uniform_mix: 0.0,
+            prune_texts: ["[removed]".into()].into_iter().collect(),
+            prune_authors: ["AutoModerator".into()].into_iter().collect(),
+            total_vocab_size: 0,
+        }
+    }
+
+    #[test]
+    fn counts_exclude_filtered_posts() {
+        // 2024-12-31T00:00:00Z and 2025-01-01T00:00:00Z.
+        let (y2024, y2025) = (1_735_603_200, 1_735_689_600);
+        let rows: [PostRow; 8] = [
+            (y2024, Some("a"), "t", Some("s"), Some("u")),
+            (y2024, Some("a"), "t", None, None),
+            (y2024, Some("b"), "t", Some("s"), Some("u")),
+            (y2025, Some("a"), "t", Some("s"), Some("u")),
+            (y2025, None, "t", Some("s"), Some("u")),
+            (y2025, Some("a"), " [removed] ", Some("s"), Some("u")),
+            (y2025, Some("a"), "t", Some("[removed]"), Some("u")),
+            (y2025, Some("b"), "t", Some("s"), Some("AutoModerator")),
+        ];
+        let batch = RecordBatch::try_from_iter([
+            (
+                "created_utc",
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))) as ArrayRef,
+            ),
+            (
+                "subreddit",
+                Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1))),
+            ),
+            (
+                "title",
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.2))),
+            ),
+            (
+                "selftext",
+                Arc::new(LargeStringArray::from_iter(rows.iter().map(|r| r.3))),
+            ),
+            (
+                "author_name",
+                Arc::new(StringArray::from_iter(rows.iter().map(|r| r.4))),
+            ),
+        ])
+        .unwrap();
+
+        let mut counts = Strata::<u64>::default();
+        count_batch(&batch, &test_config(), &mut counts).unwrap();
+        let expected: Strata<u64> = [
+            (
+                2024,
+                [("a".into(), 2), ("b".into(), 1)].into_iter().collect(),
+            ),
+            (2025, [("a".into(), 1)].into_iter().collect()),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(counts, expected);
     }
 
