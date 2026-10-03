@@ -1,77 +1,144 @@
+use std::hash::Hash;
+
+use anyhow::{bail, ensure};
+use bytemuck::{Pod, Zeroable};
 use compact_bytes::CompactBytes;
-use serde::{Deserialize, Serialize, de};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeOwned},
+};
 
 #[derive(Debug, Clone)]
-pub struct Vocab {
-    tokens: Vec<Token>,
-    special_token_index: hashbrown::HashMap<u64, TokenId>,
+pub struct Vocab<SP> {
+    tokens: Vec<Token<SP>>,
+    merges: Vec<Merge>,
+    special_token_index: hashbrown::HashMap<SP, TokenId>,
 }
 
-impl Serialize for Vocab {
+#[derive(Debug, Serialize, Deserialize)]
+struct SerdeRepr<SP> {
+    tokens: Vec<Token<SP>>,
+    merges: Vec<Merge>,
+}
+
+impl<SP> Serialize for Vocab<SP>
+where
+    SP: SpecialTokenData,
+{
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        self.tokens.serialize(serializer)
+        SerdeRepr {
+            tokens: self.tokens.clone(),
+            merges: self.merges.clone(),
+        }
+        .serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for Vocab {
+impl<'de, SP> Deserialize<'de> for Vocab<SP>
+where
+    SP: SpecialTokenData,
+{
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let tokens = Vec::<Token>::deserialize(deserializer)?;
-        if tokens.len() >= u32::MAX as usize {
-            return Err(de::Error::custom("too many tokens"));
-        }
-        Ok(Self::new(tokens))
+        let SerdeRepr { tokens, merges } = SerdeRepr::deserialize(deserializer)?;
+        Self::new(tokens, merges).map_err(de::Error::custom)
     }
 }
 
-impl Vocab {
-    pub fn new(tokens: impl Into<Vec<Token>>) -> Self {
-        let tokens = tokens.into();
-        assert!(tokens.len() < u32::MAX as usize);
-        let mut special_token_index = hashbrown::HashMap::default();
-        for (id, token) in tokens.iter().enumerate() {
-            if let Token::Special(SpecialToken { tag }) = token {
-                special_token_index.insert(*tag, id as u32);
-            }
-        }
+impl<SP> Vocab<SP>
+where
+    SP: SpecialTokenData,
+{
+    pub fn empty() -> Self {
         Self {
-            tokens,
-            special_token_index,
+            tokens: Vec::new(),
+            merges: Vec::new(),
+            special_token_index: Default::default(),
         }
     }
 
-    pub fn tokens(&self) -> impl Iterator<Item = (TokenId, &Token)> {
+    pub fn new(
+        tokens: impl IntoIterator<Item = Token<SP>>,
+        merges: impl IntoIterator<Item = Merge>,
+    ) -> anyhow::Result<Self> {
+        let mut vocab = Self::empty();
+        for tok in tokens {
+            vocab.add_token(tok)?;
+        }
+        for merge in merges {
+            vocab.add_merge(merge)?;
+        }
+        Ok(vocab)
+    }
+
+    pub fn add_token(&mut self, token: Token<SP>) -> anyhow::Result<TokenId> {
+        if self.tokens.len() == u32::MAX as usize - 1 {
+            bail!("too many tokens");
+        }
+
+        if let Token::Special(special_data) = &token {
+            if self.special_token_index.contains_key(&special_data.data) {
+                bail!("duplicate special tokens");
+            }
+            self.special_token_index
+                .insert(special_data.data.clone(), TokenId(self.tokens.len() as u32));
+        }
+
+        self.tokens.push(token);
+        Ok(TokenId(self.tokens.len() as u32 - 1))
+    }
+
+    pub fn add_merge(&mut self, merge: Merge) -> anyhow::Result<()> {
+        ensure!((merge.first.0 as usize) < self.tokens.len());
+        ensure!((merge.second.0 as usize) < self.tokens.len());
+        ensure!((merge.merged.0 as usize) < self.tokens.len());
+        self.merges.push(merge);
+        Ok(())
+    }
+
+    pub fn merges(&self) -> impl Iterator<Item = Merge> {
+        self.merges.iter().copied()
+    }
+
+    pub fn tokens(&self) -> impl Iterator<Item = (TokenId, &Token<SP>)> {
         self.tokens
             .iter()
             .enumerate()
-            .map(|(i, tok)| (i as u32, tok))
+            .map(|(i, tok)| (TokenId(i as u32), tok))
     }
 
     pub fn num_tokens(&self) -> u32 {
         self.tokens.len() as u32
     }
 
-    pub fn token(&self, id: TokenId) -> &Token {
-        &self.tokens[id as usize]
+    pub fn token(&self, id: TokenId) -> &Token<SP> {
+        &self.tokens[id.0 as usize]
     }
 
-    pub fn special_token_tag_to_id(&self, tag: u64) -> Option<TokenId> {
-        self.special_token_index.get(&tag).copied()
+    pub fn special_token_to_id(&self, sp: &SP) -> Option<TokenId> {
+        self.special_token_index.get(sp).copied()
     }
 }
 
-pub type TokenId = u32;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum Token {
+pub enum Token<SP> {
     Text(TextToken),
-    Special(SpecialToken),
+    Special(SpecialToken<SP>),
+}
+
+impl<SP> Token<SP> {
+    pub fn text(&self) -> Option<&[u8]> {
+        match self {
+            Token::Text(text_token) => Some(&text_token.0),
+            Token::Special(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +169,38 @@ impl<'de> Deserialize<'de> for TextToken {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpecialToken {
+pub struct SpecialToken<S> {
     #[serde(rename = "special")]
-    pub tag: u64,
+    pub data: S,
+}
+
+pub trait SpecialTokenData: Clone + Eq + Hash + Serialize + DeserializeOwned {}
+
+impl SpecialTokenData for () {}
+
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Pod, Zeroable,
+)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct TokenId(u32);
+
+impl TokenId {
+    pub const PLACEHOLDER: TokenId = TokenId(u32::MAX);
+
+    pub fn from_idx(idx: u32) -> anyhow::Result<Self> {
+        ensure!(idx < u32::MAX);
+        Ok(Self(idx))
+    }
+
+    pub fn idx(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Merge {
+    pub first: TokenId,
+    pub second: TokenId,
+    pub merged: TokenId,
 }

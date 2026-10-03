@@ -313,6 +313,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blosc2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4efb3b874925bab7e6c78522287b941696fc066faa9ef54e2b9449d8d39002d9"
+dependencies = [
+ "blosc2-rs-sys",
+ "cfg-if",
+ "libc",
+ "ndarray",
+]
+
+[[package]]
+name = "blosc2-rs-sys"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b451a531f8d227ea336ced6236d1913ed9fea097ce563e9c6f19448c78cecbdd"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+]
+
+[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2062,6 +2085,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrixmultiply"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
+dependencies = [
+ "autocfg",
+ "rawpointer",
+]
+
+[[package]]
 name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2171,6 +2204,21 @@ checksum = "b9a513473dce7dc00c7e7c318481ca4494034e76997218d8dad51bd9f007a815"
 dependencies = [
  "nano-gemm-codegen",
  "nano-gemm-core",
+]
+
+[[package]]
+name = "ndarray"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rawpointer",
 ]
 
 [[package]]
@@ -2813,6 +2861,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rawpointer"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3358,18 +3412,18 @@ name = "skytokens"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blosc2",
+ "bytemuck",
  "compact_bytes",
  "dashmap",
  "escape-bytes",
  "hashbrown 0.17.1",
- "lz4_flex",
  "memchr",
  "priority-queue",
  "rayon",
  "serde",
  "serde_json",
  "simple-semaphore",
- "zstd",
 ]
 
 [[package]]

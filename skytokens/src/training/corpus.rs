@@ -1,169 +1,243 @@
+//! Corpus is represented as chunks of tokens, where documents
+//! cannot be spread across chunks, and each chunk is blosc-compressed.
+//! Documents within a chunk are separated by DOC_TERMINATOR_TOKEN.
+
 use std::{
-    io::Cursor,
-    iter, mem,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread::available_parallelism,
+    cell::RefCell,
+    mem,
+    sync::{Arc, OnceLock},
 };
 
-use simple_semaphore::Semaphore;
+use blosc2::{
+    CParams, CompressAlgo, DParams,
+    chunk::{Decoder, Encoder},
+};
+use dashmap::DashMap;
+use hashbrown::HashMap;
+use priority_queue::PriorityQueue;
+use rayon::prelude::*;
 
-use crate::training::config::InMemoryCompression;
+use crate::{
+    training::{DOC_TERMINATOR_TOKEN, token_id_for_byte},
+    vocab::{Merge, TokenId},
+};
 
-/// Approx. size of uncompressed text data in each chunk.
-pub(super) const CHUNK_SIZE: usize = 64 * 1024;
+const TOKENS_PER_CHUNK: usize = 16 * 1024;
 
-#[derive(Debug, Clone)]
+thread_local! {
+    static ENCODER: RefCell<Encoder> = {
+        let mut params = CParams::default();
+        params.nthreads(1).typesize(size_of::<TokenId>()).unwrap().compressor(CompressAlgo::Lz4);
+        RefCell::new(Encoder::new(params).expect("failed to init blosc"))
+    };
+}
+
+thread_local! {
+    static DECODER: RefCell<Decoder> = {
+        let mut params = DParams::default();
+        params.nthreads(1);
+
+        RefCell::new(Decoder::new(params).expect("failed to init blosc"))
+    };
+}
+
+#[derive(Default, Debug, Clone)]
 pub struct CorpusBuilder {
-    compression: Option<InMemoryCompression>,
-    chunks: Vec<Arc<OnceLock<Chunk>>>,
-    concurrency_limiter: Arc<Semaphore>,
-
-    current_chunk_data: Vec<u8>,
-    current_chunk_doc_boundaries: Vec<u32>,
-
-    /// index i stores number of occurrences of byte pair (`i & 0xFF`, `i >> 8`)
-    byte_pair_occurrences: Arc<[AtomicUsize]>,
-    total_uncompressed_bytes: usize,
+    compressed_chunks: Vec<Arc<OnceLock<Arc<[u8]>>>>,
+    current_chunk: Vec<TokenId>,
+    token_pair_occurrence_counts: HashMap<(TokenId, TokenId), usize>,
 }
 
 impl CorpusBuilder {
-    pub fn new(compression: Option<InMemoryCompression>) -> Self {
-        Self {
-            compression,
-            chunks: Vec::new(),
-            concurrency_limiter: Semaphore::new(available_parallelism().unwrap().get() * 2),
-            current_chunk_data: Vec::with_capacity(2 * CHUNK_SIZE),
-            current_chunk_doc_boundaries: Vec::new(),
-            byte_pair_occurrences: iter::repeat_with(|| AtomicUsize::new(0))
-                .take(1 << 16)
-                .collect(),
-            total_uncompressed_bytes: 0,
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_document(&mut self, document: impl AsRef<[u8]>) {
+        for &byte in document.as_ref() {
+            self.add_token(token_id_for_byte(byte));
         }
+        for &[first, second] in document.as_ref().array_windows::<2>() {
+            *self
+                .token_pair_occurrence_counts
+                .entry((token_id_for_byte(first), token_id_for_byte(second)))
+                .or_default() += 1;
+        }
+        self.add_token(DOC_TERMINATOR_TOKEN);
+        if self.current_chunk.len() >= TOKENS_PER_CHUNK {
+            self.flush_chunk();
+        }
+    }
+
+    fn add_token(&mut self, token: TokenId) {
+        self.current_chunk.push(token);
     }
 
     fn flush_chunk(&mut self) {
-        let data = mem::take(&mut self.current_chunk_data);
-        self.current_chunk_data.reserve(2 * CHUNK_SIZE);
-        let doc_boundaries = mem::take(&mut self.current_chunk_doc_boundaries);
-
-        let chunk = Arc::new(OnceLock::new());
-        self.chunks.push(chunk.clone());
-
-        let compression = self.compression;
-        let permit = self.concurrency_limiter.acquire();
-
-        let byte_pair_occurrences = self.byte_pair_occurrences.clone();
-
-        rayon::spawn(move || {
-            let mut local_byte_pair_occurrences = hashbrown::HashMap::new();
-            let mut prev_doc_end_index = 0;
-            for &doc_end_index in &doc_boundaries {
-                let doc = &data[prev_doc_end_index as usize..doc_end_index as usize];
-                for &[a, b] in doc.array_windows::<2>() {
-                    let i = (a as u16) | ((b as u16) << 8);
-                    *local_byte_pair_occurrences.entry(i).or_default() += 1;
-                }
-                prev_doc_end_index = doc_end_index;
-            }
-
-            for (i, count) in local_byte_pair_occurrences {
-                byte_pair_occurrences[i as usize].fetch_add(count, Ordering::Relaxed);
-            }
-
-            let data = match compression {
-                Some(compression) => compress(&data, compression),
-                None => data,
-            };
-            chunk
-                .set(Chunk {
-                    data: data.into(),
-                    doc_boundaries: doc_boundaries.into(),
-                })
-                .ok()
-                .unwrap();
-
-            drop(permit);
-        });
-    }
-
-    pub fn add_document(&mut self, document: impl AsRef<[u8]>) -> anyhow::Result<()> {
-        self.total_uncompressed_bytes += document.as_ref().len();
-        self.current_chunk_data.extend_from_slice(document.as_ref());
-        self.current_chunk_doc_boundaries
-            .push(self.current_chunk_data.len().try_into()?);
-
-        if self.current_chunk_data.len() >= CHUNK_SIZE {
-            self.flush_chunk();
+        if self.current_chunk.is_empty() {
+            return;
         }
 
-        Ok(())
+        let chunk_cell = Arc::new(OnceLock::new());
+        self.compressed_chunks.push(chunk_cell.clone());
+
+        let chunk_uncompressed = mem::take(&mut self.current_chunk);
+        rayon::spawn(move || {
+            ENCODER.with(|cell| {
+                let mut encoder = cell.borrow_mut();
+                let compressed_chunk = encoder
+                    .compress(bytemuck::cast_slice(chunk_uncompressed.as_slice()))
+                    .expect("blosc failed to compress");
+                let compressed_chunk = Arc::<[u8]>::from(compressed_chunk.as_bytes());
+                chunk_cell.set(compressed_chunk).ok().unwrap();
+            });
+        });
+
+        self.current_chunk.reserve(TOKENS_PER_CHUNK);
     }
 
     pub fn build(mut self) -> Corpus {
         self.flush_chunk();
-        let chunks = self
-            .chunks
-            .iter()
-            .map(|c| c.wait().clone())
-            .collect::<Vec<_>>();
-
-        let mut byte_pair_occurrences = hashbrown::HashMap::new();
-        for (i, count) in self.byte_pair_occurrences.iter().enumerate() {
-            let a = (i & 0xFF) as u8;
-            let b = ((i >> 8) & 0xFF) as u8;
-            byte_pair_occurrences.insert((a, b), count.load(Ordering::Relaxed));
-        }
-
         Corpus {
-            chunks,
-            total_uncompressed_bytes: self.total_uncompressed_bytes,
-            byte_pair_occurrences,
-            compression: self.compression,
+            compressed_chunks: self
+                .compressed_chunks
+                .into_iter()
+                .map(|cell| Arc::clone(cell.wait()))
+                .collect(),
+            token_pair_occurrence_counts: self.token_pair_occurrence_counts.into_iter().collect(),
         }
-    }
-}
-
-fn compress(data: &[u8], compression: InMemoryCompression) -> Vec<u8> {
-    match compression {
-        InMemoryCompression::Lz4 => lz4_flex::compress_prepend_size(data),
-        InMemoryCompression::Zstd { level } => {
-            zstd::bulk::compress(data, level).expect("zstd failed?")
-        }
-    }
-}
-
-pub(super) fn decompress(compressed_data: &[u8], compression: InMemoryCompression) -> Vec<u8> {
-    match compression {
-        InMemoryCompression::Lz4 => lz4_flex::decompress_size_prepended(compressed_data)
-            .expect("lz4 compression failed roundtrip"),
-        InMemoryCompression::Zstd { .. } => zstd::decode_all(Cursor::new(compressed_data))
-            .expect("zstd compression failed roundtrip"),
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Corpus {
-    pub(super) compression: Option<InMemoryCompression>,
-    pub(super) chunks: Vec<Chunk>,
-    #[allow(unused)]
-    pub(super) total_uncompressed_bytes: usize,
-    pub(super) byte_pair_occurrences: hashbrown::HashMap<(u8, u8), usize>,
+    compressed_chunks: Vec<Arc<[u8]>>,
+    token_pair_occurrence_counts:
+        PriorityQueue<(TokenId, TokenId), usize, hashbrown::DefaultHashBuilder>,
 }
 
 impl Corpus {
-    pub fn builder(compression: Option<InMemoryCompression>) -> CorpusBuilder {
-        CorpusBuilder::new(compression)
+    pub(super) fn most_frequent_token_pair(&self) -> Option<(TokenId, TokenId)> {
+        let (&(first, second), &count) = self.token_pair_occurrence_counts.peek()?;
+        if count == 0 {
+            None
+        } else {
+            Some((first, second))
+        }
     }
-}
 
-#[derive(Debug, Clone)]
-pub(super) struct Chunk {
-    /// Compressed if in-memory compression is enabled.
-    pub(super) data: Arc<[u8]>,
-    /// Sorted boundary positions between different documents
-    /// within the chunk.
-    pub(super) doc_boundaries: Arc<[u32]>,
+    /// Updates the corpus in-place to apply the given token merge.
+    /// Parallelized.
+    pub(super) fn apply_merge(&mut self, merge: Merge) {
+        assert_ne!(merge.first, DOC_TERMINATOR_TOKEN);
+        assert_ne!(merge.second, DOC_TERMINATOR_TOKEN);
+        assert_ne!(merge.merged, DOC_TERMINATOR_TOKEN);
+
+        let token_pair_occurrence_count_deltas =
+            DashMap::<(TokenId, TokenId), isize, hashbrown::DefaultHashBuilder>::default();
+
+        self.compressed_chunks
+            .par_iter_mut()
+            .for_each(|compressed_chunk| {
+                let mut v = None;
+                let original_tokens = DECODER.with(|cell| {
+                    let mut decoder = cell.borrow_mut();
+                    let vec = decoder
+                        .decompress(compressed_chunk)
+                        .expect("blosc failed to decompress");
+                    v = Some(vec);
+                    bytemuck::cast_slice::<u8, TokenId>(v.as_ref().unwrap().as_slice())
+                });
+                let mut new_tokens = Vec::with_capacity(original_tokens.len());
+                let mut did_change = false;
+                let mut local_token_pair_occurrence_count_deltas =
+                    HashMap::<(TokenId, TokenId), isize>::default();
+
+                let mut i = 0;
+                while i < original_tokens.len() {
+                    let tok1 = original_tokens[i];
+                    if let Some(tok2) = original_tokens.get(i + 1).copied()
+                        && tok1 == merge.first
+                        && tok2 == merge.second
+                    {
+                        // Match; apply merge.
+                        did_change = true;
+                        new_tokens.push(merge.merged);
+
+                        // Update counts:
+                        // -1 occurrence for the merged pair
+                        *local_token_pair_occurrence_count_deltas
+                            .entry((tok1, tok2))
+                            .or_default() -= 1;
+
+                        if let Some(tok0) = new_tokens.len().checked_sub(2).map(|i0| new_tokens[i0])
+                            && tok0 != DOC_TERMINATOR_TOKEN
+                        {
+                            // -1 occurrence for (tok0, tok1)
+                            *local_token_pair_occurrence_count_deltas
+                                .entry((tok0, tok1))
+                                .or_default() -= 1;
+                            // +1 occurrence for (tok0, merged_token)
+                            *local_token_pair_occurrence_count_deltas
+                                .entry((tok0, merge.merged))
+                                .or_default() += 1;
+                        }
+
+                        if let Some(tok3) = original_tokens.get(i + 2).copied()
+                            && tok3 != DOC_TERMINATOR_TOKEN
+                        {
+                            // -1 occurrence for (tok2, tok)
+                            *local_token_pair_occurrence_count_deltas
+                                .entry((tok2, tok3))
+                                .or_default() -= 1;
+
+                            // +1 occurrence for (merged_token, tok3)
+                            *local_token_pair_occurrence_count_deltas
+                                .entry((merge.merged, tok3))
+                                .or_default() += 1;
+                        }
+
+                        // Skip past tok2 in the original token stream.
+                        i += 1;
+                    } else {
+                        new_tokens.push(tok1);
+                    }
+
+                    i += 1;
+                }
+
+                for ((first, second), delta) in local_token_pair_occurrence_count_deltas {
+                    *token_pair_occurrence_count_deltas
+                        .entry((first, second))
+                        .or_default() += delta;
+                }
+
+                if did_change {
+                    ENCODER.with(|cell| {
+                        let mut encoder = cell.borrow_mut();
+                        let data = encoder
+                            .compress(bytemuck::cast_slice::<TokenId, u8>(&new_tokens))
+                            .expect("blosc failed to compress");
+                        *compressed_chunk = data.as_bytes().into();
+                    });
+                }
+            });
+
+        for ((first, second), delta) in token_pair_occurrence_count_deltas {
+            let count = self
+                .token_pair_occurrence_counts
+                .get_priority(&(first, second))
+                .copied()
+                .unwrap_or(0);
+
+            let new_count = count
+                .checked_add_signed(delta)
+                .expect("token count should not be negative");
+
+            if new_count != count {
+                self.token_pair_occurrence_counts
+                    .push((first, second), new_count);
+            }
+        }
+    }
 }
