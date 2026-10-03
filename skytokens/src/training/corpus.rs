@@ -6,6 +6,7 @@ use std::{
     cell::RefCell,
     mem,
     sync::{Arc, OnceLock},
+    thread::available_parallelism,
 };
 
 use blosc2::{
@@ -16,6 +17,7 @@ use dashmap::DashMap;
 use hashbrown::HashMap;
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
+use simple_semaphore::Semaphore;
 
 use crate::{
     training::{DOC_TERMINATOR_TOKEN, token_id_for_byte},
@@ -41,16 +43,28 @@ thread_local! {
     };
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug)]
 pub struct CorpusBuilder {
     compressed_chunks: Vec<Arc<OnceLock<Arc<[u8]>>>>,
+    concurrency_limiter: Arc<Semaphore>,
     current_chunk: Vec<TokenId>,
     token_pair_occurrence_counts: HashMap<(TokenId, TokenId), usize>,
+    pool: rayon::ThreadPool,
 }
 
 impl CorpusBuilder {
     pub fn new() -> Self {
-        Self::default()
+        let threads = available_parallelism().unwrap().get();
+        Self {
+            compressed_chunks: Default::default(),
+            concurrency_limiter: Semaphore::new(4 * threads),
+            current_chunk: Default::default(),
+            token_pair_occurrence_counts: Default::default(),
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap(),
+        }
     }
 
     pub fn add_document(&mut self, document: impl AsRef<[u8]>) {
@@ -82,7 +96,8 @@ impl CorpusBuilder {
         self.compressed_chunks.push(chunk_cell.clone());
 
         let chunk_uncompressed = mem::take(&mut self.current_chunk);
-        rayon::spawn(move || {
+        let permit = self.concurrency_limiter.acquire();
+        self.pool.spawn(move || {
             ENCODER.with(|cell| {
                 let mut encoder = cell.borrow_mut();
                 let compressed_chunk = encoder
@@ -91,6 +106,7 @@ impl CorpusBuilder {
                 let compressed_chunk = Arc::<[u8]>::from(compressed_chunk.as_bytes());
                 chunk_cell.set(compressed_chunk).ok().unwrap();
             });
+            drop(permit);
         });
 
         self.current_chunk.reserve(TOKENS_PER_CHUNK);
@@ -110,6 +126,12 @@ impl CorpusBuilder {
                 .map(|((first, second), count)| ((first, second), (count, first, second)))
                 .collect(),
         }
+    }
+}
+
+impl Default for CorpusBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
