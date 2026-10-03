@@ -104,7 +104,11 @@ impl CorpusBuilder {
                 .into_iter()
                 .map(|cell| Arc::clone(cell.wait()))
                 .collect(),
-            token_pair_occurrence_counts: self.token_pair_occurrence_counts.into_iter().collect(),
+            token_pair_occurrence_counts: self
+                .token_pair_occurrence_counts
+                .into_iter()
+                .map(|((first, second), count)| ((first, second), (count, first, second)))
+                .collect(),
         }
     }
 }
@@ -113,12 +117,12 @@ impl CorpusBuilder {
 pub struct Corpus {
     compressed_chunks: Vec<Arc<[u8]>>,
     token_pair_occurrence_counts:
-        PriorityQueue<(TokenId, TokenId), usize, hashbrown::DefaultHashBuilder>,
+        PriorityQueue<(TokenId, TokenId), (usize, TokenId, TokenId), hashbrown::DefaultHashBuilder>,
 }
 
 impl Corpus {
     pub(super) fn most_frequent_token_pair(&self) -> Option<(TokenId, TokenId)> {
-        let (&(first, second), &count) = self.token_pair_occurrence_counts.peek()?;
+        let (&(first, second), &(count, ..)) = self.token_pair_occurrence_counts.peek()?;
         if count == 0 {
             None
         } else {
@@ -228,6 +232,7 @@ impl Corpus {
                 .token_pair_occurrence_counts
                 .get_priority(&(first, second))
                 .copied()
+                .map(|tup| tup.0)
                 .unwrap_or(0);
 
             let new_count = count
@@ -236,7 +241,7 @@ impl Corpus {
 
             if new_count != count {
                 self.token_pair_occurrence_counts
-                    .push((first, second), new_count);
+                    .push((first, second), (new_count, first, second));
             }
         }
     }

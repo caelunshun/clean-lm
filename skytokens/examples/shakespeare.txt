@@ -1,4 +1,3 @@
-text
 "First Citizen: Before we proceed any further, hear me speak."
 "All: Speak, speak."
 First Citizen: You are all resolved rather to die than to famish?

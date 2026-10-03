@@ -12,6 +12,7 @@ use serde::{
 pub struct Vocab<SP> {
     tokens: Vec<Token<SP>>,
     merges: Vec<Merge>,
+    text_token_index: hashbrown::HashMap<CompactBytes, TokenId>,
     special_token_index: hashbrown::HashMap<SP, TokenId>,
 }
 
@@ -59,6 +60,7 @@ where
             tokens: Vec::new(),
             merges: Vec::new(),
             special_token_index: Default::default(),
+            text_token_index: Default::default(),
         }
     }
 
@@ -87,6 +89,14 @@ where
             }
             self.special_token_index
                 .insert(special_data.data.clone(), TokenId(self.tokens.len() as u32));
+        }
+
+        if let Token::Text(text) = &token {
+            if self.text_token_index.contains_key(&text.0) {
+                bail!("duplicate text tokens");
+            }
+            self.text_token_index
+                .insert(text.0.clone(), TokenId(self.tokens.len() as u32));
         }
 
         self.tokens.push(token);
@@ -122,6 +132,12 @@ where
 
     pub fn special_token_to_id(&self, sp: &SP) -> Option<TokenId> {
         self.special_token_index.get(sp).copied()
+    }
+
+    pub fn text_to_id(&self, text: impl AsRef<[u8]>) -> Option<TokenId> {
+        self.text_token_index
+            .get(&CompactBytes::new(text.as_ref()))
+            .copied()
     }
 }
 
