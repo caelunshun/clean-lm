@@ -17,8 +17,11 @@ pub struct DatasetConfig {
     pub reddit_ingest_bucket: String,
     pub reddit_ingest_path: String,
     pub post_sample_size: u32,
-    pub subreddit_sampling_bias: f64,
-    pub year_sampling_bias: f64,
+    /// In `[0, 1]`: quotas are a mixture of `(1 - mix) * proportional + mix * uniform`
+    /// across subreddits within a year.
+    pub subreddit_uniform_mix: f64,
+    /// As `subreddit_uniform_mix`, but across years.
+    pub year_uniform_mix: f64,
     pub prune_texts: FastIndexSet<CompactString>,
     pub prune_authors: FastIndexSet<CompactString>,
     /// Total vocabulary size including special tokens.

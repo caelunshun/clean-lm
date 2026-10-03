@@ -1,26 +1,27 @@
 #![allow(deprecated)]
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    io::{BufWriter, Cursor, Write},
-    ops::Range,
-    sync::Arc,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, io::Cursor, ops::Range, sync::Arc};
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use arrow_array::{
     Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, StructArray,
     cast::AsArray,
     types::{Date32Type, Int64Type, UInt64Type},
 };
-use compact_str::{CompactString, ToCompactString};
+use compact_str::CompactString;
 use object_store::{ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath};
 use parquet::arrow::{
     ProjectionMask,
-    async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+    arrow_reader::ArrowReaderMetadata,
+    async_reader::{
+        ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+    },
 };
-use rand::{RngExt, SeedableRng, rngs::StdRng, seq::IndexedRandom};
+use rand::{
+    RngExt, SeedableRng,
+    rngs::StdRng,
+    seq::{IndexedRandom, SliceRandom},
+};
 use reddit_ingest::{
     assemble::{
         index_json::{INDEX_FILE_NAME, IndexJson},
@@ -33,24 +34,38 @@ use tokio::task::JoinSet;
 
 use crate::skyred::{
     config::DatasetConfig,
-    dataset::schema::{Comment, Document},
+    dataset::{
+        document_file,
+        schema::{Comment, Document},
+    },
 };
 
 const SECONDS_PER_DAY: i64 = 86_400;
 /// Used to impute author name when null.
 const DELETED_AUTHOR: &str = "[deleted]";
 const MAX_COMMENT_CHAIN_DEPTH: usize = 16;
+const POST_COUNT_ROW_GROUPS_IN_FLIGHT: usize = 32;
 
 type Year = i16;
 
 /// Values keyed by (year, subreddit).
 type Strata<T> = FastHashMap<Year, FastHashMap<CompactString, T>>;
 
+pub const SAMPLE_FILE_NAME: &str = "posts.zst";
+
 pub fn build_sample(config: &DatasetConfig) -> anyhow::Result<()> {
-    tokio::runtime::Runtime::new()?.block_on(build_sample_async(config))
+    for mix in [config.year_uniform_mix, config.subreddit_uniform_mix] {
+        ensure!((0.0..=1.0).contains(&mix), "uniform mix must be in [0, 1]");
+    }
+
+    let documents = tokio::runtime::Runtime::new()?.block_on(build_sample_async(config))?;
+    tracing::info!(num_documents = documents.len(), "writing sampled documents");
+
+    fs_err::create_dir_all(&config.work_dir)?;
+    document_file::write_documents(&config.work_dir.join(SAMPLE_FILE_NAME), &documents)
 }
 
-async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<()> {
+async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<Vec<Document>> {
     let object_store: Arc<dyn ObjectStore> = Arc::new(
         AmazonS3Builder::from_env()
             .with_bucket_name(&config.reddit_ingest_bucket)
@@ -77,7 +92,7 @@ async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<()> {
         "allocated sample quotas"
     );
 
-    let max_in_flight = std::thread::available_parallelism()?.get();
+    let max_in_flight = 2 * std::thread::available_parallelism()?.get();
     let mut files = index
         .files
         .iter()
@@ -107,29 +122,58 @@ async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<()> {
         tracing::info!("sampled {files_done}/{} files", index.files.len());
     }
 
-    let documents = sample.into_documents();
-    tracing::info!(num_documents = documents.len(), "writing sampled documents");
-
-    fs_err::create_dir_all(&config.work_dir)?;
-    let mut encoder = zstd::Encoder::new(
-        BufWriter::new(fs_err::File::create(config.work_dir.join("posts.zst"))?),
-        3,
-    )?;
-    postcard::to_io(&documents, &mut encoder)?;
-    encoder.finish()?.flush()?;
-
-    Ok(())
+    Ok(sample.into_documents(&mut rng))
 }
 
 /// Reads the number of posts per (year, subreddit), excluding posts without a subreddit.
+/// Row groups are fetched and decoded concurrently.
 async fn read_post_counts(
     object_store: Arc<dyn ObjectStore>,
     path: ObjectPath,
 ) -> anyhow::Result<Strata<u64>> {
-    let mut stream =
-        ParquetRecordBatchStreamBuilder::new(ParquetObjectReader::new(object_store, path))
-            .await?
+    let mut reader = ParquetObjectReader::new(object_store, path);
+    let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+    let schema = metadata.parquet_schema();
+    let leaves = schema
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| matches!(col.name(), "date" | "subreddit" | "posts"))
+        .map(|(i, _)| i);
+    let projection = ProjectionMask::leaves(schema, leaves);
+
+    let mut row_groups = 0..metadata.metadata().num_row_groups();
+    let mut tasks = JoinSet::new();
+    let mut counts = Strata::<u64>::default();
+    loop {
+        while tasks.len() < POST_COUNT_ROW_GROUPS_IN_FLIGHT
+            && let Some(row_group) = row_groups.next()
+        {
+            let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                reader.clone(),
+                metadata.clone(),
+            )
+            .with_projection(projection.clone())
+            .with_row_groups(vec![row_group])
             .build()?;
+            tasks.spawn(count_posts(stream));
+        }
+        let Some(partial) = tasks.join_next().await else {
+            break;
+        };
+        for (year, partial_by_subreddit) in partial?? {
+            let by_subreddit = counts.entry(year).or_default();
+            for (subreddit, count) in partial_by_subreddit {
+                *by_subreddit.entry(subreddit).or_default() += count;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+async fn count_posts(
+    mut stream: ParquetRecordBatchStream<ParquetObjectReader>,
+) -> anyhow::Result<Strata<u64>> {
     let mut counts = Strata::<u64>::default();
     while let Some(reader) = stream.next_row_group().await? {
         for batch in reader {
@@ -164,7 +208,7 @@ fn allocate_quotas(post_counts: &Strata<u64>, config: &DatasetConfig) -> Strata<
     let year_quotas = apportion(
         config.post_sample_size.into(),
         &year_counts,
-        config.year_sampling_bias,
+        config.year_uniform_mix,
     );
 
     years
@@ -175,7 +219,7 @@ fn allocate_quotas(post_counts: &Strata<u64>, config: &DatasetConfig) -> Strata<
             let mut subreddits: Vec<_> = by_subreddit.iter().collect();
             subreddits.sort_unstable_by_key(|(subreddit, _)| *subreddit);
             let counts: Vec<u64> = subreddits.iter().map(|(_, count)| **count).collect();
-            let quotas = apportion(year_quota, &counts, config.subreddit_sampling_bias);
+            let quotas = apportion(year_quota, &counts, config.subreddit_uniform_mix);
             let by_subreddit = subreddits
                 .into_iter()
                 .zip(quotas)
@@ -187,13 +231,18 @@ fn allocate_quotas(post_counts: &Strata<u64>, config: &DatasetConfig) -> Strata<
         .collect()
 }
 
-/// Splits `total` across categories proportional to `count(category) + bias * total`,
-/// capping each category at its count and redistributing the excess.
-fn apportion(total: u64, counts: &[u64], bias: f64) -> Vec<u64> {
+/// Splits `total` across categories by shares mixing `(1 - uniform_mix)` proportional to count
+/// with `uniform_mix` uniform over nonempty categories, capping each category at its count
+/// and redistributing the excess in proportion to the remaining shares.
+fn apportion(total: u64, counts: &[u64], uniform_mix: f64) -> Vec<u64> {
     let mut quotas = vec![0u64; counts.len()];
-    let mut remaining = total.min(counts.iter().sum());
+    let count_sum: u64 = counts.iter().sum();
+    let mut remaining = total.min(count_sum);
     let mut active: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
-    let weight = |i: usize| counts[i] as f64 + bias * total as f64;
+    let num_nonempty = active.len() as f64;
+    let weight = |i: usize| {
+        (1.0 - uniform_mix) * counts[i] as f64 / count_sum as f64 + uniform_mix / num_nonempty
+    };
     loop {
         let total_weight: f64 = active.iter().map(|&i| weight(i)).sum();
         let ideal = |i: usize| remaining as f64 * weight(i) / total_weight;
@@ -297,17 +346,16 @@ fn sample_batch(
             continue;
         };
 
-        let title = title.value(row).to_owned();
+        let title = title.value(row);
         let selftext = if selftext.is_null(row) {
-            CompactString::default()
+            ""
         } else {
-            selftext.value(row).to_compact_string()
+            selftext.value(row)
         };
-
         let author = if author.is_null(row) {
-            DELETED_AUTHOR.to_compact_string()
+            DELETED_AUTHOR
         } else {
-            author.value(row).to_compact_string()
+            author.value(row)
         };
 
         if config.prune_texts.contains(title.trim())
@@ -328,9 +376,9 @@ fn sample_batch(
         let mut doc = Document {
             date,
             subreddit: subreddit.value(row).into(),
-            title,
-            author,
-            selftext,
+            title: title.to_owned(),
+            author: author.into(),
+            selftext: selftext.into(),
             comment_chain: comments.deepest_chain(comments.range(row), rng, config),
         };
         doc.comment_chain.truncate(MAX_COMMENT_CHAIN_DEPTH);
@@ -567,8 +615,9 @@ impl Sample {
         }
     }
 
-    /// Documents ordered by key, i.e. deterministically shuffled.
-    fn into_documents(self) -> Vec<Document> {
+    /// Documents in a deterministic random order. Ordering by key alone is not a uniform
+    /// shuffle, since the keys kept by heavily subsampled strata cluster near the maximum.
+    fn into_documents(self, rng: &mut StdRng) -> Vec<Document> {
         let mut items: Vec<Keyed> = self
             .strata
             .into_values()
@@ -576,6 +625,96 @@ impl Sample {
             .flat_map(|reservoir| reservoir.heap.into_iter().map(|Reverse(item)| item))
             .collect();
         items.sort_unstable();
+        items.shuffle(rng);
         items.into_iter().map(|item| item.doc).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::local::LocalFileSystem;
+    use reddit_ingest::{assemble::subreddit_daily::write_subreddit_daily, stats::SubredditDaily};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn post_counts_across_row_groups() {
+        // 2024-11-01T00:00:00Z; 200 days spans a year boundary and several row groups.
+        let start = 1_730_419_200;
+        let mut stats = SubredditDaily::default();
+        let mut expected = Strata::<u64>::default();
+        for day in 0..200i64 {
+            let created_utc = start + day * SECONDS_PER_DAY;
+            let year = day_to_date(created_utc / SECONDS_PER_DAY).unwrap().year();
+            for (i, subreddit) in ["a", "b", "c"].into_iter().enumerate() {
+                let subreddit = CompactString::from(subreddit);
+                let posts = (day as u64 + i as u64) % 4;
+                for _ in 0..posts {
+                    stats.add_post(created_utc, Some(&subreddit));
+                }
+                stats.add_comment(created_utc, &subreddit);
+                if posts > 0 {
+                    *expected
+                        .entry(year)
+                        .or_default()
+                        .entry(subreddit)
+                        .or_default() += posts;
+                }
+            }
+            stats.add_post(created_utc, None);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_subreddit_daily(dir.path(), &stats, 3).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let counts = read_post_counts(object_store, ObjectPath::from(SUBREDDIT_DAILY_FILE_NAME))
+            .await
+            .unwrap();
+        assert_eq!(counts, expected);
+    }
+
+    #[test]
+    fn apportion_proportional() {
+        assert_eq!(apportion(50, &[10, 30, 60], 0.0), [5, 15, 30]);
+    }
+
+    #[test]
+    fn apportion_uniform() {
+        assert_eq!(apportion(30, &[100, 0, 100, 100], 1.0), [10, 0, 10, 10]);
+    }
+
+    #[test]
+    fn apportion_mixture() {
+        // Shares: 0.5 * [0.1, 0.9] + 0.5 * [0.5, 0.5] = [0.3, 0.7].
+        assert_eq!(apportion(100, &[100, 900], 0.5), [30, 70]);
+    }
+
+    #[test]
+    fn apportion_redistributes_capped_excess() {
+        // Uniform would give ~10 each, but the first category only has 1.
+        assert_eq!(apportion(31, &[1, 1000, 1000], 1.0), [1, 15, 15]);
+        // Shares are ~[0.18, 0.26, 0.56]; the remaining 90 is split ~[0.32, 0.68].
+        assert_eq!(apportion(100, &[10, 100, 400], 0.5), [10, 29, 61]);
+    }
+
+    #[test]
+    fn apportion_total_exceeds_counts() {
+        assert_eq!(apportion(1000, &[3, 0, 7], 0.3), [3, 0, 7]);
+    }
+
+    #[test]
+    fn apportion_sums_to_total() {
+        let counts: Vec<u64> = (0..1000).map(|i| (i * i) % 997 + i / 10).collect();
+        for mix in [0.0, 0.1, 0.5, 0.9, 1.0] {
+            for total in [0, 1, 999, 12_345, 100_000] {
+                let quotas = apportion(total, &counts, mix);
+                assert_eq!(
+                    quotas.iter().sum::<u64>(),
+                    total.min(counts.iter().sum()),
+                    "mix={mix} total={total}"
+                );
+                assert!(quotas.iter().zip(&counts).all(|(q, c)| q <= c));
+            }
+        }
     }
 }

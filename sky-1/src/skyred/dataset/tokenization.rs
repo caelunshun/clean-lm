@@ -10,7 +10,10 @@ use skytokens::{
 };
 use strum::{EnumIter, IntoEnumIterator};
 
-use crate::skyred::{config::DatasetConfig, dataset::schema::Document};
+use crate::skyred::{
+    config::DatasetConfig,
+    dataset::{document_file::DocumentReader, sampling::SAMPLE_FILE_NAME, schema::Document},
+};
 
 pub struct SkyredTokenizer {
     vocab: Vocab<SpecialToken>,
@@ -88,13 +91,11 @@ impl SpecialTokenData for SpecialToken {}
 pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
     let mut corpus = CorpusBuilder::new();
 
-    let documents: Vec<Document> = postcard::from_io((
-        zstd::Decoder::new(fs_err::File::open(config.work_dir.join("posts.zst"))?)?,
-        &mut vec![0u8; 16384],
-    ))?
-    .0;
+    let documents = DocumentReader::open(&config.work_dir.join(SAMPLE_FILE_NAME))?;
+    tracing::info!(num_documents = documents.num_documents(), "building corpus");
 
     for document in documents {
+        let document = document?;
         corpus.add_document(&document.subreddit);
         corpus.add_document(format_date(document.date));
         corpus.add_document(&document.author);
