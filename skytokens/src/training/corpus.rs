@@ -38,7 +38,7 @@ impl CorpusBuilder {
             current_chunk_data: Vec::with_capacity(2 * CHUNK_SIZE),
             current_chunk_doc_boundaries: Vec::new(),
             byte_pair_occurrences: iter::repeat_with(|| AtomicUsize::new(0))
-                .take(u16::MAX as usize)
+                .take(1 << 16)
                 .collect(),
             total_uncompressed_bytes: 0,
         }
@@ -59,9 +59,14 @@ impl CorpusBuilder {
 
         rayon::spawn(move || {
             let mut local_byte_pair_occurrences = hashbrown::HashMap::new();
-            for &[a, b] in data.array_windows::<2>() {
-                let i = (a as u16) | ((b as u16) << 8);
-                *local_byte_pair_occurrences.entry(i).or_default() += 1;
+            let mut prev_doc_end_index = 0;
+            for &doc_end_index in &doc_boundaries {
+                let doc = &data[prev_doc_end_index as usize..doc_end_index as usize];
+                for &[a, b] in doc.array_windows::<2>() {
+                    let i = (a as u16) | ((b as u16) << 8);
+                    *local_byte_pair_occurrences.entry(i).or_default() += 1;
+                }
+                prev_doc_end_index = doc_end_index;
             }
 
             for (i, count) in local_byte_pair_occurrences {

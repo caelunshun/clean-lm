@@ -147,10 +147,45 @@ impl TextTokenizer {
             }
         }
 
-        let leaf = &mut self.nodes[*path.last().unwrap() as usize];
-        leaf.anchor = *path.last().unwrap();
+        let leaf_idx = *path.last().unwrap();
+        let leaf = &mut self.nodes[leaf_idx as usize];
+        leaf.anchor = leaf_idx;
         leaf.anchor_distance = 0;
         leaf.token = token_id;
+
+        // If existing tokens were longer, we need to link the suffix back to the new
+        // anchor node.
+        let mut stack: Vec<(NodeIdx, u32)> = leaf.next1.values().map(|&c| (c, 1)).collect();
+        while let Some((node_idx, distance)) = stack.pop() {
+            let node = &mut self.nodes[node_idx as usize];
+            if node.token != u32::MAX {
+                continue;
+            }
+            node.anchor = leaf_idx;
+            node.anchor_distance = distance;
+            stack.extend(node.next1.values().map(|&c| (c, distance + 1)));
+        }
+    }
+
+    /// Returns the longest token that is a prefix of `text`, along with its length.
+    /// Returns `(u32::MAX, 0)` if there is no such token
+    pub(crate) fn longest_prefix(&self, text: &[u8]) -> (TokenId, usize) {
+        let mut node_idx = self.root;
+        let mut depth = 0;
+        for b in text {
+            match self.nodes[node_idx as usize].next1.get(b) {
+                Some(&next) => {
+                    node_idx = next;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+        let node = &self.nodes[node_idx as usize];
+        (
+            self.nodes[node.anchor as usize].token,
+            depth - node.anchor_distance as usize,
+        )
     }
 
     /// Tokenizes the given byte string, invoking the callback
@@ -189,49 +224,42 @@ impl TextTokenizer {
                 remaining_text = &remaining_text[1..];
             } else {
                 // End of token.
-                let distance = (text_at_prev_token.len() - remaining_text.len())
-                    - self.nodes[node.anchor as usize].anchor_distance as usize;
-                text_at_prev_token = &text_at_prev_token[distance..];
-                remaining_text = text_at_prev_token;
-
                 let token = self.nodes[node.anchor as usize].token;
                 assert_ne!(token, u32::MAX);
                 emit_token(token);
+
+                let token_len = (text_at_prev_token.len() - remaining_text.len())
+                    - node.anchor_distance as usize;
+                text_at_prev_token = &text_at_prev_token[token_len..];
+                remaining_text = text_at_prev_token;
 
                 node_idx = self.root;
             }
         }
 
-        while !remaining_text.is_empty() {
+        while !text_at_prev_token.is_empty() {
             let node = &self.nodes[node_idx as usize];
 
-            let b0 = remaining_text[0];
-            let skip1 = node.next1.get(&b0).copied();
+            let skip1 = remaining_text
+                .first()
+                .and_then(|b0| node.next1.get(b0).copied());
 
             if let Some(skip1_node) = skip1 {
                 node_idx = skip1_node;
                 remaining_text = &remaining_text[1..];
             } else {
-                // End of token.
-                let distance = (text_at_prev_token.len() - remaining_text.len())
-                    - self.nodes[node.anchor as usize].anchor_distance as usize;
-                assert!(distance > 0);
-                text_at_prev_token = &text_at_prev_token[distance..];
-                remaining_text = text_at_prev_token;
-
+                // End of token or end of text.
                 let token = self.nodes[node.anchor as usize].token;
+                assert_ne!(token, u32::MAX);
                 emit_token(token);
+
+                let token_len = (text_at_prev_token.len() - remaining_text.len())
+                    - node.anchor_distance as usize;
+                text_at_prev_token = &text_at_prev_token[token_len..];
+                remaining_text = text_at_prev_token;
 
                 node_idx = self.root;
             }
-        }
-
-        // Emit final token if present.
-        if text_at_prev_token.len() != remaining_text.len() {
-            let node = &self.nodes[node_idx as usize];
-            let token = self.nodes[node.anchor as usize].token;
-            assert_ne!(token, u32::MAX);
-            emit_token(token);
         }
     }
 

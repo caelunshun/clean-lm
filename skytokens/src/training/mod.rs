@@ -26,7 +26,7 @@ pub use corpus::{Corpus, CorpusBuilder};
 
 pub fn train_vocab(corpus: &Corpus, target_vocab_size: u32) -> anyhow::Result<Vocab> {
     ensure!(
-        target_vocab_size >= u8::MAX as u32,
+        target_vocab_size >= 256,
         "target vocab must be large enough for at least a token for each byte (256 entries)"
     );
     ensure!(target_vocab_size < u32::MAX);
@@ -59,7 +59,9 @@ impl<'a> Trainer<'a> {
         let mut pairs_heap =
             PriorityQueue::<(u32, u32), usize, hashbrown::DefaultHashBuilder>::default();
         for (&(tok_a, tok_b), &count) in &corpus.byte_pair_occurrences {
-            pairs_heap.push((token_id_for_byte(tok_a), token_id_for_byte(tok_b)), count);
+            if count > 0 {
+                pairs_heap.push((token_id_for_byte(tok_a), token_id_for_byte(tok_b)), count);
+            }
         }
 
         Self {
@@ -73,7 +75,10 @@ impl<'a> Trainer<'a> {
 
     fn run(mut self) -> Vocab {
         while self.tokens.len() < self.target_vocab_size as usize {
-            self.do_merge_step();
+            if !self.do_merge_step() {
+                // No adjacent token pairs left
+                break;
+            }
         }
 
         Vocab::new(
@@ -84,9 +89,10 @@ impl<'a> Trainer<'a> {
         )
     }
 
-    fn do_merge_step(&mut self) {
-        let Some(((tok_a, tok_b), _)) = self.pairs_heap.pop() else {
-            return;
+    /// Returns `false` if there are no token pairs left to merge
+    fn do_merge_step(&mut self) -> bool {
+        let Some((&(tok_a, tok_b), _)) = self.pairs_heap.peek() else {
+            return false;
         };
 
         let new_token_text = CompactBytes::new(
@@ -109,31 +115,19 @@ impl<'a> Trainer<'a> {
                 None => Cow::Borrowed(&*chunk.data),
             };
 
+            let mut old_tokens = Vec::new();
+            let mut new_segment = Vec::new();
             let mut prev_doc_end_index = 0;
             for &doc_end_index in &*chunk.doc_boundaries {
-                let mut prev_token = None;
-                let mut prev_prev_token = None;
-                self.tokenizer.tokenize(
-                    &data[prev_doc_end_index as usize..doc_end_index as usize],
-                    |token| {
-                        if let Some(prev_token) = prev_token
-                            && let Some(prev_prev_token) = prev_prev_token
-                        {
-                            if prev_token == tok_a && token == tok_b {
-                                *local_deltas
-                                    .entry((prev_prev_token, prev_token))
-                                    .or_default() -= 1;
-                                *local_deltas
-                                    .entry((prev_prev_token, new_token_id))
-                                    .or_default() += 1;
-                            } else if prev_prev_token == tok_a && prev_token == tok_b {
-                                *local_deltas.entry((prev_token, token)).or_default() -= 1;
-                                *local_deltas.entry((new_token_id, token)).or_default() += 1;
-                            }
-                        }
-                        prev_prev_token = prev_token;
-                        prev_token = Some(token);
-                    },
+                let doc = &data[prev_doc_end_index as usize..doc_end_index as usize];
+                old_tokens.clear();
+                self.tokenizer.tokenize_into(doc, &mut old_tokens);
+                self.accumulate_deltas(
+                    doc,
+                    &old_tokens,
+                    (new_token_id, &new_token_text),
+                    &mut new_segment,
+                    &mut local_deltas,
                 );
 
                 prev_doc_end_index = doc_end_index;
@@ -153,8 +147,94 @@ impl<'a> Trainer<'a> {
                 .get_priority(&tok_pair)
                 .copied()
                 .unwrap_or(0);
-            self.pairs_heap
-                .push(tok_pair, old_count.checked_add_signed(delta).unwrap_or(0));
+            let new_count = old_count
+                .checked_add_signed(delta)
+                .expect("pair count went negative");
+            if new_count == 0 {
+                self.pairs_heap.remove(&tok_pair);
+            } else {
+                self.pairs_heap.push(tok_pair, new_count);
+            }
+        }
+        assert!(self.pairs_heap.get_priority(&(tok_a, tok_b)).is_none());
+
+        true
+    }
+
+    /// Accumulates the pair count changes within one document caused by
+    /// adding a new token, given the document's tokenization `old_tokens`
+    /// from before the addition.
+    ///
+    /// The longest match changes only at token boundaries where the text starts
+    /// with the new token and the old token is shorter. From each such boundary,
+    /// the document is re-segmented until it realigns with an old boundary
+    /// where the longest match is unchanged.
+    fn accumulate_deltas(
+        &self,
+        doc: &[u8],
+        old_tokens: &[u32],
+        (new_token_id, new_token_text): (u32, &[u8]),
+        new_segment: &mut Vec<u32>,
+        deltas: &mut hashbrown::HashMap<(u32, u32), isize>,
+    ) {
+        let token_len = |token: u32| self.tokens[token as usize].len();
+        let longest_match_changes = |pos: usize, old_len: usize| {
+            old_len < new_token_text.len() && doc[pos..].starts_with(new_token_text)
+        };
+
+        let mut i = 0;
+        let mut pos = 0;
+        while i < old_tokens.len() {
+            if !longest_match_changes(pos, token_len(old_tokens[i])) {
+                pos += token_len(old_tokens[i]);
+                i += 1;
+                continue;
+            }
+
+            let segment_start = i;
+            new_segment.clear();
+            let mut new_pos = pos;
+            loop {
+                let (mut token, mut len) = self.tokenizer.longest_prefix(&doc[new_pos..]);
+                if longest_match_changes(new_pos, len) {
+                    (token, len) = (new_token_id, new_token_text.len());
+                }
+                new_segment.push(token);
+                new_pos += len;
+
+                while pos < new_pos {
+                    pos += token_len(old_tokens[i]);
+                    i += 1;
+                }
+                if pos == new_pos
+                    && (i == old_tokens.len()
+                        || !longest_match_changes(pos, token_len(old_tokens[i])))
+                {
+                    break;
+                }
+            }
+
+            let old_segment = &old_tokens[segment_start..i];
+            if segment_start > 0 {
+                let left = old_tokens[segment_start - 1];
+                *deltas.entry((left, old_segment[0])).or_default() -= 1;
+                *deltas.entry((left, new_segment[0])).or_default() += 1;
+            }
+            if i < old_tokens.len() {
+                let right = old_tokens[i];
+                *deltas
+                    .entry((*old_segment.last().unwrap(), right))
+                    .or_default() -= 1;
+                *deltas
+                    .entry((*new_segment.last().unwrap(), right))
+                    .or_default() += 1;
+            }
+            for pair in old_segment.windows(2) {
+                *deltas.entry((pair[0], pair[1])).or_default() -= 1;
+            }
+            for pair in new_segment.windows(2) {
+                *deltas.entry((pair[0], pair[1])).or_default() += 1;
+            }
         }
     }
 }
@@ -171,5 +251,160 @@ mod tests {
 
         let vocab = train_vocab(&corpus, 300).unwrap();
         println!("{}", serde_json::to_string_pretty(&vocab).unwrap());
+    }
+
+    fn random_docs(seed: u64, num_docs: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
+        let mut rng = seed;
+        let mut next = move |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as usize % n
+        };
+        (0..num_docs)
+            .map(|_| {
+                (0..next(200))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn build_corpus(docs: &[Vec<u8>], compression: Option<InMemoryCompression>) -> Corpus {
+        let mut corpus = Corpus::builder(compression);
+        for doc in docs {
+            corpus.add_document(doc).unwrap();
+        }
+        corpus.build()
+    }
+
+    fn recount_pairs(trainer: &Trainer) -> hashbrown::HashMap<(u32, u32), usize> {
+        let mut counts = hashbrown::HashMap::new();
+        for chunk in &trainer.corpus.chunks {
+            let data = match trainer.corpus.compression {
+                Some(compression) => decompress(&chunk.data, compression),
+                None => chunk.data.to_vec(),
+            };
+            let mut prev_doc_end_index = 0;
+            for &doc_end_index in &*chunk.doc_boundaries {
+                let tokens = trainer
+                    .tokenizer
+                    .tokenize_to_vec(&data[prev_doc_end_index as usize..doc_end_index as usize]);
+                for pair in tokens.windows(2) {
+                    *counts.entry((pair[0], pair[1])).or_default() += 1;
+                }
+                prev_doc_end_index = doc_end_index;
+            }
+        }
+        counts
+    }
+
+    fn assert_pair_counts_exact(docs: &[Vec<u8>], compression: Option<InMemoryCompression>) {
+        let corpus = build_corpus(docs, compression);
+        let mut trainer = Trainer::new(&corpus, u32::MAX - 1);
+        loop {
+            let heap = trainer
+                .pairs_heap
+                .iter()
+                .map(|(&pair, &count)| (pair, count))
+                .collect::<hashbrown::HashMap<_, _>>();
+            assert_eq!(
+                heap,
+                recount_pairs(&trainer),
+                "after {} tokens",
+                trainer.tokens.len()
+            );
+            if !trainer.do_merge_step() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn pair_counts_exact_for_repeats() {
+        assert_pair_counts_exact(
+            &[
+                b"xababy".to_vec(),
+                b"xaaay".to_vec(),
+                b"aaaaaaa".to_vec(),
+                vec![0xFF, 0xFF, 0xFF],
+            ],
+            None,
+        );
+    }
+
+    #[test]
+    fn pair_counts_exact_when_greedy_resegments() {
+        // "he" is merged before "th", after which "the." is re-segmented
+        // from [t, he, .] into [th, e, .].
+        let mut doc = Vec::new();
+        doc.extend(b"he.x".repeat(30));
+        doc.extend(b"the.".repeat(5));
+        doc.extend(b"thy.".repeat(20));
+        assert_pair_counts_exact(&[doc], None);
+    }
+
+    #[test]
+    fn pair_counts_exact_for_random_corpus() {
+        assert_pair_counts_exact(&random_docs(1, 200, b"aab c"), None);
+        assert_pair_counts_exact(&random_docs(2, 100, b"abcd \n"), None);
+    }
+
+    #[test]
+    fn pair_counts_exact_across_compressed_chunks() {
+        let docs = random_docs(3, 2000, b"aaabbc d");
+        assert!(docs.iter().map(Vec::len).sum::<usize>() > 2 * corpus::CHUNK_SIZE);
+        let corpus = build_corpus(&docs, Some(InMemoryCompression::Lz4));
+        let mut trainer = Trainer::new(&corpus, u32::MAX - 1);
+        for _ in 0..50 {
+            assert!(trainer.do_merge_step());
+        }
+        let heap = trainer
+            .pairs_heap
+            .iter()
+            .map(|(&pair, &count)| (pair, count))
+            .collect::<hashbrown::HashMap<_, _>>();
+        assert_eq!(heap, recount_pairs(&trainer));
+    }
+
+    #[test]
+    fn stops_when_no_pairs_left() {
+        let corpus = build_corpus(&[b"ab".to_vec()], None);
+        let vocab = train_vocab(&corpus, 1000).unwrap();
+        assert_eq!(vocab.num_tokens(), 257);
+    }
+
+    #[test]
+    fn trained_vocab_roundtrips_without_duplicates() {
+        let docs = random_docs(4, 300, b"aab c\n\xFF");
+        let corpus = build_corpus(&docs, None);
+        let vocab = train_vocab(&corpus, 1000).unwrap();
+
+        let token_texts = vocab
+            .tokens()
+            .map(|(_, token)| match token {
+                Token::Text(text) => text.0.as_slice().to_vec(),
+                Token::Special(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        let unique = token_texts.iter().collect::<hashbrown::HashSet<_>>();
+        assert_eq!(unique.len(), token_texts.len());
+
+        let tokenizer = TextTokenizer::new(&vocab);
+        for doc in &docs {
+            let decoded = tokenizer
+                .tokenize_to_vec(doc)
+                .into_iter()
+                .flat_map(|id| token_texts[id as usize].iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(&decoded, doc);
+        }
+    }
+
+    #[test]
+    fn byte_pairs_counted_within_documents() {
+        let corpus = build_corpus(&[b"a".to_vec(), b"b".to_vec(), vec![0xFF, 0xFF]], None);
+        assert_eq!(corpus.byte_pair_occurrences[&(b'a', b'b')], 0);
+        assert_eq!(corpus.byte_pair_occurrences[&(0xFF, 0xFF)], 1);
     }
 }
