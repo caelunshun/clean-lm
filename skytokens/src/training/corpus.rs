@@ -1,37 +1,49 @@
 //! Corpus is represented as chunks of tokens, where documents
-//! cannot be spread across chunks, and each chunk is blosc-compressed.
+//! cannot be spread across chunks, and each chunk is optionally blosc-compressed.
 //! Documents within a chunk are separated by DOC_TERMINATOR_TOKEN.
 
-use std::{
-    cell::RefCell,
-    mem,
-    sync::{Arc, OnceLock},
-    thread::available_parallelism,
-};
+use std::{cell::RefCell, iter, mem, sync::Arc, thread::available_parallelism};
 
 use blosc2::{
-    CParams, CompressAlgo, DParams,
+    CParams, CompressAlgo, DParams, SplitMode,
     chunk::{Decoder, Encoder},
 };
-use dashmap::DashMap;
 use hashbrown::HashMap;
 use priority_queue::PriorityQueue;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use simple_semaphore::Semaphore;
 
 use crate::{
-    training::{DOC_TERMINATOR_TOKEN, token_id_for_byte},
+    training::{DOC_TERMINATOR, token_id_for_byte},
     vocab::{Merge, TokenId},
 };
 
-const TOKENS_PER_CHUNK: usize = 16 * 1024;
+const TOKENS_PER_CHUNK: usize = 64 * 1024;
+
+/// Compression applied to corpus chunks held in memory during training.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Compression {
+    None,
+    #[default]
+    Lz4,
+    BloscLz,
+}
+
+fn new_encoder(algo: CompressAlgo) -> Encoder {
+    let mut params = CParams::default();
+    params
+        .nthreads(1)
+        .typesize(size_of::<TokenId>())
+        .unwrap()
+        .splitmode(SplitMode::Never)
+        .compressor(algo);
+    Encoder::new(params).expect("failed to init blosc")
+}
 
 thread_local! {
-    static ENCODER: RefCell<Encoder> = {
-        let mut params = CParams::default();
-        params.nthreads(1).typesize(size_of::<TokenId>()).unwrap().compressor(CompressAlgo::Lz4);
-        RefCell::new(Encoder::new(params).expect("failed to init blosc"))
-    };
+    static LZ4_ENCODER: RefCell<Encoder> = RefCell::new(new_encoder(CompressAlgo::Lz4));
+    static BLOSCLZ_ENCODER: RefCell<Encoder> = RefCell::new(new_encoder(CompressAlgo::Blosclz));
 }
 
 thread_local! {
@@ -43,48 +55,100 @@ thread_local! {
     };
 }
 
+/// Holds blosc-compressed data for a chunk if compression is enabled,
+/// otherwise raw packed TokenIds.
+type ChunkData = Vec<u8>;
+
+fn compress_chunk_into(compression: Compression, tokens: &[TokenId], dst: &mut Vec<u8>) {
+    let encoder = match compression {
+        Compression::None => return dst.extend_from_slice(bytemuck::cast_slice(tokens)),
+        Compression::Lz4 => &LZ4_ENCODER,
+        Compression::BloscLz => &BLOSCLZ_ENCODER,
+    };
+
+    // Blosc's maximum overhead, see docs on Encoder::compress
+    let max_compressed_size = size_of_val::<[TokenId]>(tokens) + 32;
+
+    if dst.capacity() == 0 {
+        // Compression will always fail with a zero-capacity buffer,
+        // so pre-allocate the required space.
+        dst.reserve_exact(max_compressed_size);
+    }
+
+    encoder.with(|cell| {
+        let mut encoder = cell.borrow_mut();
+
+        let compressed_size =
+            match encoder.compress_into(bytemuck::cast_slice(tokens), dst.spare_capacity_mut()) {
+                Ok(sz) => sz,
+                Err(blosc2::Error::MaxBufsizeExceeded | blosc2::Error::WriteBuffer) => {
+                    dst.reserve_exact(max_compressed_size);
+                    encoder
+                        .compress_into(bytemuck::cast_slice(tokens), dst.spare_capacity_mut())
+                        .expect("blosc failed to compress")
+                }
+                Err(e) => panic!("blosc failed to compress: {e}"),
+            };
+
+        // Soundness: we trust blosc's returned compressed_size.
+        unsafe {
+            dst.set_len(dst.len() + compressed_size);
+        }
+
+        dst.shrink_to_fit();
+    })
+}
+
+#[derive(Debug)]
+struct BuiltChunk {
+    data: ChunkData,
+    token_pair_occurrence_counts: HashMap<(TokenId, TokenId), usize>,
+}
+
 #[derive(Debug)]
 pub struct CorpusBuilder {
-    compressed_chunks: Vec<Arc<OnceLock<Arc<[u8]>>>>,
+    compression: Compression,
+    chunks: Vec<flume::Receiver<BuiltChunk>>,
     concurrency_limiter: Arc<Semaphore>,
     current_chunk: Vec<TokenId>,
-    token_pair_occurrence_counts: HashMap<(TokenId, TokenId), usize>,
     pool: rayon::ThreadPool,
+    num_tokens: usize,
 }
 
 impl CorpusBuilder {
     pub fn new() -> Self {
+        Self::with_compression(Compression::default())
+    }
+
+    pub fn with_compression(compression: Compression) -> Self {
         let threads = available_parallelism().unwrap().get();
         Self {
-            compressed_chunks: Default::default(),
+            compression,
+            chunks: Default::default(),
             concurrency_limiter: Semaphore::new(4 * threads),
             current_chunk: Default::default(),
-            token_pair_occurrence_counts: Default::default(),
             pool: rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap(),
+            num_tokens: 0,
         }
     }
 
     pub fn add_document(&mut self, document: impl AsRef<[u8]>) {
-        for &byte in document.as_ref() {
-            self.add_token(token_id_for_byte(byte));
-        }
-        for &[first, second] in document.as_ref().array_windows::<2>() {
-            *self
-                .token_pair_occurrence_counts
-                .entry((token_id_for_byte(first), token_id_for_byte(second)))
-                .or_default() += 1;
-        }
-        self.add_token(DOC_TERMINATOR_TOKEN);
+        self.current_chunk.extend(
+            document
+                .as_ref()
+                .iter()
+                .copied()
+                .map(token_id_for_byte)
+                .chain(iter::once(DOC_TERMINATOR)),
+        );
+        self.num_tokens += document.as_ref().len();
+
         if self.current_chunk.len() >= TOKENS_PER_CHUNK {
             self.flush_chunk();
         }
-    }
-
-    fn add_token(&mut self, token: TokenId) {
-        self.current_chunk.push(token);
     }
 
     fn flush_chunk(&mut self) {
@@ -92,20 +156,32 @@ impl CorpusBuilder {
             return;
         }
 
-        let chunk_cell = Arc::new(OnceLock::new());
-        self.compressed_chunks.push(chunk_cell.clone());
+        let (chunk_tx, chunk) = flume::bounded(1);
+        self.chunks.push(chunk);
 
         let chunk_uncompressed = mem::take(&mut self.current_chunk);
+        let compression = self.compression;
         let permit = self.concurrency_limiter.acquire();
         self.pool.spawn(move || {
-            ENCODER.with(|cell| {
-                let mut encoder = cell.borrow_mut();
-                let compressed_chunk = encoder
-                    .compress(bytemuck::cast_slice(chunk_uncompressed.as_slice()))
-                    .expect("blosc failed to compress");
-                let compressed_chunk = Arc::<[u8]>::from(compressed_chunk.as_bytes());
-                chunk_cell.set(compressed_chunk).ok().unwrap();
-            });
+            let mut buf = Vec::new();
+            compress_chunk_into(compression, &chunk_uncompressed, &mut buf);
+
+            let mut token_pair_occurrence_counts = HashMap::<(TokenId, TokenId), usize>::default();
+            for &[first, second] in chunk_uncompressed.array_windows::<2>() {
+                if first != DOC_TERMINATOR && second != DOC_TERMINATOR {
+                    *token_pair_occurrence_counts
+                        .entry((first, second))
+                        .or_default() += 1;
+                }
+            }
+
+            chunk_tx
+                .send(BuiltChunk {
+                    data: buf,
+                    token_pair_occurrence_counts,
+                })
+                .ok()
+                .unwrap();
             drop(permit);
         });
 
@@ -114,14 +190,38 @@ impl CorpusBuilder {
 
     pub fn build(mut self) -> Corpus {
         self.flush_chunk();
+        let (chunks, token_pair_occurrence_counts): (Vec<_>, Vec<_>) = self
+            .chunks
+            .into_iter()
+            .map(|cell| cell.recv().unwrap())
+            .map(
+                |BuiltChunk {
+                     data,
+                     token_pair_occurrence_counts,
+                 }| (data, token_pair_occurrence_counts),
+            )
+            .collect();
+
+        let token_pair_occurrence_counts = token_pair_occurrence_counts.into_par_iter().reduce(
+            HashMap::default,
+            |mut first, second| {
+                for (pair, count) in second {
+                    *first.entry(pair).or_default() += count;
+                }
+                first
+            },
+        );
+
+        tracing::info!(
+            num_tokens = self.num_tokens,
+            num_chunks = chunks.len(),
+            "built corpus"
+        );
+
         Corpus {
-            compressed_chunks: self
-                .compressed_chunks
-                .into_iter()
-                .map(|cell| Arc::clone(cell.wait()))
-                .collect(),
-            token_pair_occurrence_counts: self
-                .token_pair_occurrence_counts
+            compression: self.compression,
+            chunks,
+            token_pair_occurrence_counts: token_pair_occurrence_counts
                 .into_iter()
                 .map(|((first, second), count)| ((first, second), (count, first, second)))
                 .collect(),
@@ -137,116 +237,176 @@ impl Default for CorpusBuilder {
 
 #[derive(Debug, Clone)]
 pub struct Corpus {
-    compressed_chunks: Vec<Arc<[u8]>>,
+    compression: Compression,
+    chunks: Vec<ChunkData>,
     token_pair_occurrence_counts:
         PriorityQueue<(TokenId, TokenId), (usize, TokenId, TokenId), hashbrown::DefaultHashBuilder>,
 }
 
 impl Corpus {
-    pub(super) fn most_frequent_token_pair(&self) -> Option<(TokenId, TokenId)> {
-        let (&(first, second), &(count, ..)) = self.token_pair_occurrence_counts.peek()?;
-        if count == 0 {
-            None
-        } else {
-            Some((first, second))
-        }
+    pub fn stored_bytes(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.len()).sum()
     }
 
-    /// Updates the corpus in-place to apply the given token merge.
-    /// Parallelized.
-    pub(super) fn apply_merge(&mut self, merge: Merge) {
-        assert_ne!(merge.first, DOC_TERMINATOR_TOKEN);
-        assert_ne!(merge.second, DOC_TERMINATOR_TOKEN);
-        assert_ne!(merge.merged, DOC_TERMINATOR_TOKEN);
+    /// Returns up to `n` of the most frequent token pairs,
+    /// ordered from most to least frequent.
+    pub(super) fn n_most_frequent_token_pairs(&mut self, n: usize) -> Vec<(TokenId, TokenId)> {
+        let mut pairs = Vec::new();
+        let mut counts = Vec::new();
 
-        let token_pair_occurrence_count_deltas =
-            DashMap::<(TokenId, TokenId), isize, hashbrown::DefaultHashBuilder>::default();
+        while pairs.len() < n
+            && let Some(((first, second), (count, ..))) = self.token_pair_occurrence_counts.pop()
+        {
+            pairs.push((first, second));
+            counts.push(count);
+        }
 
-        self.compressed_chunks
+        // Add back to heap
+        for (&pair, &count) in pairs.iter().zip(&counts) {
+            self.token_pair_occurrence_counts
+                .push(pair, (count, pair.0, pair.1));
+        }
+
+        pairs
+    }
+
+    /// Updates the corpus in-place to apply the given sequence of token merges.
+    /// Parallelized, but each merge runs in sequence.
+    /// The cost of compressing and decompressing each chunk, as well as loading
+    /// from DRAM into cache (provided some cache level is big enough to hold
+    /// uncompressed tokens of a chunk + bookkeeping and overhead),
+    /// is amortized across the provided merges.
+    pub(super) fn apply_merges(&mut self, merges: &[Merge]) {
+        for merge in merges {
+            assert_ne!(merge.first, DOC_TERMINATOR);
+            assert_ne!(merge.second, DOC_TERMINATOR);
+            assert_ne!(merge.merged, DOC_TERMINATOR);
+        }
+
+        let compression = self.compression;
+
+        // In parallel, map each chunk to its contribution to the per-token-pair count deltas
+        // by applying the merge. Then reduce the delta maps across chunks,
+        // producing a final summed delta map.
+        let token_pair_occurrence_count_deltas: HashMap<(TokenId, TokenId), isize> = self
+            .chunks
             .par_iter_mut()
-            .for_each(|compressed_chunk| {
-                let mut v = None;
-                let original_tokens = DECODER.with(|cell| {
-                    let mut decoder = cell.borrow_mut();
-                    let vec = decoder
-                        .decompress(compressed_chunk)
-                        .expect("blosc failed to decompress");
-                    v = Some(vec);
-                    bytemuck::cast_slice::<u8, TokenId>(v.as_ref().unwrap().as_slice())
-                });
-                let mut new_tokens = Vec::with_capacity(original_tokens.len());
+            .map(|chunk| {
+                let chunk = RefCell::new(chunk);
+                let mut chunk_guard = None;
+
+                let mut decompressed;
+                let mut tokens: &mut [TokenId] = if compression == Compression::None {
+                    let guard = chunk_guard.insert(chunk.borrow_mut());
+                    bytemuck::cast_slice_mut(&mut *guard)
+                } else {
+                    decompressed = DECODER.with(|cell| {
+                        cell.borrow_mut()
+                            .decompress(&chunk.borrow())
+                            .expect("blosc failed to decompress")
+                    });
+                    bytemuck::cast_slice_mut(&mut decompressed)
+                };
+
                 let mut did_change = false;
-                let mut local_token_pair_occurrence_count_deltas =
+                let mut token_pair_occurrence_count_deltas =
                     HashMap::<(TokenId, TokenId), isize>::with_capacity(TOKENS_PER_CHUNK / 8);
 
-                let mut i = 0;
-                while i < original_tokens.len() {
-                    let tok1 = original_tokens[i];
-                    if let Some(tok2) = original_tokens.get(i + 1).copied()
-                        && tok1 == merge.first
-                        && tok2 == merge.second
-                    {
-                        // Match; apply merge.
-                        did_change = true;
-                        new_tokens.push(merge.merged);
+                for merge in merges {
+                    let mut i = 0;
 
-                        // Update counts:
-                        // -1 occurrence for the merged pair
-                        *local_token_pair_occurrence_count_deltas
-                            .entry((tok1, tok2))
-                            .or_default() -= 1;
+                    // Stores the number of tokens logically removed from the tokens buffer so far,
+                    // which affects how `i` (an index into the _original_ token buffer
+                    // before applying this merge) maps to destination indexes in the overwritten
+                    // buffer. See Vec::retain for a similar pattern.
+                    let mut removed = 0;
 
-                        if let Some(tok0) = new_tokens.len().checked_sub(2).map(|i0| new_tokens[i0])
-                            && tok0 != DOC_TERMINATOR_TOKEN
+                    while i < tokens.len() {
+                        let tok1 = tokens[i];
+                        if let Some(tok2) = tokens.get(i + 1).copied()
+                            && tok1 == merge.first
+                            && tok2 == merge.second
                         {
-                            // -1 occurrence for (tok0, tok1)
-                            *local_token_pair_occurrence_count_deltas
-                                .entry((tok0, tok1))
-                                .or_default() -= 1;
-                            // +1 occurrence for (tok0, merged_token)
-                            *local_token_pair_occurrence_count_deltas
-                                .entry((tok0, merge.merged))
-                                .or_default() += 1;
-                        }
+                            // Match; apply merge.
+                            did_change = true;
 
-                        if let Some(tok3) = original_tokens.get(i + 2).copied()
-                            && tok3 != DOC_TERMINATOR_TOKEN
-                        {
-                            // -1 occurrence for (tok2, tok)
-                            *local_token_pair_occurrence_count_deltas
-                                .entry((tok2, tok3))
+                            // Update counts:
+                            // -1 occurrence for the merged pair
+                            *token_pair_occurrence_count_deltas
+                                .entry((tok1, tok2))
                                 .or_default() -= 1;
 
-                            // +1 occurrence for (merged_token, tok3)
-                            *local_token_pair_occurrence_count_deltas
-                                .entry((merge.merged, tok3))
-                                .or_default() += 1;
+                            if let Some(tok0) = i.checked_sub(removed + 1).map(|tok0| tokens[tok0])
+                                && tok0 != DOC_TERMINATOR
+                            {
+                                // -1 occurrence for (tok0, tok1)
+                                *token_pair_occurrence_count_deltas
+                                    .entry((tok0, tok1))
+                                    .or_default() -= 1;
+                                // +1 occurrence for (tok0, merged_token)
+                                *token_pair_occurrence_count_deltas
+                                    .entry((tok0, merge.merged))
+                                    .or_default() += 1;
+                            }
+
+                            if let Some(tok3) = tokens.get(i + 2).copied()
+                                && tok3 != DOC_TERMINATOR
+                            {
+                                // -1 occurrence for (tok2, tok)
+                                *token_pair_occurrence_count_deltas
+                                    .entry((tok2, tok3))
+                                    .or_default() -= 1;
+
+                                // +1 occurrence for (merged_token, tok3)
+                                *token_pair_occurrence_count_deltas
+                                    .entry((merge.merged, tok3))
+                                    .or_default() += 1;
+                            }
+
+                            // Record the merge and removal of tok2.
+                            tokens[i - removed] = merge.merged;
+                            removed += 1;
+
+                            // Skip past tok2 in the original token stream.
+                            i += 1;
+                        } else {
+                            // Move the token downward to its new position.
+                            tokens[i - removed] = tok1;
                         }
 
-                        // Skip past tok2 in the original token stream.
                         i += 1;
-                    } else {
-                        new_tokens.push(tok1);
                     }
 
-                    i += 1;
-                }
-
-                for ((first, second), delta) in local_token_pair_occurrence_count_deltas {
-                    *token_pair_occurrence_count_deltas
-                        .entry((first, second))
-                        .or_default() += delta;
+                    // Shrink our tokens view to exclude the leftover space.
+                    let l = tokens.len();
+                    tokens = &mut tokens[..l - removed];
                 }
 
                 if did_change {
-                    ENCODER.with(|cell| {
-                        let mut encoder = cell.borrow_mut();
-                        let data = encoder
-                            .compress(bytemuck::cast_slice::<TokenId, u8>(&new_tokens))
-                            .expect("blosc failed to compress");
-                        *compressed_chunk = data.as_bytes().into();
-                    });
+                    match compression {
+                        Compression::None => {
+                            // We modified the tokens buffer in-place, so we can just truncate it.
+                            let remaining_size = size_of_val::<[TokenId]>(tokens);
+                            drop(chunk_guard);
+                            chunk.borrow_mut().truncate(remaining_size);
+                        }
+                        _ => {
+                            // Recompress, reusing the chunk's allocation.
+                            // Borrow can't fail because on the compressed path,
+                            // we don't initialize chunk_guard.
+                            chunk.borrow_mut().clear();
+                            compress_chunk_into(compression, tokens, &mut chunk.borrow_mut());
+                        }
+                    }
                 }
+
+                token_pair_occurrence_count_deltas
+            })
+            .reduce(HashMap::default, |mut first, second| {
+                for (pair, delta) in second {
+                    *first.entry(pair).or_default() += delta;
+                }
+                first
             });
 
         for ((first, second), delta) in token_pair_occurrence_count_deltas {
@@ -262,8 +422,12 @@ impl Corpus {
                 .expect("token count should not be negative");
 
             if new_count != count {
-                self.token_pair_occurrence_counts
-                    .push((first, second), (new_count, first, second));
+                if new_count > 0 {
+                    self.token_pair_occurrence_counts
+                        .push((first, second), (new_count, first, second));
+                } else {
+                    self.token_pair_occurrence_counts.remove(&(first, second));
+                }
             }
         }
     }

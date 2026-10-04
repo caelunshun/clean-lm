@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
     let corpus = corpus.build();
 
     const VOCAB_SIZE: u32 = 4096;
-    let vocab: Vocab<()> = training::train_vocab(&corpus, VOCAB_SIZE)?;
+    let vocab: Vocab<()> = training::train_vocab(corpus, VOCAB_SIZE, 8)?;
 
     println!("{}", serde_json::to_string_pretty(&vocab)?);
 

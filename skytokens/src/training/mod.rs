@@ -9,19 +9,27 @@ use compact_bytes::CompactBytes;
 
 mod corpus;
 
-pub use corpus::{Corpus, CorpusBuilder};
+pub use corpus::{Compression, Corpus, CorpusBuilder};
 
+/// Trains a vocabulary using a BPE algorithm.
+///
+/// `fused_merges` specifies how many merges can be applied
+/// in one pass, without updating the token pair occurrence
+/// table in between. Values >1 produce an approximation of the
+/// BPE algorithm but may help amortize compression and memory bandwidth
+/// overhead.
 pub fn train_vocab<SP: SpecialTokenData>(
-    corpus: &Corpus,
+    mut corpus: Corpus,
     target_vocab_size: u32,
+    fused_merges: usize,
 ) -> anyhow::Result<Vocab<SP>> {
     ensure!(
         target_vocab_size >= 256,
         "target vocab must be large enough for at least a token for each byte (256 entries)"
     );
     ensure!(target_vocab_size < u32::MAX);
+    ensure!(fused_merges > 0);
 
-    let mut corpus = corpus.clone();
     let mut vocab = Vocab::empty();
 
     // Initialize a token per byte
@@ -33,35 +41,49 @@ pub fn train_vocab<SP: SpecialTokenData>(
     }
 
     while vocab.num_tokens() < target_vocab_size {
-        let Some((first, second)) = corpus.most_frequent_token_pair() else {
+        let num_merges = fused_merges.min((target_vocab_size - vocab.num_tokens()) as usize);
+
+        let pairs = corpus.n_most_frequent_token_pairs(num_merges);
+
+        if pairs.is_empty() {
             // No token pairs in corpus
             break;
-        };
+        }
 
-        let mut merged_token_bytes = CompactBytes::new(vocab.token(first).text().unwrap());
-        merged_token_bytes.extend_from_slice(vocab.token(second).text().unwrap());
+        let mut merges = Vec::with_capacity(pairs.len());
 
-        let merged = vocab.add_token(Token::Text(TextToken(merged_token_bytes)))?;
-        let merge = Merge {
-            first,
-            second,
-            merged,
-        };
-        vocab.add_merge(merge)?;
+        for (first, second) in pairs {
+            let mut merged_token_bytes = CompactBytes::new(vocab.token(first).text().unwrap());
+            merged_token_bytes.extend_from_slice(vocab.token(second).text().unwrap());
 
-        corpus.apply_merge(merge);
-        tracing::debug!(
-            vocab_size = vocab.num_tokens(),
-            first = %vocab.token(first).text_token().unwrap(),
-            second = %vocab.token(second).text_token().unwrap(),
-            "applied merge"
-        );
+            let merged = vocab.add_token(Token::Text(TextToken(merged_token_bytes)))?;
+            let merge = Merge {
+                first,
+                second,
+                merged,
+            };
+            vocab.add_merge(merge)?;
+
+            merges.push(merge);
+
+            tracing::debug!(
+                vocab_size = vocab.num_tokens(),
+                first = %vocab.token(first).text_token().unwrap(),
+                second = %vocab.token(second).text_token().unwrap(),
+                "applying merge"
+            );
+        }
+
+        corpus.apply_merges(&merges);
+        if fused_merges > 1 {
+            tracing::debug!("end fused merge group");
+        }
     }
 
     Ok(vocab)
 }
 
-const DOC_TERMINATOR_TOKEN: TokenId = TokenId::PLACEHOLDER;
+const DOC_TERMINATOR: TokenId = TokenId::PLACEHOLDER;
 
 fn token_id_for_byte(byte: u8) -> TokenId {
     TokenId::from_idx(byte as u32).unwrap()

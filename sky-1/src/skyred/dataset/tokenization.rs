@@ -112,11 +112,12 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
     tracing::info!("built corpus");
 
     let mut vocab = skytokens::training::train_vocab::<SpecialToken>(
-        &corpus,
+        corpus,
         config
             .total_vocab_size
             .checked_sub(SpecialToken::iter().count() as u32)
             .context("too few tokens")?,
+        config.bpe_training_fused_merges,
     )?;
     for special in SpecialToken::iter() {
         vocab.add_token(Token::Special(skytokens::vocab::SpecialToken {

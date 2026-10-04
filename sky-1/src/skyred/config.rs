@@ -29,6 +29,7 @@ pub struct DatasetConfig {
     pub prune_authors: Vec<CompactString>,
     /// Total vocabulary size including special tokens.
     pub total_vocab_size: u32,
+    pub bpe_training_fused_merges: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

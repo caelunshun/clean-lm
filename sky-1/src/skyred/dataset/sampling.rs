@@ -747,6 +747,7 @@ mod tests {
             prune_phrases: [].into_iter().collect(),
             prune_authors: ["AutoModerator".into()].into_iter().collect(),
             total_vocab_size: 0,
+            bpe_training_fused_merges: 1,
         }
     }
 
