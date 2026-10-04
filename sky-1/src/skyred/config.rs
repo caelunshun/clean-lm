@@ -15,6 +15,9 @@ pub struct DatasetConfig {
     pub reddit_ingest_bucket: String,
     pub reddit_ingest_path: String,
     pub post_sample_size: u32,
+    /// Posts created before this year are excluded from the sample.
+    #[serde(default)]
+    pub min_year: Option<i16>,
     /// In `[0, 1]`: quotas are a mixture of `(1 - mix) * proportional + mix * uniform`
     /// across subreddits within a year.
     pub subreddit_uniform_mix: f64,
@@ -28,7 +31,9 @@ pub struct DatasetConfig {
     pub prune_authors: Vec<CompactString>,
     /// Total vocabulary size including special tokens.
     pub total_vocab_size: u32,
+    pub tokenizer_train_sample_limit: Option<u64>,
     pub bpe_training_fused_merges: usize,
+    pub use_pretokenization: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

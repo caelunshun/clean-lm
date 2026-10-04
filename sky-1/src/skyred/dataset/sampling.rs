@@ -425,13 +425,14 @@ impl<'a> PostColumns<'a> {
     }
 
     /// Returns the post's date and subreddit, or `None` if the post is excluded
-    /// by missing data or the author and text filters.
+    /// by missing data, the minimum year, or the author and text filters.
     fn stratum(&self, row: usize, filter: &Filter) -> Option<(Date, &'a str)> {
         if self.subreddit.is_null(row) {
             return None;
         }
         let date = day_to_date(self.created_utc.value(row).div_euclid(SECONDS_PER_DAY))?;
-        if filter.should_prune_author(self.author.value(row))
+        if filter.should_prune_year(date.year())
+            || filter.should_prune_author(self.author.value(row))
             || filter.should_prune_text(self.title.value(row))
             || filter.should_prune_text(self.selftext.value(row))
         {
@@ -702,6 +703,10 @@ impl Filter {
         }
     }
 
+    pub fn should_prune_year(&self, year: Year) -> bool {
+        self.config.min_year.is_some_and(|min| year < min)
+    }
+
     pub fn should_prune_author(&self, author: &str) -> bool {
         let trimmed = author.trim_ascii();
         self.config.prune_authors.iter().any(|a| a == trimmed)
@@ -738,6 +743,7 @@ mod tests {
             reddit_ingest_bucket: String::new(),
             reddit_ingest_path: String::new(),
             post_sample_size: 0,
+            min_year: None,
             subreddit_uniform_mix: 0.0,
             year_uniform_mix: 0.0,
             prune_texts: ["[removed]".into()].into_iter().collect(),
@@ -745,6 +751,8 @@ mod tests {
             prune_authors: ["AutoModerator".into()].into_iter().collect(),
             total_vocab_size: 0,
             bpe_training_fused_merges: 1,
+            use_pretokenization: false,
+            tokenizer_train_sample_limit: None,
         }
     }
 
@@ -797,6 +805,17 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        assert_eq!(counts, expected);
+
+        let mut counts = Strata::<u64>::default();
+        let config = DatasetConfig {
+            min_year: Some(2025),
+            ..test_config()
+        };
+        count_batch(&batch, &Filter::new(&config), &mut counts).unwrap();
+        let expected: Strata<u64> = [(2025, [("a".into(), 1)].into_iter().collect())]
+            .into_iter()
+            .collect();
         assert_eq!(counts, expected);
     }
 

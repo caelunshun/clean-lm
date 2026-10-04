@@ -33,6 +33,7 @@ skytokens = { path = "../skytokens" }
 strum = { version = "0.28.0", features = ["derive"] }
 aho-corasick = "1.1.5"
 mimalloc = "0.1.52"
+memchr = "2.8.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -4,6 +4,7 @@ use crate::skyred::{
 };
 use anyhow::Context;
 use jiff::civil::Date;
+use memchr::memchr2;
 use serde::{Deserialize, Serialize};
 use skytokens::{
     text_tokenizer::TextTokenizer,
@@ -16,13 +17,15 @@ use strum::{EnumIter, IntoEnumIterator};
 pub struct SkyredTokenizer {
     vocab: Vocab<SpecialToken>,
     text_tokenizer: TextTokenizer,
+    use_pretokenization: bool,
 }
 
 impl SkyredTokenizer {
-    pub fn new(vocab: Vocab<SpecialToken>) -> anyhow::Result<Self> {
+    pub fn new(vocab: Vocab<SpecialToken>, use_pretokenization: bool) -> anyhow::Result<Self> {
         Ok(Self {
             text_tokenizer: TextTokenizer::new(&vocab),
             vocab,
+            use_pretokenization,
         })
     }
 
@@ -56,8 +59,33 @@ impl SkyredTokenizer {
         Ok(tokens)
     }
 
+    fn pretokenize<'a>(&self, text: &'a [u8]) -> Vec<&'a [u8]> {
+        let mut remaining = text;
+        let mut pretokens = Vec::new();
+        while !remaining.is_empty() {
+            let pretoken_end = memchr2(b' ', b'\n', remaining);
+            match pretoken_end {
+                Some(i) => {
+                    pretokens.push(&remaining[..=i]);
+                    remaining = &remaining[i + 1..];
+                }
+                None => {
+                    pretokens.push(remaining);
+                    break;
+                }
+            }
+        }
+        pretokens
+    }
+
     fn push_text(&self, tokens: &mut Vec<TokenId>, text: impl AsRef<[u8]>) -> anyhow::Result<()> {
-        tokens.extend(self.text_tokenizer.tokenize(text)?);
+        if self.use_pretokenization {
+            for pretoken in self.pretokenize(text.as_ref()) {
+                tokens.extend(self.text_tokenizer.tokenize(pretoken)?);
+            }
+        } else {
+            tokens.extend(self.text_tokenizer.tokenize(text)?);
+        }
         Ok(())
     }
 
@@ -90,9 +118,12 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
     let mut corpus = CorpusBuilder::new();
 
     let documents = DocumentReader::open(&config.work_dir.join(SAMPLE_FILE_NAME))?;
-    tracing::info!(num_documents = documents.num_documents(), "building corpus");
+    let count = documents
+        .num_documents()
+        .min(config.tokenizer_train_sample_limit.unwrap_or(u64::MAX));
+    tracing::info!(num_documents = count, "building corpus");
 
-    for document in documents {
+    for document in documents.into_iter().take(count.try_into()?) {
         let document = document?;
         corpus.add_document(&document.subreddit)?;
         corpus.add_document(format_date(document.date))?;

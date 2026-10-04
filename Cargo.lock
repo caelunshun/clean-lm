@@ -3372,6 +3372,7 @@ dependencies = [
  "fs-err",
  "jiff",
  "json5",
+ "memchr",
  "mimalloc",
  "object_store",
  "parquet",
