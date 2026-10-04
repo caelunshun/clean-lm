@@ -1,6 +1,10 @@
 use crate::{
     model::Sky1Config,
-    training::{parameter::Parameter, weight_update_params::WeightUpdateParams},
+    training::{
+        checkpoint::{CheckpointBuilder, CheckpointLoader},
+        parameter::Parameter,
+        weight_update_params::WeightUpdateParams,
+    },
 };
 use cleandl::{
     context::{Context, ResourceKey},
@@ -66,6 +70,69 @@ impl Sky1Weights {
                 stream,
                 cx,
             )?,
+        })
+    }
+
+    pub fn save_checkpoint(
+        &self,
+        builder: &mut CheckpointBuilder,
+        cx: &Context,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        builder.build_child("embeddings", |builder| {
+            builder.add_param("weight", &self.embeddings, cx, stream)?;
+            Ok(())
+        })?;
+
+        for (i, decoder) in self.decoder_blocks.iter().enumerate() {
+            builder.build_child(&format!("decoder_blocks[{i}]"), |builder| {
+                decoder.save_checkpoint(builder, cx, stream)
+            })?;
+        }
+
+        builder.build_child("final_norm", |builder| {
+            builder.add_param("gamma", &self.final_norm_gamma, cx, stream)?;
+            Ok(())
+        })?;
+
+        builder.build_child("lm_head", |builder| {
+            builder.add_param("weight", &self.lm_head, cx, stream)?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    pub fn load_from_checkpoint(
+        config: &Sky1Config,
+        loader: &mut CheckpointLoader,
+        cx: &Context,
+        stream: &Stream,
+    ) -> anyhow::Result<Self> {
+        let embeddings = loader.load_child("embeddings", |loader| {
+            loader.load_param("weight", cx, stream)
+        })?;
+
+        let decoder_blocks = (0..config.num_decoder_blocks)
+            .map(|i| {
+                loader.load_child(&format!("decoder_blocks[{i}]"), |loader| {
+                    DecoderWeights::load_from_checkpoint(loader, cx, stream)
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let final_norm_gamma = loader.load_child("final_norm", |loader| {
+            loader.load_param("gamma", cx, stream)
+        })?;
+
+        let lm_head =
+            loader.load_child("lm_head", |loader| loader.load_param("weight", cx, stream))?;
+
+        Ok(Self {
+            embeddings,
+            decoder_blocks,
+            final_norm_gamma,
+            lm_head,
         })
     }
 }

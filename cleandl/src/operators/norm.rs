@@ -1,9 +1,10 @@
 use crate::{
     context::{Context, ResourceKey},
-    kernel::RustKernels,
+    kernel::{RustKernels, rust_kernels_have_227kb_smem, rust_kernels_have_tma},
     tensor::{Tensor, TensorView, TensorViewMut},
 };
 use anyhow::bail;
+use half::bf16;
 use skycuda::{module::Module, stream::Stream};
 use skytens_core::{
     data_type::{ElementType, FloatType},
@@ -58,10 +59,12 @@ impl NormExecutor {
             &self.cx,
         )?;
 
-        let (kernel_name, cta_threads) = fwd_kernel_spec(inner_dim)?;
+        let KernelSpec {
+            name: kernel_name,
+            cta_threads,
+            dynamic_smem,
+        } = fwd_kernel_spec(inner_dim, &self.cx)?;
         let kernel = self.module.get_function(kernel_name)?;
-
-        let dynamic_smem = self.cx.cuda().max_dynamic_smem_per_cta() - 1024;
         kernel.set_max_dynamic_smem(dynamic_smem)?;
 
         let occupancy = stream.device().sm_count();
@@ -137,10 +140,12 @@ impl NormExecutor {
             &self.cx,
         )?;
 
-        let (kernel_name, cta_size) = bwd_kernel_spec(inner_dim)?;
+        let KernelSpec {
+            name: kernel_name,
+            cta_threads,
+            dynamic_smem,
+        } = bwd_kernel_spec(inner_dim, &self.cx)?;
         let kernel = self.module.get_function(kernel_name)?;
-
-        let dynamic_smem = self.cx.cuda().max_dynamic_smem_per_cta() - 1024;
         kernel.set_max_dynamic_smem(dynamic_smem)?;
 
         let occupancy = stream.device().sm_count();
@@ -168,7 +173,7 @@ impl NormExecutor {
                 .arg(out_dgamma_memory)?
                 .arg(i32::try_from(batch_size)?)?
                 .dynamic_smem(dynamic_smem)?
-                .block_size(cta_size, 1, 1)?;
+                .block_size(cta_threads, 1, 1)?;
             // Block dim and smem are overriden by TileIR.
             unsafe {
                 launch.launch(occupancy as u32, 1, 1)?;
@@ -181,18 +186,78 @@ impl NormExecutor {
 
 const NULL_POINTER: u64 = 0;
 
-fn fwd_kernel_spec(inner_dim: usize) -> anyhow::Result<(&'static str, u32)> {
+struct KernelSpec {
+    name: &'static str,
+    cta_threads: u32,
+    dynamic_smem: usize,
+}
+
+/// Prefetch stage count used by the norm kernels in `rust-kernels/src/norm.rs`.
+fn prefetch_stages(cx: &Context) -> usize {
+    if rust_kernels_have_227kb_smem(cx) {
+        3
+    } else {
+        1
+    }
+}
+
+fn fwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec> {
     match inner_dim {
-        2048 => Ok(("rmsnorm_bf16_warp_persistent_inner2048", 384)),
+        2048 => Ok(KernelSpec {
+            name: "rmsnorm_bf16_warp_persistent_inner2048",
+            cta_threads: 384,
+            dynamic_smem: fwd_required_smem(2048, prefetch_stages(cx), 12, cx),
+        }),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
 }
 
-fn bwd_kernel_spec(inner_dim: usize) -> anyhow::Result<(&'static str, u32)> {
+fn bwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec> {
     match inner_dim {
-        2048 => Ok(("rmsnorm_bwd_bf16_cta_persistent_inner2048", 256)),
+        2048 => Ok(KernelSpec {
+            name: "rmsnorm_bwd_bf16_cta_persistent_inner2048",
+            cta_threads: 256,
+            dynamic_smem: bwd_required_smem(2048, 4, prefetch_stages(cx), 8),
+        }),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
+}
+
+const MBARRIER_SIZE: usize = 8;
+
+/// Must match the SMEM calculation in `rmsnorm_bf16_warp_persistent`.
+fn fwd_required_smem(
+    vector_size: usize,
+    prefetch_stages: usize,
+    num_warps: usize,
+    cx: &Context,
+) -> usize {
+    let num_mbarriers = if rust_kernels_have_tma(cx) {
+        prefetch_stages * num_warps
+    } else {
+        0
+    };
+    let store_staging_space = if rust_kernels_have_227kb_smem(cx) {
+        size_of::<bf16>() * vector_size * num_warps
+    } else {
+        0
+    };
+    size_of::<bf16>() * vector_size
+        + size_of::<bf16>() * (vector_size * prefetch_stages * num_warps)
+        + num_mbarriers * MBARRIER_SIZE
+        + store_staging_space
+}
+
+/// Must match the SMEM calculation in `rmsnorm_bwd_bf16_cta_persistent`.
+fn bwd_required_smem(
+    vector_size: usize,
+    rows_per_iter: usize,
+    prefetch_stages: usize,
+    num_warps: usize,
+) -> usize {
+    (4 * size_of::<bf16>() * vector_size * rows_per_iter * prefetch_stages)
+        + (size_of::<f32>() * rows_per_iter * prefetch_stages)
+        + (size_of::<f32>() * rows_per_iter * num_warps)
 }
 
 fn check_bf16_matrix(tensor: &TensorView<'_>, rows: usize, cols: usize) {

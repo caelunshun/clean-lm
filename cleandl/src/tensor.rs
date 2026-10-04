@@ -88,22 +88,36 @@ impl Tensor {
         stream: &Stream,
         cx: &Context,
     ) -> anyhow::Result<Self> {
+        Self::from_bytes(
+            bytemuck::cast_slice(slice),
+            T::element_type(),
+            shape,
+            stream,
+            cx,
+        )
+    }
+
+    pub fn from_bytes(
+        bytes: &[u8],
+        element_type: impl Into<ElementType>,
+        shape: impl Into<Shape>,
+        stream: &Stream,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
         let shape = shape.into();
-        let element_type = T::element_type();
+        let element_type = element_type.into();
         let virt = VirtTensorView::new(shape, element_type);
         assert!(
             virt.is_contiguous(),
-            "from_slice currently unimplemented for non-contiguous tensors"
+            "from_slice/from_bytes currently unimplemented for non-contiguous tensors"
         );
         let allocation_bytes = virt.required_bytes();
-        assert_eq!(allocation_bytes, size_of_val(slice));
+        assert_eq!(allocation_bytes, size_of_val(bytes));
 
         let mut staging_memory = cx
             .host_pinned_memory_pool()
             .alloc_zeroed(allocation_bytes)?;
-        staging_memory
-            .view_mut()?
-            .copy_from_slice(bytemuck::cast_slice(slice));
+        staging_memory.view_mut()?.copy_from_slice(bytes);
 
         let mut device_memory = cx
             .device_memory_pool()

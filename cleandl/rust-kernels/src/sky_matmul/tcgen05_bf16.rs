@@ -1084,7 +1084,7 @@ fn kernel_template<
         let mut smem = Smem::<AB_PIPE_DEPTH, EPILOGUE_PIPE_DEPTH> {
             base: DynamicSharedArray::<u8, 1024>::get_raw(),
         };
-        assert!(dynamic_smem_size() >= smem.required_space());
+        assert!(dynamic_smem_size() == smem.required_space());
 
         if threadIdx_x() == 0 {
             init_barriers(&mut smem);

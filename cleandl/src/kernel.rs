@@ -62,3 +62,13 @@ impl ResourceKey for RustKernels {
         )
     }
 }
+
+/// Host equivalent of the `has_tma` cfg alias in `rust-kernels/build.rs`.
+pub(crate) fn rust_kernels_have_tma(cx: &Context) -> bool {
+    cx.cuda().compute_capability_major() >= 9
+}
+
+/// Host equivalent of the `has_227kb_smem` cfg alias in `rust-kernels/build.rs`.
+pub(crate) fn rust_kernels_have_227kb_smem(cx: &Context) -> bool {
+    (9..=11).contains(&cx.cuda().compute_capability_major())
+}

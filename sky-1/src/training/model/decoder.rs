@@ -1,7 +1,10 @@
 use crate::{
     model::{BlocksConfig, Sky1Config},
     training::{
-        model::MetaTensors, parameter::Parameter, weight_update_params::WeightUpdateParams,
+        checkpoint::{CheckpointBuilder, CheckpointLoader},
+        model::MetaTensors,
+        parameter::Parameter,
+        weight_update_params::WeightUpdateParams,
     },
 };
 use cleandl::{
@@ -197,6 +200,76 @@ impl DecoderWeights {
                 stream,
                 cx,
             )?,
+        })
+    }
+
+    pub fn save_checkpoint(
+        &self,
+        builder: &mut CheckpointBuilder,
+        cx: &Context,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        builder.build_child("pre_qkv_norm", |builder| {
+            builder.add_param("gamma", &self.pre_qkv_norm_gamma, cx, stream)
+        })?;
+
+        builder.build_child("qkv_proj", |builder| {
+            builder.add_param("weight", &self.qkv_proj, cx, stream)
+        })?;
+
+        builder.build_child("o_proj", |builder| {
+            builder.add_param("weight", &self.o_proj, cx, stream)
+        })?;
+
+        builder.build_child("pre_ffn_norm", |builder| {
+            builder.add_param("gamma", &self.pre_ffn_norm_gamma, cx, stream)
+        })?;
+
+        builder.build_child("ffn", |builder| {
+            builder.add_param("up", &self.ffn_up, cx, stream)?;
+            builder.add_param("gate", &self.ffn_gate, cx, stream)?;
+            builder.add_param("down", &self.ffn_down, cx, stream)?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    pub fn load_from_checkpoint(
+        loader: &mut CheckpointLoader,
+        cx: &Context,
+        stream: &Stream,
+    ) -> anyhow::Result<Self> {
+        let pre_qkv_norm_gamma = loader.load_child("pre_qkv_norm", |loader| {
+            loader.load_param("gamma", cx, stream)
+        })?;
+
+        let qkv_proj =
+            loader.load_child("qkv_proj", |loader| loader.load_param("weight", cx, stream))?;
+
+        let o_proj =
+            loader.load_child("o_proj", |loader| loader.load_param("weight", cx, stream))?;
+
+        let pre_ffn_norm_gamma = loader.load_child("pre_ffn_norm", |loader| {
+            loader.load_param("gamma", cx, stream)
+        })?;
+
+        let (ffn_up, ffn_gate, ffn_down) = loader.load_child("ffn", |loader| {
+            Ok((
+                loader.load_param("up", cx, stream)?,
+                loader.load_param("gate", cx, stream)?,
+                loader.load_param("down", cx, stream)?,
+            ))
+        })?;
+
+        Ok(Self {
+            pre_qkv_norm_gamma,
+            qkv_proj,
+            o_proj,
+            pre_ffn_norm_gamma,
+            ffn_up,
+            ffn_gate,
+            ffn_down,
         })
     }
 }

@@ -59,28 +59,9 @@ impl SkyredTokenizer {
         Ok(tokens)
     }
 
-    fn pretokenize<'a>(&self, text: &'a [u8]) -> Vec<&'a [u8]> {
-        let mut remaining = text;
-        let mut pretokens = Vec::new();
-        while !remaining.is_empty() {
-            let pretoken_end = memchr2(b' ', b'\n', remaining);
-            match pretoken_end {
-                Some(i) => {
-                    pretokens.push(&remaining[..=i]);
-                    remaining = &remaining[i + 1..];
-                }
-                None => {
-                    pretokens.push(remaining);
-                    break;
-                }
-            }
-        }
-        pretokens
-    }
-
     fn push_text(&self, tokens: &mut Vec<TokenId>, text: impl AsRef<[u8]>) -> anyhow::Result<()> {
         if self.use_pretokenization {
-            for pretoken in self.pretokenize(text.as_ref()) {
+            for pretoken in pretokenize(text.as_ref()) {
                 tokens.extend(self.text_tokenizer.tokenize(pretoken)?);
             }
         } else {
@@ -101,6 +82,25 @@ impl SkyredTokenizer {
     pub fn vocab(&self) -> &Vocab<SpecialToken> {
         &self.vocab
     }
+}
+
+fn pretokenize(text: &[u8]) -> Vec<&[u8]> {
+    let mut remaining = text;
+    let mut pretokens = Vec::new();
+    while !remaining.is_empty() {
+        let pretoken_end = memchr2(b' ', b'\n', remaining);
+        match pretoken_end {
+            Some(i) => {
+                pretokens.push(&remaining[..=i]);
+                remaining = &remaining[i + 1..];
+            }
+            None => {
+                pretokens.push(remaining);
+                break;
+            }
+        }
+    }
+    pretokens
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, EnumIter, Serialize, Deserialize)]
@@ -125,15 +125,32 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
 
     for document in documents.into_iter().take(count.try_into()?) {
         let document = document?;
-        corpus.add_document(&document.subreddit)?;
-        corpus.add_document(format_date(document.date))?;
-        corpus.add_document(&document.author)?;
-        corpus.add_document(&document.title)?;
-        corpus.add_document(&document.selftext)?;
+        for text in [
+            document.subreddit.as_str(),
+            format_date(document.date).as_str(),
+            document.author.as_str(),
+            document.title.as_str(),
+            document.selftext.as_str(),
+        ] {
+            if config.use_pretokenization {
+                for pretoken in pretokenize(text.as_bytes()) {
+                    corpus.add_document(pretoken)?;
+                }
+            } else {
+                corpus.add_document(text)?;
+            }
+        }
 
         for comment in document.comment_chain {
-            corpus.add_document(&comment.author)?;
-            corpus.add_document(&comment.text)?;
+            for text in [comment.author.as_str(), comment.text.as_str()] {
+                if config.use_pretokenization {
+                    for pretoken in pretokenize(text.as_bytes()) {
+                        corpus.add_document(pretoken)?;
+                    }
+                } else {
+                    corpus.add_document(text)?;
+                }
+            }
         }
     }
 

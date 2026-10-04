@@ -70,7 +70,7 @@ fn rmsnorm_bf16_warp_persistent<
             + size_of::<bf16>() * (VECTOR_SIZE * PREFETCH_STAGES * NUM_WARPS)
             + num_mbarriers * size_of::<cuda_device::Barrier>()
             + store_staging_space;
-        assert!(dynamic_smem_size() >= required_smem as u32);
+        assert!(dynamic_smem_size() == required_smem as u32);
 
         let smem_base = DynamicSharedArray::<bf16, 128>::get();
         let smem_gamma = smem_base;
@@ -378,7 +378,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
     let required_smem = (4 * size_of::<bf16>() * VECTOR_SIZE * ROWS_PER_ITER * PREFETCH_STAGES)
         + (size_of::<f32>() * ROWS_PER_ITER * PREFETCH_STAGES)
         + (size_of::<f32>() * ROWS_PER_ITER * NUM_WARPS);
-    assert!(dynamic_smem_size() >= required_smem as u32);
+    assert!(dynamic_smem_size() == required_smem as u32);
 
     unsafe {
         let smem_base = DynamicSharedArray::<bf16, 256>::get();

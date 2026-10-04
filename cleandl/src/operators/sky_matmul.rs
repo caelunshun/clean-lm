@@ -25,6 +25,27 @@ const NATIVE_TM_CGA: usize = 256;
 const NATIVE_TN_CGA: usize = 256;
 const NATIVE_CGA_SIZE: u32 = 2;
 const NATIVE_CTA_THREADS: u32 = 384;
+const NATIVE_TM_CTA: usize = 128;
+const NATIVE_TN_B_CTA: usize = NATIVE_TN_CGA / NATIVE_CGA_SIZE as usize;
+const NATIVE_TK_CTA: usize = 64;
+const NATIVE_TM_EPI: usize = 128;
+const NATIVE_TN_EPI: usize = 64;
+const NATIVE_AB_PIPE_DEPTH: usize = 6;
+const NATIVE_EPILOGUE_PIPE_DEPTH: usize = 1;
+
+/// Must match `Smem::required_space` in `rust-kernels/src/sky_matmul/tcgen05_bf16.rs`.
+const fn native_required_smem() -> usize {
+    const BF16_SIZE: usize = 2;
+    const MBARRIER_SIZE: usize = 8;
+    let ab_staging = NATIVE_AB_PIPE_DEPTH
+        * BF16_SIZE
+        * (NATIVE_TM_CTA * NATIVE_TK_CTA + NATIVE_TN_B_CTA * NATIVE_TK_CTA);
+    // Epilogue load slots plus one store slot.
+    let epi_staging = (NATIVE_EPILOGUE_PIPE_DEPTH + 1) * BF16_SIZE * NATIVE_TM_EPI * NATIVE_TN_EPI;
+    let num_barriers = 2 * NATIVE_AB_PIPE_DEPTH + 2 * NATIVE_EPILOGUE_PIPE_DEPTH + 2 + 2 + 2;
+    let tmem_addr = size_of::<u32>();
+    ab_staging + epi_staging + num_barriers * MBARRIER_SIZE + tmem_addr
+}
 
 /// Executes custom matrix multiplications with high-performance fused epilogues,
 /// with kernels implemented in `rust-kernels` crate. Currently only supports SM10x
@@ -274,7 +295,7 @@ impl<E: Epilogue> ResourceKey for SkyMatmulConfig<E> {
                 self.epilogue.native_kernel_name()
             );
             let kernel = module.get_function(&kernel_name)?;
-            let dynamic_smem = cx.cuda().max_dynamic_smem_per_cta();
+            let dynamic_smem = native_required_smem();
             kernel.set_max_dynamic_smem(dynamic_smem)?;
             Backend::Native(NativeBackend {
                 kernel,

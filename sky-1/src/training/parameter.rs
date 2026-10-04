@@ -79,6 +79,31 @@ impl Parameter {
         })
     }
 
+    pub fn with_initial_weights_and_opt_state(
+        initial_master_weights: Tensor,
+        initial_adam_m: Tensor,
+        initial_adam_v: Tensor,
+        stream: &Stream,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        let bf16_weights_replica =
+            ConversionExecutor::get(cx)?.f32_to_bf16(&initial_master_weights.view(), stream)?;
+
+        let gradients = Tensor::new_zeroed(
+            initial_master_weights.shape(),
+            ElementType::Float(FloatType::F32),
+            cx,
+        )?;
+
+        Ok(Self {
+            master_weights: initial_master_weights,
+            bf16_weights_replica,
+            adam_m: initial_adam_m,
+            adam_v: initial_adam_v,
+            gradients,
+        })
+    }
+
     pub fn bf16_weights(&self) -> &Tensor {
         &self.bf16_weights_replica
     }
