@@ -3560,6 +3560,7 @@ dependencies = [
  "flume",
  "hashbrown 0.17.1",
  "priority-queue",
+ "rand 0.10.3",
  "rayon",
  "serde",
  "serde_json",

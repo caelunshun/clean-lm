@@ -20,3 +20,6 @@ simple-semaphore = "1.1.0"
 thiserror = "2.0.21"
 thread_local = "1.1.10"
 tracing = "0.1.44"
+
+[dev-dependencies]
+rand = "0.10.3"
