@@ -7,12 +7,12 @@ use skytokens::{
 fn main() -> anyhow::Result<()> {
     let mut corpus = CorpusBuilder::new();
     for line in include_str!("shakespeare.txt").lines() {
-        corpus.add_document(line);
+        corpus.add_document(line)?;
     }
     let corpus = corpus.build();
 
     const VOCAB_SIZE: u32 = 4096;
-    let vocab: Vocab<()> = training::train_vocab(corpus, VOCAB_SIZE, 8)?;
+    let vocab: Vocab<()> = training::train_vocab(corpus, VOCAB_SIZE, 1)?;
 
     println!("{}", serde_json::to_string_pretty(&vocab)?);
 

@@ -4,6 +4,7 @@
 
 use std::{cell::RefCell, iter, mem, sync::Arc, thread::available_parallelism};
 
+use anyhow::ensure;
 use blosc2::{
     CParams, CompressAlgo, DParams, SplitMode,
     chunk::{Decoder, Encoder},
@@ -13,6 +14,7 @@ use priority_queue::PriorityQueue;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use simple_semaphore::Semaphore;
+use thread_local::ThreadLocal;
 
 use crate::{
     training::{DOC_TERMINATOR, token_id_for_byte},
@@ -135,7 +137,8 @@ impl CorpusBuilder {
         }
     }
 
-    pub fn add_document(&mut self, document: impl AsRef<[u8]>) {
+    pub fn add_document(&mut self, document: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        ensure!((document.as_ref().len()) < u32::MAX as usize);
         self.current_chunk.extend(
             document
                 .as_ref()
@@ -149,6 +152,7 @@ impl CorpusBuilder {
         if self.current_chunk.len() >= TOKENS_PER_CHUNK {
             self.flush_chunk();
         }
+        Ok(())
     }
 
     fn flush_chunk(&mut self) {
@@ -285,6 +289,8 @@ impl Corpus {
 
         let compression = self.compression;
 
+        let thr_match_buffer = ThreadLocal::<RefCell<Vec<u32>>>::new();
+
         // In parallel, map each chunk to its contribution to the per-token-pair count deltas
         // by applying the merge. Then reduce the delta maps across chunks,
         // producing a final summed delta map.
@@ -312,33 +318,54 @@ impl Corpus {
                 let mut token_pair_occurrence_count_deltas =
                     HashMap::<(TokenId, TokenId), isize>::with_capacity(TOKENS_PER_CHUNK / 8);
 
+                let mut match_buffer = thr_match_buffer.get_or_default().borrow_mut();
+
                 for merge in merges {
-                    let mut i = 0;
+                    let max_matches = tokens.len() - 1;
+                    match_buffer.resize(max_matches, u32::MAX);
 
-                    // Stores the number of tokens logically removed from the tokens buffer so far,
-                    // which affects how `i` (an index into the _original_ token buffer
-                    // before applying this merge) maps to destination indexes in the overwritten
-                    // buffer. See Vec::retain for a similar pattern.
-                    let mut removed = 0;
+                    let num_matches =
+                        scan_merge_matches(tokens, &mut match_buffer, merge.first, merge.second);
+                    did_change |= num_matches > 0;
 
-                    while i < tokens.len() {
-                        let tok1 = tokens[i];
-                        if let Some(tok2) = tokens.get(i + 1).copied()
-                            && tok1 == merge.first
-                            && tok2 == merge.second
+                    // Apply merges. Applied matches are compacted into the front of
+                    // `match_buffer` (overwriting already-visited entries) for use by the
+                    // compaction pass below.
+                    let mut num_applied = 0usize;
+                    for m in 0..num_matches {
+                        let i = match_buffer[m] as usize;
+                        let prev_i = num_applied.checked_sub(1).map(|a| match_buffer[a] as usize);
+
+                        // In the case of overlapping matches, the leftmost takes priority, so skip
+                        // the one following it.
+                        if let Some(i_minus_1) = i.checked_sub(1)
+                            && prev_i == Some(i_minus_1)
                         {
-                            // Match; apply merge.
-                            did_change = true;
+                            continue;
+                        }
 
-                            // Update counts:
-                            // -1 occurrence for the merged pair
-                            *token_pair_occurrence_count_deltas
-                                .entry((tok1, tok2))
-                                .or_default() -= 1;
+                        let tok1 = tokens[i];
+                        let tok2 = tokens[i + 1];
 
-                            if let Some(tok0) = i.checked_sub(removed + 1).map(|tok0| tokens[tok0])
-                                && tok0 != DOC_TERMINATOR
+                        // Update counts:
+                        // -1 occurrence for the merged pair
+                        *token_pair_occurrence_count_deltas
+                            .entry((tok1, tok2))
+                            .or_default() -= 1;
+
+                        if let Some(i_minus_1) = i.checked_sub(1) {
+                            // Adjust token before the merged pair.
+                            let tok0 = if let Some(i_minus_2) = i.checked_sub(2)
+                                && prev_i == Some(i_minus_2)
                             {
+                                // - Need to handle the case where the immediately preceding
+                                // token was just merged.
+                                merge.merged
+                            } else {
+                                tokens[i_minus_1]
+                            };
+
+                            if tok0 != DOC_TERMINATOR {
                                 // -1 occurrence for (tok0, tok1)
                                 *token_pair_occurrence_count_deltas
                                     .entry((tok0, tok1))
@@ -348,30 +375,47 @@ impl Corpus {
                                     .entry((tok0, merge.merged))
                                     .or_default() += 1;
                             }
+                        }
 
-                            if let Some(tok3) = tokens.get(i + 2).copied()
-                                && tok3 != DOC_TERMINATOR
-                            {
-                                // -1 occurrence for (tok2, tok)
-                                *token_pair_occurrence_count_deltas
-                                    .entry((tok2, tok3))
-                                    .or_default() -= 1;
+                        if let Some(tok3) = tokens.get(i + 2).copied()
+                            && tok3 != DOC_TERMINATOR
+                        {
+                            // -1 occurrence for (tok2, tok)
+                            *token_pair_occurrence_count_deltas
+                                .entry((tok2, tok3))
+                                .or_default() -= 1;
 
-                                // +1 occurrence for (merged_token, tok3)
-                                *token_pair_occurrence_count_deltas
-                                    .entry((merge.merged, tok3))
-                                    .or_default() += 1;
-                            }
+                            // +1 occurrence for (merged_token, tok3)
+                            *token_pair_occurrence_count_deltas
+                                .entry((merge.merged, tok3))
+                                .or_default() += 1;
+                        }
 
-                            // Record the merge and removal of tok2.
-                            tokens[i - removed] = merge.merged;
+                        tokens[i] = merge.merged;
+                        // tokens[i + 1] will be eliminated by compaction below.
+                        match_buffer[num_applied] = i as u32;
+                        num_applied += 1;
+                    }
+
+                    // Now that we've applied the matches, we need to compact
+                    // the token buffer by removing those tokens which were matches.
+                    // `removed` stores the number of tokens logically removed from the tokens buffer so far,
+                    // which affects how `i` (an index into the _original_ token buffer
+                    // before applying this merge) maps to destination indexes in the overwritten
+                    // buffer. See Vec::retain for a similar pattern.
+                    let mut removed = 0;
+                    let mut applied = match_buffer[..num_applied]
+                        .iter()
+                        .map(|&j| j as usize)
+                        .peekable();
+                    let mut i = 0;
+                    while i < tokens.len() {
+                        tokens[i - removed] = tokens[i];
+
+                        if applied.next_if_eq(&i).is_some() {
+                            // Next token is removed, so skip.
                             removed += 1;
-
-                            // Skip past tok2 in the original token stream.
                             i += 1;
-                        } else {
-                            // Move the token downward to its new position.
-                            tokens[i - removed] = tok1;
                         }
 
                         i += 1;
@@ -429,6 +473,176 @@ impl Corpus {
                     self.token_pair_occurrence_counts.remove(&(first, second));
                 }
             }
+        }
+    }
+}
+
+/// Builds a list of all positions `i` in the given token buffer
+/// where `tokens[i] == first && tokens[i+1] == second`. The provided
+/// positions list must have sufficient capacity to hold the maximum
+/// number of possible indexes. Return match count.
+fn scan_merge_matches(
+    tokens: &[TokenId],
+    matches: &mut [u32],
+    first: TokenId,
+    second: TokenId,
+) -> usize {
+    let max_matches = tokens.len() - 1;
+    assert!(matches.len() >= max_matches);
+    assert!(tokens.len() < u32::MAX as usize);
+
+    let tokens: &[u32] = bytemuck::cast_slice(tokens);
+
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        return unsafe { scan_merge_matches_avx512(tokens, matches, first.idx(), second.idx()) };
+    }
+
+    scan_merge_matches_fallback(tokens, matches, first.idx(), second.idx())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn scan_merge_matches_avx512(
+    tokens: &[u32],
+    matches: &mut [u32],
+    first: u32,
+    second: u32,
+) -> usize {
+    use core::arch::x86_64::*;
+
+    let mut match_count = 0;
+
+    let (head, middle, tail) = unsafe { tokens.align_to::<__m512i>() };
+    if middle.is_empty() {
+        return scan_merge_matches_fallback(tokens, matches, first, second);
+    }
+
+    if !head.is_empty() {
+        for (i, [a, b]) in head
+            .array_windows::<2>()
+            .copied()
+            .chain(iter::once([
+                head.last().copied().unwrap(),
+                tokens[head.len()],
+            ]))
+            .enumerate()
+        {
+            if a == first && b == second {
+                matches[match_count] = i as u32;
+                match_count += 1;
+            }
+        }
+    }
+
+    // SIMD loop
+    unsafe {
+        let v_first = _mm512_set1_epi32(first as i32);
+        let v_second = _mm512_set1_epi32(second as i32);
+
+        for (i, &v_toks) in middle.iter().enumerate() {
+            let tail_match = if i < middle.len() - 1 || !tail.is_empty() {
+                tokens[head.len() + (i + 1) * 16] == second
+            } else {
+                false
+            };
+
+            let m1 = _mm512_cmpeq_epi32_mask(v_toks, v_first);
+            let m2 = _mm512_cmpeq_epi32_mask(v_toks, v_second) >> 1 | ((tail_match as u16) << 15);
+
+            let m_match = m1 & m2;
+
+            let base = (head.len() + i * 16) as u32 as i32;
+            let indexes = _mm512_setr_epi32(
+                base,
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+                base + 10,
+                base + 11,
+                base + 12,
+                base + 13,
+                base + 14,
+                base + 15,
+            );
+
+            let v_match_count = m_match.count_ones();
+            let store_mask = ((1 << v_match_count) - 1) as u16;
+
+            let compressed_indexes = _mm512_maskz_compress_epi32(m_match, indexes);
+
+            _mm512_mask_storeu_epi32(
+                matches.as_mut_ptr().add(match_count).cast(),
+                store_mask,
+                compressed_indexes,
+            );
+            match_count += v_match_count as usize;
+        }
+    }
+
+    if !tail.is_empty() {
+        for (i, [a, b]) in tail.array_windows::<2>().copied().enumerate() {
+            let i = i + head.len() + 16 * middle.len();
+
+            if a == first && b == second {
+                matches[match_count] = i as u32;
+                match_count += 1;
+            }
+        }
+    }
+
+    match_count
+}
+
+fn scan_merge_matches_fallback(
+    tokens: &[u32],
+    matches: &mut [u32],
+    first: u32,
+    second: u32,
+) -> usize {
+    let mut match_count = 0;
+    for (i, &[a, b]) in tokens.array_windows::<2>().enumerate() {
+        if a == first && b == second {
+            matches[match_count] = i as u32;
+            match_count += 1;
+        }
+    }
+    match_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_merge_matches() {
+        let mut buf = Vec::new();
+        for _ in 0..1000 {
+            buf.extend([
+                TokenId::from_idx(0).unwrap(),
+                TokenId::from_idx(1).unwrap(),
+                TokenId::from_idx(2).unwrap(),
+                TokenId::from_idx(3).unwrap(),
+            ]);
+        }
+
+        let mut match_buffer = vec![0u32; buf.len() - 1];
+        let count = scan_merge_matches(
+            &buf,
+            &mut match_buffer,
+            TokenId::from_idx(3).unwrap(),
+            TokenId::from_idx(0).unwrap(),
+        );
+        assert_eq!(count, 999);
+
+        for (i, idx) in match_buffer[..count].iter().copied().enumerate() {
+            assert_eq!(idx, (i * 4 + 3) as u32);
         }
     }
 }

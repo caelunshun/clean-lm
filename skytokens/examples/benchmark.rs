@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let mut corpus = CorpusBuilder::with_compression(compression);
     for _ in 0..repeats {
         for line in text.lines() {
-            corpus.add_document(line);
+            corpus.add_document(line)?;
         }
     }
     let corpus = corpus.build();
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let start = Instant::now();
-    let vocab: Vocab<()> = training::train_vocab(corpus, VOCAB_SIZE, 1)?;
+    let vocab: Vocab<()> = training::train_vocab(corpus, VOCAB_SIZE, 4)?;
     eprintln!(
         "trained {} token vocab in {:.2?}",
         vocab.num_tokens(),
