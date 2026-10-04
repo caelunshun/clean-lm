@@ -50,6 +50,12 @@ pub fn train_vocab<SP: SpecialTokenData>(
         vocab.add_merge(merge)?;
 
         corpus.apply_merge(merge);
+        tracing::debug!(
+            vocab_size = vocab.num_tokens(),
+            first = %vocab.token(first).text_token().unwrap(),
+            second = %vocab.token(second).text_token().unwrap(),
+            "applied merge"
+        );
     }
 
     Ok(vocab)

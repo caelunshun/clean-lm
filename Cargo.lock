@@ -3489,6 +3489,7 @@ dependencies = [
  "serde_json",
  "simple-semaphore",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

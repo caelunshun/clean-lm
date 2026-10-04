@@ -1,4 +1,4 @@
-use std::hash::Hash;
+use std::{fmt::Display, hash::Hash};
 
 use anyhow::{bail, ensure};
 use bytemuck::{Pod, Zeroable};
@@ -155,6 +155,13 @@ impl<SP> Token<SP> {
             Token::Special(_) => None,
         }
     }
+
+    pub fn text_token(&self) -> Option<&TextToken> {
+        match self {
+            Token::Text(text_token) => Some(text_token),
+            Token::Special(special_token) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +188,14 @@ impl<'de> Deserialize<'de> for TextToken {
             .map_err(|_| de::Error::custom("incorrect escape"))?;
 
         Ok(Self(CompactBytes::new(d.as_slice())))
+    }
+}
+
+impl Display for TextToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        String::from_utf8(escape_bytes::escape(self.0.iter().copied()))
+            .unwrap()
+            .fmt(f)
     }
 }
 
