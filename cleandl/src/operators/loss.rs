@@ -69,12 +69,15 @@ impl LossExecutor {
     }
 
     /// `logits` has shape `[batch_size, num_classes]` and `stats` and `labels`
-    /// shape `[batch_size]`.
+    /// shape `[batch_size]`. `labels_mask` has length `batch_size`; rows with a
+    /// `false` entry are excluded from the loss and receive zero gradient, and the
+    /// mean is taken over the unmasked rows only.
     pub fn cross_entropy_loss_fwd_bwd(
         &self,
         logits: &TensorView<'_>,
         stats: &TensorView<'_>,
         labels: &TensorView<'_>,
+        labels_mask: &[bool],
         stream: &Stream,
     ) -> anyhow::Result<CrossEntropyLossOutput> {
         assert_eq!(logits.element_type(), ElementType::Float(FloatType::Bf16));
@@ -91,8 +94,25 @@ impl LossExecutor {
         assert!(num_classes.is_multiple_of(16));
         assert_eq!(stats.shape(), Shape::new([batch_size]));
         assert_eq!(labels.shape(), Shape::new([batch_size]));
+        assert_eq!(labels_mask.len(), batch_size);
 
         assert!(batch_size > 0);
+
+        let num_unmasked = labels_mask.iter().filter(|&&m| m).count();
+        let recip_num_unmasked = if num_unmasked == 0 {
+            0.0
+        } else {
+            (num_unmasked as f32).recip()
+        };
+
+        // Read by the kernel directly from host pinned memory.
+        let mut labels_mask_mem = self
+            .cx
+            .host_pinned_memory_pool()
+            .alloc_zeroed(labels_mask.len())?;
+        for (dst, &src) in labels_mask_mem.view_mut()?.iter_mut().zip(labels_mask) {
+            *dst = u8::from(src);
+        }
 
         // The loss is an atomic accumulator, so it relies on the allocation being zeroed.
         let mut out_loss =
@@ -116,10 +136,11 @@ impl LossExecutor {
                 .arg(logits_memory)?
                 .arg(stats_memory)?
                 .arg(labels_memory)?
+                .arg(&labels_mask_mem)?
                 .arg(out_loss_memory)?
                 .arg(out_logits_grad_memory)?
                 .arg(i32::try_from(batch_size)?)?
-                .arg((batch_size as f32).recip())?
+                .arg(recip_num_unmasked)?
                 .arg(i32::try_from(num_classes)?)?;
             // Block dim and smem are overriden by TileIR.
             unsafe {

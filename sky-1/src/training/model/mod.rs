@@ -216,6 +216,7 @@ impl Sky1Executor {
         &self,
         token_indices: &TensorView,
         labels: &TensorView,
+        labels_mask: &[bool],
         meta_tensors: &MetaTensors,
         weights: &Sky1Weights,
         stream: &Stream,
@@ -264,6 +265,7 @@ impl Sky1Executor {
             &logits.view(),
             &loss_stats.view(),
             labels,
+            labels_mask,
             stream,
         )?;
 

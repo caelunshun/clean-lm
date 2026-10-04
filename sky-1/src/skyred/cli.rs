@@ -1,4 +1,4 @@
-use crate::skyred::{config::Config, dataset};
+use crate::skyred::{config::Config, dataset, training};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -14,6 +14,7 @@ pub struct Cli {
 pub enum Command {
     BuildSample,
     TrainTokenizer,
+    Train(training::Cli),
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -22,6 +23,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::BuildSample => dataset::sampling::build_sample(&config.dataset)?,
         Command::TrainTokenizer => dataset::tokenization::train_tokenizer(&config.dataset)?,
+        Command::Train(cli) => training::run(&cli, &config)?,
     }
 
     Ok(())

@@ -51,15 +51,19 @@ extern "C" __tile_global__ void online_softmax_stats_128(const __nv_bfloat16 *__
 // Forward+backward cross-entropy loss on logits w.r.t.
 // a single target label per row.
 // Requires logits pre-processed with online_softmax_stats kernel.
-// Loss must be pre-zeroed. This kernel will compute the mean across batch items.
+// Rows with a false `labels_mask` entry contribute neither loss nor gradient.
+// Loss must be pre-zeroed. `recip_batch_size` is the reciprocal of the number
+// of unmasked rows, so this kernel computes the mean across unmasked batch items.
 extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat16 *__restrict__ logits,
                                                            const float *__restrict__ stats, const int *__restrict__ labels,
+                                                           const bool *__restrict__ labels_mask,
                                                            float *__restrict__ out_loss, __nv_bfloat16 *__restrict__ out_logits_grad,
                                                            int batch_size, float recip_batch_size, int num_classes)
 {
     ASSUME_ALIGNED(logits);
     ASSUME_ALIGNED(stats);
     ASSUME_ALIGNED(labels);
+    ASSUME_ALIGNED(labels_mask);
     ASSUME_ALIGNED(out_logits_grad);
     ASSUME_ALIGNED(out_loss);
     num_classes = ct::assume_divisible(num_classes, 16_ic);
@@ -73,12 +77,16 @@ extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat
     auto labels_view = ct::partition_view{
         ct::tensor_span{labels, ct::extents{batch_size}},
         ct::shape<128>{}};
+    auto labels_mask_view = ct::partition_view{
+        ct::tensor_span{labels_mask, ct::extents{batch_size}},
+        ct::shape<128>{}};
     auto out_logits_grad_view = ct::partition_view{
         ct::tensor_span{out_logits_grad, ct::extents{batch_size, num_classes}},
         ct::shape<128, 128>{}};
 
     auto stats_tile = ct::reshape(stats_view.load_masked(ct::bid().x), ct::shape<128, 1>{});
     auto labels_tile = ct::reshape(labels_view.load_masked(ct::bid().x), ct::shape<128, 1>{});
+    auto labels_mask_tile = ct::reshape(labels_mask_view.load_masked(ct::bid().x), ct::shape<128, 1>{});
 
     auto per_row_loss = ct::zeros<ct::tile<float, ct::shape<128, 1>>>();
 
@@ -89,7 +97,7 @@ extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat
         auto log_probs = logits_tile - stats_tile;
 
         auto class_idx = ct::iota<ct::tile<int, ct::shape<1, 128>>>() + 128 * tile_idx;
-        auto class_matches = class_idx == labels_tile;
+        auto class_matches = (class_idx == labels_tile) && labels_mask_tile;
 
         auto loss_contrib = ct::select(class_matches, -log_probs, ct::zeros<ct::tile<float, ct::shape<128, 128>>>());
         per_row_loss = per_row_loss + ct::sum(loss_contrib, 1_ic);
@@ -98,8 +106,9 @@ extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat
                                        ct::zeros<ct::tile<float, ct::shape<128, 128>>>());
         auto probs = ct::exp2(log_probs * log2_e, ct::round_subnormals_to_zero_t{});
 
-        auto grad = ct::element_cast<__nv_bfloat16>((probs - target_probs) * recip_batch_size);
-        out_logits_grad_view.store_masked(grad, ct::bid().x, tile_idx);
+        auto grad = ct::select(labels_mask_tile, (probs - target_probs) * recip_batch_size,
+                               ct::zeros<ct::tile<float, ct::shape<128, 128>>>());
+        out_logits_grad_view.store_masked(ct::element_cast<__nv_bfloat16>(grad), ct::bid().x, tile_idx);
     }
 
     auto loss_contrib = ct::reshape(ct::sum(per_row_loss, 0_ic) * recip_batch_size, ct::shape<1>{});

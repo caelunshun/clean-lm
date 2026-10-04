@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub dataset: DatasetConfig,
     pub training: TrainingConfig,
+    pub model: ModelConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +40,7 @@ pub struct DatasetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrainingConfig {
     pub seed: u64,
+    pub checkpoints_dir: PathBuf,
     pub microbatch_size: u32,
     pub gradient_accumulation_steps: u32,
     pub adam_beta1: f32,
@@ -47,10 +49,26 @@ pub struct TrainingConfig {
     pub max_gradient_norm: f32,
     pub lr_schedule: LrSchedule,
     pub lr_warmup_steps: Option<u32>,
+    pub enable_autotuning: bool,
+    pub steps_per_checkpoint: usize,
+    pub max_kept_checkpoints: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    pub num_blocks: usize,
+    pub hidden_size: usize,
+    pub ffn_intermediate_size: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub max_seqlen: usize,
+    pub rope_base_freq: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum LrSchedule {
     Constant { lr: f32 },
+    Cosine { lr_min: f32, lr_max: f32 },
 }

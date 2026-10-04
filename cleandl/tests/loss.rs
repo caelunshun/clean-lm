@@ -61,6 +61,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     let labels_host: Vec<i32> = (0..BATCH_SIZE)
         .map(|_| rng.random_range(0..NUM_CLASSES as i32))
         .collect();
+    let labels_mask: Vec<bool> = (0..BATCH_SIZE).map(|_| rng.random_bool(0.8)).collect();
 
     cx.upload_to_device(&logits_host, logits.storage_mut(), &stream)?;
     cx.upload_to_device(&labels_host, labels.storage_mut(), &stream)?;
@@ -70,6 +71,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         &logits.view(),
         &stats.view(),
         &labels.view(),
+        &labels_mask,
         &stream,
     )?;
 
@@ -82,7 +84,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     let loss_out: f32 = bytemuck::cast_slice::<_, f32>(loss_staging.view()?)[0];
     let grad_out: &[bf16] = bytemuck::cast_slice(grad_staging.view()?);
 
-    let expected = reference_loss(&logits_host, &labels_host);
+    let expected = reference_loss(&logits_host, &labels_host, &labels_mask);
 
     let check =
         |name: &str, i: usize, actual: f32, expected: f32, rel: f32| -> anyhow::Result<()> {
@@ -141,7 +143,8 @@ struct Reference {
     grad: Vec<f32>,
 }
 
-fn reference_loss(logits: &[bf16], labels: &[i32]) -> Reference {
+fn reference_loss(logits: &[bf16], labels: &[i32], labels_mask: &[bool]) -> Reference {
+    let num_unmasked = labels_mask.iter().filter(|&&m| m).count();
     let mut grad = vec![0.0; BATCH_SIZE * NUM_CLASSES];
 
     let (stats, row_losses): (Vec<f32>, Vec<f64>) = grad
@@ -157,13 +160,18 @@ fn reference_loss(logits: &[bf16], labels: &[i32]) -> Reference {
             let sum_exp: f64 = row_logits.iter().map(|&x| ((x - max) as f64).exp()).sum();
             let logsumexp = max + (sum_exp as f32).ln();
 
+            if !labels_mask[row] {
+                row_grad.fill(0.0);
+                return (logsumexp, 0.0);
+            }
+
             let label = labels[row] as usize;
             let row_loss = -(row_logits[label] - logsumexp) as f64;
 
             for (class, grad) in row_grad.iter_mut().enumerate() {
                 let prob = (row_logits[class] - logsumexp).exp();
                 let target = f32::from(class == label);
-                *grad = (prob - target) / BATCH_SIZE as f32;
+                *grad = (prob - target) / num_unmasked as f32;
             }
 
             (logsumexp, row_loss)
@@ -172,7 +180,7 @@ fn reference_loss(logits: &[bf16], labels: &[i32]) -> Reference {
 
     Reference {
         stats,
-        loss: (row_losses.iter().sum::<f64>() / BATCH_SIZE as f64) as f32,
+        loss: (row_losses.iter().sum::<f64>() / num_unmasked as f64) as f32,
         grad,
     }
 }
