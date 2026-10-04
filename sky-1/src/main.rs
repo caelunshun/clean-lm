@@ -2,15 +2,15 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 use cleandl::context::Context;
+use mimalloc::MiMalloc;
 use sky_1::skyred;
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
-use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
-static ALLOCATOR: Jemalloc = Jemalloc;
+static ALLOCATOR: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 struct Cli {
