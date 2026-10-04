@@ -23,7 +23,7 @@ use zstd::{
 
 use crate::skyred::dataset::schema::Document;
 
-const ZSTD_LEVEL: i32 = 9;
+const ZSTD_LEVEL: i32 = 4;
 const DICT_MAX_SIZE: usize = 256 * 1024;
 /// Upper bound on the encoded document bytes used to train the dictionary.
 const DICT_TRAINING_BYTES: usize = 64 * 1024 * 1024;
@@ -36,7 +36,7 @@ pub fn write_documents(path: &Path, documents: &[Document]) -> anyhow::Result<()
     let dict = train_dictionary(documents)?;
     let cdict = EncoderDictionary::copy(&dict, ZSTD_LEVEL);
 
-    let mut writer = BufWriter::new(fs_err::File::create(path)?);
+    let mut writer = BufWriter::with_capacity(256 * 1024, fs_err::File::create(path)?);
     writer.write_all(&u32::try_from(dict.len())?.to_le_bytes())?;
     writer.write_all(&dict)?;
     writer.write_all(&(documents.len() as u64).to_le_bytes())?;

@@ -159,7 +159,7 @@ impl<SP> Token<SP> {
     pub fn text_token(&self) -> Option<&TextToken> {
         match self {
             Token::Text(text_token) => Some(text_token),
-            Token::Special(special_token) => None,
+            Token::Special(_) => None,
         }
     }
 }

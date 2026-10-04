@@ -177,7 +177,7 @@ impl Corpus {
                 let mut new_tokens = Vec::with_capacity(original_tokens.len());
                 let mut did_change = false;
                 let mut local_token_pair_occurrence_count_deltas =
-                    HashMap::<(TokenId, TokenId), isize>::default();
+                    HashMap::<(TokenId, TokenId), isize>::with_capacity(TOKENS_PER_CHUNK / 8);
 
                 let mut i = 0;
                 while i < original_tokens.len() {
