@@ -2,8 +2,6 @@
 //!
 //! Does not use pre-tokenization, since those techniques have language/script assumptions.
 
-use std::time::Instant;
-
 use anyhow::ensure;
 
 use crate::vocab::{Merge, SpecialTokenData, TextToken, Token, TokenId, Vocab};
@@ -76,9 +74,7 @@ pub fn train_vocab<SP: SpecialTokenData>(
             );
         }
 
-        let start = Instant::now();
         corpus.apply_merges(&merges);
-        dbg!(start.elapsed());
 
         if fused_merges > 1 {
             tracing::debug!("end fused merge group");

@@ -96,15 +96,15 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
 
     for document in documents {
         let document = document?;
-        corpus.add_document(&document.subreddit);
-        corpus.add_document(format_date(document.date));
-        corpus.add_document(&document.author);
-        corpus.add_document(&document.title);
-        corpus.add_document(&document.selftext);
+        corpus.add_document(&document.subreddit)?;
+        corpus.add_document(format_date(document.date))?;
+        corpus.add_document(&document.author)?;
+        corpus.add_document(&document.title)?;
+        corpus.add_document(&document.selftext)?;
 
         for comment in document.comment_chain {
-            corpus.add_document(&comment.author);
-            corpus.add_document(&comment.text);
+            corpus.add_document(&comment.author)?;
+            corpus.add_document(&comment.text)?;
         }
     }
 
