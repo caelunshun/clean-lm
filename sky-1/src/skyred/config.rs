@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use compact_str::CompactString;
 use serde::Deserialize;
-use skytens_core::FastIndexSet;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -22,8 +21,12 @@ pub struct DatasetConfig {
     pub subreddit_uniform_mix: f64,
     /// As `subreddit_uniform_mix`, but across years.
     pub year_uniform_mix: f64,
-    pub prune_texts: FastIndexSet<CompactString>,
-    pub prune_authors: FastIndexSet<CompactString>,
+    /// Matches exact text after whitespace trimming. ASCII case-sensitive.
+    pub prune_texts: Vec<CompactString>,
+    /// Matches substrings of text. ASCII case-insensitive.
+    pub prune_phrases: Vec<CompactString>,
+    /// Matches exact author username. Case-sensitive.
+    pub prune_authors: Vec<CompactString>,
     /// Total vocabulary size including special tokens.
     pub total_vocab_size: u32,
 }

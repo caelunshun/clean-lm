@@ -4,6 +4,7 @@ use std::{
     cmp::Reverse, collections::BinaryHeap, future::Future, io::Cursor, ops::Range, sync::Arc,
 };
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Context, ensure};
 use arrow_array::{
     Array, ArrayRef, LargeStringArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
@@ -41,7 +42,7 @@ use crate::skyred::{
 const SECONDS_PER_DAY: i64 = 86_400;
 /// Used to impute author name when null.
 const DELETED_AUTHOR: &str = "[deleted]";
-const MAX_COMMENT_CHAIN_DEPTH: usize = 16;
+const MAX_COMMENT_CHAIN_DEPTH: usize = 8;
 
 type Year = i16;
 
@@ -63,6 +64,8 @@ pub fn build_sample(config: &DatasetConfig) -> anyhow::Result<()> {
 }
 
 async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<Vec<Document>> {
+    let filter = Filter::new(config);
+
     let object_store: Arc<dyn ObjectStore> = Arc::new(
         AmazonS3Builder::from_env()
             .with_bucket_name(&config.reddit_ingest_bucket)
@@ -92,9 +95,9 @@ async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<Vec<Docume
         paths.iter().cloned(),
         |path| {
             let object_store = object_store.clone();
-            let config = config.clone();
+            let filter = filter.clone();
             async move {
-                count_file(object_store, &path, &config)
+                count_file(object_store, &path, &filter)
                     .await
                     .with_context(|| format!("failed to count posts in {path}"))
             }
@@ -123,9 +126,9 @@ async fn build_sample_async(config: &DatasetConfig) -> anyhow::Result<Vec<Docume
         files,
         |(path, seed)| {
             let (object_store, quotas) = (object_store.clone(), quotas.clone());
-            let config = config.clone();
+            let filter = filter.clone();
             async move {
-                sample_file(object_store, &path, &quotas, seed, &config)
+                sample_file(object_store, &path, &quotas, seed, &filter)
                     .await
                     .with_context(|| format!("failed to sample from {path}"))
             }
@@ -181,13 +184,13 @@ fn merge_counts(counts: &mut Strata<u64>, other: Strata<u64>) {
 async fn count_file(
     object_store: Arc<dyn ObjectStore>,
     path: &ObjectPath,
-    config: &DatasetConfig,
+    filter: &Filter,
 ) -> anyhow::Result<Strata<u64>> {
     let mut stream = open_posts(object_store, path, false).await?;
     let mut counts = Strata::<u64>::default();
     while let Some(reader) = stream.next_row_group().await? {
         for batch in reader {
-            count_batch(&batch?, config, &mut counts)?;
+            count_batch(&batch?, filter, &mut counts)?;
         }
     }
     Ok(counts)
@@ -195,13 +198,13 @@ async fn count_file(
 
 fn count_batch(
     batch: &RecordBatch,
-    config: &DatasetConfig,
+    filter: &Filter,
     counts: &mut Strata<u64>,
 ) -> anyhow::Result<()> {
     let batch = StructArray::from(batch.clone());
     let posts = PostColumns::new(&batch)?;
     for row in 0..batch.len() {
-        if let Some((date, subreddit)) = posts.stratum(row, config) {
+        if let Some((date, subreddit)) = posts.stratum(row, filter) {
             *counts
                 .entry(date.year())
                 .or_default()
@@ -322,7 +325,7 @@ async fn sample_file(
     path: &ObjectPath,
     quotas: &Strata<u64>,
     seed: u64,
-    config: &DatasetConfig,
+    filter: &Filter,
 ) -> anyhow::Result<Sample> {
     let mut stream = open_posts(object_store, path, true).await?;
 
@@ -330,7 +333,7 @@ async fn sample_file(
     let mut sample = Sample::default();
     while let Some(reader) = stream.next_row_group().await? {
         for batch in reader {
-            sample_batch(&batch?, quotas, &mut rng, &mut sample, config)?;
+            sample_batch(&batch?, quotas, &mut rng, &mut sample, filter)?;
         }
     }
     Ok(sample)
@@ -341,7 +344,7 @@ fn sample_batch(
     quotas: &Strata<u64>,
     rng: &mut StdRng,
     sample: &mut Sample,
-    config: &DatasetConfig,
+    filter: &Filter,
 ) -> anyhow::Result<()> {
     let batch = StructArray::from(batch.clone());
     let posts = PostColumns::new(&batch)?;
@@ -356,7 +359,7 @@ fn sample_batch(
     };
 
     for row in 0..batch.len() {
-        let Some((date, subreddit)) = posts.stratum(row, config) else {
+        let Some((date, subreddit)) = posts.stratum(row, filter) else {
             continue;
         };
         let Some(reservoir) = sample.reservoir(quotas, date.year(), subreddit) else {
@@ -373,7 +376,7 @@ fn sample_batch(
             title: posts.title.value(row).to_owned(),
             author: posts.author(row).into(),
             selftext: posts.selftext(row).into(),
-            comment_chain: comments.deepest_chain(comments.range(row), rng, config),
+            comment_chain: comments.deepest_chain(comments.range(row), rng, filter),
         };
         doc.comment_chain.truncate(MAX_COMMENT_CHAIN_DEPTH);
 
@@ -425,14 +428,14 @@ impl<'a> PostColumns<'a> {
 
     /// Returns the post's date and subreddit, or `None` if the post is excluded
     /// by missing data or the author and text filters.
-    fn stratum(&self, row: usize, config: &DatasetConfig) -> Option<(Date, &'a str)> {
+    fn stratum(&self, row: usize, filter: &Filter) -> Option<(Date, &'a str)> {
         if self.subreddit.is_null(row) {
             return None;
         }
         let date = day_to_date(self.created_utc.value(row).div_euclid(SECONDS_PER_DAY))?;
-        if config.prune_texts.contains(self.title.value(row).trim())
-            || config.prune_texts.contains(self.selftext(row).trim())
-            || config.prune_authors.contains(self.author(row).trim())
+        if filter.should_prune_author(self.author.value(row))
+            || filter.should_prune_text(self.title.value(row))
+            || filter.should_prune_text(self.selftext.value(row))
         {
             return None;
         }
@@ -453,12 +456,12 @@ impl CommentColumns<'_> {
         self.offsets[post_row] as usize..self.offsets[post_row + 1] as usize
     }
 
-    fn passes_filter(&self, i: usize, config: &DatasetConfig) -> bool {
-        if config.prune_authors.contains(self.author.value(i).trim()) {
+    fn passes_filter(&self, i: usize, filter: &Filter) -> bool {
+        if filter.should_prune_author(self.author.value(i)) {
             return false;
         }
 
-        if config.prune_texts.contains(self.body.value(i).trim()) {
+        if filter.should_prune_text(self.body.value(i)) {
             return false;
         }
 
@@ -472,11 +475,11 @@ impl CommentColumns<'_> {
         &self,
         range: Range<usize>,
         rng: &mut StdRng,
-        config: &DatasetConfig,
+        filter: &Filter,
     ) -> Vec<Comment> {
         let mut valid_indices = range
             .into_iter()
-            .filter(|i| self.passes_filter(*i, config))
+            .filter(|i| self.passes_filter(*i, filter))
             .collect::<Vec<_>>();
         if valid_indices.is_empty() {
             return Vec::new();
@@ -547,7 +550,12 @@ impl CommentColumns<'_> {
             }
         }
 
-        let Some(max_depth) = depths.values().max().copied() else {
+        let Some(max_depth) = depths
+            .values()
+            .filter(|d| **d <= MAX_COMMENT_CHAIN_DEPTH)
+            .max()
+            .copied()
+        else {
             return Vec::new();
         };
         let deepest: Vec<usize> = valid_indices
@@ -676,6 +684,41 @@ impl Sample {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Filter {
+    config: Arc<DatasetConfig>,
+    prune_phrases_searcher: Arc<AhoCorasick>,
+}
+
+impl Filter {
+    pub fn new(config: &DatasetConfig) -> Self {
+        let mut prune_phrases_searcher = AhoCorasickBuilder::new();
+        prune_phrases_searcher.ascii_case_insensitive(true);
+        let prune_phrases_searcher = prune_phrases_searcher
+            .build(config.prune_phrases.iter().map(|p| p.as_str()))
+            .unwrap();
+
+        Self {
+            config: Arc::new(config.clone()),
+            prune_phrases_searcher: Arc::new(prune_phrases_searcher),
+        }
+    }
+
+    pub fn should_prune_author(&self, author: &str) -> bool {
+        let trimmed = author.trim_ascii();
+        self.config.prune_authors.iter().any(|a| a == trimmed)
+    }
+
+    pub fn should_prune_text(&self, text: &str) -> bool {
+        let trimmed = text.trim_ascii();
+        if self.config.prune_texts.iter().any(|t| t == trimmed) {
+            return true;
+        }
+
+        self.prune_phrases_searcher.is_match(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{Int64Array, LargeStringArray, StringArray};
@@ -701,6 +744,7 @@ mod tests {
             subreddit_uniform_mix: 0.0,
             year_uniform_mix: 0.0,
             prune_texts: ["[removed]".into()].into_iter().collect(),
+            prune_phrases: [].into_iter().collect(),
             prune_authors: ["AutoModerator".into()].into_iter().collect(),
             total_vocab_size: 0,
         }
@@ -745,7 +789,7 @@ mod tests {
         .unwrap();
 
         let mut counts = Strata::<u64>::default();
-        count_batch(&batch, &test_config(), &mut counts).unwrap();
+        count_batch(&batch, &Filter::new(&test_config()), &mut counts).unwrap();
         let expected: Strata<u64> = [
             (
                 2024,

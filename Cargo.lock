@@ -3381,6 +3381,7 @@ checksum = "368ece9665ab1142ae0fc9f125659d81c32479020bdbfd076a5e6b4a2528b3d4"
 name = "sky-1"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "arrow-array",
  "arrow-schema",
