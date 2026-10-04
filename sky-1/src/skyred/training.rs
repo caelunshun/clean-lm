@@ -12,6 +12,7 @@ use crate::{
         weight_update_params::WeightUpdateParams,
     },
 };
+use anyhow::anyhow;
 use clap::Parser;
 use cleandl::{context::Context, operators::attention::RaggedSeqlenTensors, tensor::Tensor};
 use rand::{SeedableRng, rngs::StdRng};
@@ -22,7 +23,14 @@ use skycuda::{
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 use skytokens::vocab::{TokenId, Vocab};
-use std::{f32::consts::PI, mem, path::PathBuf, process::exit, sync::Arc, thread};
+use std::{
+    f32::consts::PI,
+    mem,
+    path::PathBuf,
+    process::exit,
+    sync::Arc,
+    thread::{self, JoinHandle},
+};
 
 #[derive(Debug, Parser)]
 pub struct Cli {
@@ -84,7 +92,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         num_decoder_blocks: config.model.num_blocks,
     };
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct LossRecord {
         batch: usize,
         loss: f32,
@@ -119,43 +127,52 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
 
     let executor = Sky1Executor::get(model_config.clone(), &cx)?;
 
-    let checkpoint = |weights: &Sky1Weights,
-                      train_step: u32,
-                      loss_history: &[LossRecord]|
+    let mut checkpoint_writer = CheckpointWriter::default();
+    let mut checkpoint = |weights: &Sky1Weights,
+                          train_step: u32,
+                          loss_history: &[LossRecord]|
      -> anyhow::Result<()> {
+        // Ensure at most one checkpoint in flight at a time. 
+        checkpoint_writer.wait()?;
+
         let mut builder = CheckpointBuilder::default();
         weights.save_checkpoint(&mut builder, &cx, cx.d2h_copy_stream())?;
-        let dir = config
-            .training
-            .checkpoints_dir
-            .join(format!("checkpoint{train_step:06}"));
-        fs_err::create_dir_all(&dir)?;
 
-        builder.save_to_dir(train_step, &dir)?;
+        let checkpoints_dir = config.training.checkpoints_dir.clone();
+        let max_kept_checkpoints = config.training.max_kept_checkpoints;
+        let loss_history = loss_history.to_vec();
+        checkpoint_writer.spawn(move || {
+            let dir = checkpoints_dir.join(format!("checkpoint{train_step:06}"));
+            fs_err::create_dir_all(&dir)?;
 
-        let mut loss_csv = csv::Writer::from_path(dir.join("loss.csv"))?;
-        for loss_record in loss_history {
-            loss_csv.serialize(loss_record)?;
-        }
-        loss_csv.flush()?;
+            builder.save_to_dir(train_step, &dir)?;
 
-        tracing::info!("saved checkpoint to {}", dir.display());
+            let mut loss_csv = csv::Writer::from_path(dir.join("loss.csv"))?;
+            for loss_record in &loss_history {
+                loss_csv.serialize(loss_record)?;
+            }
+            loss_csv.flush()?;
 
-        let mut all_checkpoints = fs_err::read_dir(&config.training.checkpoints_dir)?
-            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
-            .collect::<Result<Vec<_>, _>>()?;
-        all_checkpoints.retain(|c| c.starts_with("checkpoint"));
-        all_checkpoints.sort_unstable();
-        if all_checkpoints.len() > config.training.max_kept_checkpoints {
-            fs_err::remove_dir_all(config.training.checkpoints_dir.join(&all_checkpoints[0]))?;
-        }
+            tracing::info!("saved checkpoint to {}", dir.display());
+
+            let mut all_checkpoints = fs_err::read_dir(&checkpoints_dir)?
+                .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            all_checkpoints.retain(|c| c.starts_with("checkpoint"));
+            all_checkpoints.sort_unstable();
+            if all_checkpoints.len() > max_kept_checkpoints {
+                fs_err::remove_dir_all(checkpoints_dir.join(&all_checkpoints[0]))?;
+            }
+
+            Ok(())
+        });
 
         Ok(())
     };
 
     let (shutdown_tx, shutdown) = flume::bounded(1);
     ctrlc::set_handler(move || {
-        shutdown_tx.send(()).ok();
+        shutdown_tx.try_send(()).ok();
     })?;
 
     for (i, batch) in stream_batches(tokenizer, config)?
@@ -232,6 +249,11 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                 }
             };
 
+            // Gradients are summed (not averaged) across microbatches, so need to correct
+            // gradient clipping accordingly. 
+            let accumulated_microbatches =
+                i + 1 - train_step as usize * config.training.gradient_accumulation_steps as usize;
+
             train_step += 1;
             executor.weight_update(
                 &mut weights,
@@ -239,7 +261,8 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                     adam_beta1: config.training.adam_beta1,
                     adam_beta2: config.training.adam_beta2,
                     weight_decay: config.training.weight_decay,
-                    max_gradient_norm: config.training.max_gradient_norm,
+                    max_gradient_norm: config.training.max_gradient_norm
+                        * accumulated_microbatches as f32,
                     lr,
                 },
                 train_step,
@@ -247,7 +270,9 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             )?;
             tracing::info!(lr, "weight update");
 
-            if train_step.is_multiple_of(config.training.steps_per_checkpoint as u32) {
+            if train_step.is_multiple_of(config.training.steps_per_checkpoint as u32)
+                || i == num_microbatches - 1
+            {
                 checkpoint(&weights, train_step, &loss_history)?;
             }
         }
@@ -258,7 +283,40 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         }
     }
 
+    checkpoint_writer.wait()?;
+
     Ok(())
+}
+
+/// Runs checkpoint save on a background thread.
+/// waits for completion on drop.
+#[derive(Default)]
+struct CheckpointWriter {
+    in_flight: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl CheckpointWriter {
+    fn wait(&mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self.in_flight.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow!("checkpoint thread panicked"))??;
+        }
+        Ok(())
+    }
+
+    fn spawn(&mut self, save: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
+        assert!(self.in_flight.is_none());
+        self.in_flight = Some(thread::spawn(save));
+    }
+}
+
+impl Drop for CheckpointWriter {
+    fn drop(&mut self) {
+        if let Err(e) = self.wait() {
+            tracing::error!("failed to save checkpoint: {e:?}");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

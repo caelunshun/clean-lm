@@ -14,7 +14,7 @@ use skycuda::{
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
+    data_type::{ElementType, FloatType, UIntType},
     shape::Shape,
 };
 
@@ -48,7 +48,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     )?;
     let mut labels = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
-        ElementType::SInt(SIntType::S32),
+        ElementType::UInt(UIntType::U32),
         &cx,
     )?;
 
@@ -58,8 +58,8 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         BATCH_SIZE * NUM_CLASSES,
         &mut rng,
     );
-    let labels_host: Vec<i32> = (0..BATCH_SIZE)
-        .map(|_| rng.random_range(0..NUM_CLASSES as i32))
+    let labels_host: Vec<u32> = (0..BATCH_SIZE)
+        .map(|_| rng.random_range(0..NUM_CLASSES as u32))
         .collect();
     let labels_mask: Vec<bool> = (0..BATCH_SIZE).map(|_| rng.random_bool(0.8)).collect();
 
@@ -143,7 +143,7 @@ struct Reference {
     grad: Vec<f32>,
 }
 
-fn reference_loss(logits: &[bf16], labels: &[i32], labels_mask: &[bool]) -> Reference {
+fn reference_loss(logits: &[bf16], labels: &[u32], labels_mask: &[bool]) -> Reference {
     let num_unmasked = labels_mask.iter().filter(|&&m| m).count();
     let mut grad = vec![0.0; BATCH_SIZE * NUM_CLASSES];
 

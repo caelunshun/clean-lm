@@ -55,6 +55,7 @@ impl RopeExecutor {
 
         let (block_size, kernel_name) = match self.config.head_dim {
             64 => (64, "rope_hd64_64x1x64"),
+            128 => (32, "rope_hd128_32x1x128"),
             hd => bail!("unimplemented head dimension {hd} for rope"),
         };
 

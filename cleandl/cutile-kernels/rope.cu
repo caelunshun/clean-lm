@@ -1,6 +1,7 @@
 #include "utils.cuh"
 
-extern "C" __tile_global__ void rope_hd64_64x1x64(
+template <int HEAD_DIM, int BLOCK_SIZE>
+__tile__ void rope_impl(
     __nv_bfloat16 *__restrict__ x,
     const int64_t *__restrict__ cu_seqlen,
     const __half *__restrict__ cos_table,
@@ -12,8 +13,6 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
     int max_seqlen,
     int row_stride)
 {
-    constexpr int BLOCK_SIZE = 64;
-    constexpr int HEAD_DIM = 64;
     constexpr int HALF_HEAD_DIM = HEAD_DIM / 2;
 
     max_seqlen = ct::assume_divisible(max_seqlen, ct::integral_constant<BLOCK_SIZE>{});
@@ -65,4 +64,36 @@ extern "C" __tile_global__ void rope_hd64_64x1x64(
         [[cutile::hint(0, allow_tma = false)]] x_view.store_masked(rot_first_half, 0, head_idx, 0);
         [[cutile::hint(0, allow_tma = false)]] x_view.store_masked(rot_second_half, 0, head_idx, 1);
     }
+}
+
+extern "C" __tile_global__ void rope_hd64_64x1x64(
+    __nv_bfloat16 *__restrict__ x,
+    const int64_t *__restrict__ cu_seqlen,
+    const __half *__restrict__ cos_table,
+    const __half *__restrict__ sin_table,
+    const uint64_t *__restrict__ cta_work_items,
+    int total_num_tokens,
+    // Combined across Q and K.
+    int num_heads,
+    int max_seqlen,
+    int row_stride)
+{
+    rope_impl<64, 64>(x, cu_seqlen, cos_table, sin_table, cta_work_items,
+                      total_num_tokens, num_heads, max_seqlen, row_stride);
+}
+
+extern "C" __tile_global__ void rope_hd128_32x1x128(
+    __nv_bfloat16 *__restrict__ x,
+    const int64_t *__restrict__ cu_seqlen,
+    const __half *__restrict__ cos_table,
+    const __half *__restrict__ sin_table,
+    const uint64_t *__restrict__ cta_work_items,
+    int total_num_tokens,
+    // Combined across Q and K.
+    int num_heads,
+    int max_seqlen,
+    int row_stride)
+{
+    rope_impl<128, 32>(x, cu_seqlen, cos_table, sin_table, cta_work_items,
+                       total_num_tokens, num_heads, max_seqlen, row_stride);
 }

@@ -676,14 +676,14 @@ impl DecoderExecutor {
         train_step: u32,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        for param in [
-            &mut weights.pre_qkv_norm_gamma,
-            &mut weights.qkv_proj,
-            &mut weights.o_proj,
-            &mut weights.pre_ffn_norm_gamma,
-            &mut weights.ffn_up,
-            &mut weights.ffn_gate,
-            &mut weights.ffn_down,
+        for (param, weight_decay) in [
+            (&mut weights.pre_qkv_norm_gamma, 0.0),
+            (&mut weights.qkv_proj, config.weight_decay),
+            (&mut weights.o_proj, config.weight_decay),
+            (&mut weights.pre_ffn_norm_gamma, 0.0),
+            (&mut weights.ffn_up, config.weight_decay),
+            (&mut weights.ffn_gate, config.weight_decay),
+            (&mut weights.ffn_down, config.weight_decay),
         ] {
             self.optimizer.adamw_weight_update(
                 &param.gradients.view(),
@@ -694,7 +694,7 @@ impl DecoderExecutor {
                 &mut param.adam_v.view_mut(),
                 config.adam_beta1,
                 config.adam_beta2,
-                config.weight_decay,
+                weight_decay,
                 config.max_gradient_norm,
                 config.lr,
                 train_step,

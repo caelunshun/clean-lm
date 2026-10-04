@@ -55,7 +55,7 @@ extern "C" __tile_global__ void online_softmax_stats_128(const __nv_bfloat16 *__
 // Loss must be pre-zeroed. `recip_batch_size` is the reciprocal of the number
 // of unmasked rows, so this kernel computes the mean across unmasked batch items.
 extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat16 *__restrict__ logits,
-                                                           const float *__restrict__ stats, const int *__restrict__ labels,
+                                                           const float *__restrict__ stats, const uint32_t *__restrict__ labels,
                                                            const bool *__restrict__ labels_mask,
                                                            float *__restrict__ out_loss, __nv_bfloat16 *__restrict__ out_logits_grad,
                                                            int batch_size, float recip_batch_size, int num_classes)
@@ -96,7 +96,7 @@ extern "C" __tile_global__ void cross_entropy_loss_fwd_bwd_128(const __nv_bfloat
         auto logits_tile = ct::element_cast<float>(logits_view.load_masked(ct::bid().x, tile_idx));
         auto log_probs = logits_tile - stats_tile;
 
-        auto class_idx = ct::iota<ct::tile<int, ct::shape<1, 128>>>() + 128 * tile_idx;
+        auto class_idx = ct::iota<ct::tile<uint32_t, ct::shape<1, 128>>>() + (uint32_t)(128 * tile_idx);
         auto class_matches = (class_idx == labels_tile) && labels_mask_tile;
 
         auto loss_contrib = ct::select(class_matches, -log_probs, ct::zeros<ct::tile<float, ct::shape<128, 128>>>());

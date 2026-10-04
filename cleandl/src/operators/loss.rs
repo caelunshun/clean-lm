@@ -5,7 +5,7 @@ use crate::{
 };
 use skycuda::{module::Module, stream::Stream};
 use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
+    data_type::{ElementType, FloatType, UIntType},
     shape::Shape,
 };
 use std::sync::Arc;
@@ -82,7 +82,7 @@ impl LossExecutor {
     ) -> anyhow::Result<CrossEntropyLossOutput> {
         assert_eq!(logits.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(stats.element_type(), ElementType::Float(FloatType::F32));
-        assert_eq!(labels.element_type(), ElementType::SInt(SIntType::S32));
+        assert_eq!(labels.element_type(), ElementType::UInt(UIntType::U32));
 
         assert!(logits.is_packed_row_major());
         assert!(stats.is_packed_row_major());

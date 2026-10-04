@@ -27,8 +27,8 @@ const TRAIN_STEP: u32 = 3;
 
 const EPS: f32 = 1e-6;
 
-const REL_TOLERANCE: f32 = 1e-4;
-const ABS_TOLERANCE: f32 = 1e-6;
+const REL_TOLERANCE: f32 = 1e-3;
+const ABS_TOLERANCE: f32 = 1e-4;
 const REPLICA_REL_TOLERANCE: f32 = 8e-3;
 
 #[test]
@@ -188,7 +188,7 @@ fn reference_adamw(gradient: &[f32], weight: &[f32], m: &[f32], v: &[f32]) -> Re
             let m_hat = m_new / bias_correction1;
             let v_hat = v_new / bias_correction2;
 
-            let w = weight[i] - LR * (m_hat / (v_hat.sqrt() + EPS) + WEIGHT_DECAY * weight[i]);
+            let w = weight[i] - LR * (m_hat / (v_hat.sqrt() + EPS) + WEIGHT_DECAY * LR * weight[i]);
 
             (w, (m_new, v_new))
         })

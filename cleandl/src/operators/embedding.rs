@@ -5,7 +5,7 @@ use crate::{
 };
 use skycuda::{module::Module, stream::Stream};
 use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
+    data_type::{ElementType, FloatType, UIntType},
     shape::Shape,
 };
 use std::sync::Arc;
@@ -34,7 +34,7 @@ impl EmbeddingExecutor {
         );
         assert_eq!(
             token_indices.element_type(),
-            ElementType::SInt(SIntType::S32)
+            ElementType::UInt(UIntType::U32)
         );
 
         assert!(embedding_table.is_packed_row_major());
@@ -92,7 +92,7 @@ impl EmbeddingExecutor {
     ) -> anyhow::Result<()> {
         assert_eq!(
             token_indices.element_type(),
-            ElementType::SInt(SIntType::S32)
+            ElementType::UInt(UIntType::U32)
         );
         assert_eq!(dl_dout.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(dl_din.element_type(), ElementType::Float(FloatType::F32));

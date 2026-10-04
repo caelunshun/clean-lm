@@ -370,10 +370,10 @@ impl Sky1Executor {
             })?;
         }
 
-        for param in [
-            &mut weights.embeddings,
-            &mut weights.final_norm_gamma,
-            &mut weights.lm_head,
+        for (param, weight_decay) in [
+            (&mut weights.embeddings, config.weight_decay),
+            (&mut weights.final_norm_gamma, 0.0),
+            (&mut weights.lm_head, config.weight_decay),
         ] {
             self.optimizer.adamw_weight_update(
                 &param.gradients.view(),
@@ -384,7 +384,7 @@ impl Sky1Executor {
                 &mut param.adam_v.view_mut(),
                 config.adam_beta1,
                 config.adam_beta2,
-                config.weight_decay,
+                weight_decay,
                 config.max_gradient_norm,
                 config.lr,
                 train_step,

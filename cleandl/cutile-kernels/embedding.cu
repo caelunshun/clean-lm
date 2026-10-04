@@ -1,7 +1,7 @@
 #include "utils.cuh"
 
 extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
-    const int *__restrict__ indices, const float *__restrict__ embeddings,
+    const uint32_t *__restrict__ indices, const float *__restrict__ embeddings,
     __nv_bfloat16 *__restrict__ out, int vocab_size, int num_tokens,
     int embed_dim)
 {
@@ -29,7 +29,7 @@ extern "C" __tile_global__ void embedding_lookup_f32in_bf16out_32x128(
 }
 
 extern "C" __tile_global__ void embedding_scatter_add_bf16in_f32out_32x128(
-    const int *__restrict__ indices, const __nv_bfloat16 *__restrict__ dL_dout,
+    const uint32_t *__restrict__ indices, const __nv_bfloat16 *__restrict__ dL_dout,
     float *__restrict__ dL_din, int vocab_size, int num_tokens, int embed_dim)
 {
     ASSUME_ALIGNED(indices);
