@@ -2,8 +2,8 @@ use crate::{
     skyred::{
         config::{Config, LrSchedule},
         dataset::{
-            document_file::DocumentReader,
-            tokenization::{SkyredTokenizer, SpecialToken},
+            tokenization::{SpecialToken, VOCAB_FILE_NAME},
+            tokenized_file::{SChunkReader, TOKEN_COUNTS_FILE_NAME, TOKENIZED_FILE_NAME},
         },
     },
     training::{
@@ -16,7 +16,6 @@ use anyhow::anyhow;
 use clap::Parser;
 use cleandl::{context::Context, operators::attention::RaggedSeqlenTensors, tensor::Tensor};
 use rand::{SeedableRng, rngs::StdRng};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use skycuda::{
     device_memory_pool::DeviceMemoryPoolOptions,
@@ -26,9 +25,9 @@ use skytokens::vocab::{TokenId, Vocab};
 use std::{
     f32::consts::PI,
     mem,
+    ops::{ControlFlow, Range},
     path::PathBuf,
     process::exit,
-    sync::Arc,
     thread::{self, JoinHandle},
 };
 
@@ -39,18 +38,28 @@ pub struct Cli {
 }
 
 pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
-    let vocab: Vocab<SpecialToken> =
-        serde_json::from_slice(&fs_err::read(config.dataset.work_dir.join("vocab.json"))?)?;
-    let tokenizer = Arc::new(SkyredTokenizer::new(
-        vocab.clone(),
-        config.dataset.use_pretokenization,
-    )?);
+    let vocab: Vocab<SpecialToken> = serde_json::from_slice(&fs_err::read(
+        config.dataset.work_dir.join(VOCAB_FILE_NAME),
+    )?)?;
+
+    let token_counts =
+        SChunkReader::<u32>::open(&config.dataset.work_dir.join(TOKEN_COUNTS_FILE_NAME))?
+            .read_all()?;
 
     let mut num_microbatches = 0usize;
     let mut max_num_sequences = 0;
-    for batch in stream_batches(tokenizer.clone(), config)? {
-        num_microbatches += 1;
-        max_num_sequences = max_num_sequences.max(batch.seqlens.len());
+    let mut num_sequences = 0;
+    let mut packer = Packer::new(config);
+    for &count in &token_counts {
+        let _ = packer.pack_document(count as usize, |_, completes_batch| {
+            num_sequences += 1;
+            if completes_batch {
+                num_microbatches += 1;
+                max_num_sequences = max_num_sequences.max(num_sequences);
+                num_sequences = 0;
+            }
+            ControlFlow::Continue(())
+        });
     }
 
     let num_steps = num_microbatches.div_ceil(config.training.gradient_accumulation_steps as usize);
@@ -132,7 +141,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                           train_step: u32,
                           loss_history: &[LossRecord]|
      -> anyhow::Result<()> {
-        // Ensure at most one checkpoint in flight at a time. 
+        // Ensure at most one checkpoint in flight at a time.
         checkpoint_writer.wait()?;
 
         let mut builder = CheckpointBuilder::default();
@@ -175,7 +184,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         shutdown_tx.try_send(()).ok();
     })?;
 
-    for (i, batch) in stream_batches(tokenizer, config)?
+    for (i, batch) in stream_batches(token_counts, config)
         .into_iter()
         .enumerate()
         .skip(train_step as usize * config.training.gradient_accumulation_steps as usize)
@@ -250,7 +259,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             };
 
             // Gradients are summed (not averaged) across microbatches, so need to correct
-            // gradient clipping accordingly. 
+            // gradient clipping accordingly.
             let accumulated_microbatches =
                 i + 1 - train_step as usize * config.training.gradient_accumulation_steps as usize;
 
@@ -327,71 +336,85 @@ struct Batch {
     seqlens: Vec<u32>,
 }
 
+/// Packs documents into microbatches of exactly the microbatch size in token count.
+/// Documents can be sharded across microbatches.
+struct Packer {
+    microbatch_size: usize,
+    max_seqlen: usize,
+    batch_fill: usize,
+}
+
+impl Packer {
+    fn new(config: &Config) -> Self {
+        Self {
+            microbatch_size: config.training.microbatch_size as usize,
+            max_seqlen: config.model.max_seqlen,
+            batch_fill: 0,
+        }
+    }
+
+    /// Calls `f` with the token range of each sequence cut from the document.
+    fn pack_document(
+        &mut self,
+        doc_len: usize,
+        mut f: impl FnMut(Range<usize>, bool) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut consumed = 0;
+        while consumed < doc_len {
+            let tokens_to_take = (self.microbatch_size - self.batch_fill)
+                .min(doc_len - consumed)
+                .min(self.max_seqlen);
+            self.batch_fill += tokens_to_take;
+            let completes_batch = self.batch_fill == self.microbatch_size;
+            if completes_batch {
+                self.batch_fill = 0;
+            }
+            f(consumed..consumed + tokens_to_take, completes_batch)?;
+            consumed += tokens_to_take;
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Streams batches of exactly the microbatch size in token count.
 /// Drops any tail that does not fill a full batch.
-fn stream_batches(
-    tokenizer: Arc<SkyredTokenizer>,
-    config: &Config,
-) -> anyhow::Result<flume::Receiver<Batch>> {
-    let mut dataset = DocumentReader::open(&config.dataset.work_dir.join("posts.zst"))?;
-
+fn stream_batches(token_counts: Vec<u32>, config: &Config) -> flume::Receiver<Batch> {
     let (batches_tx, batches_rx) = flume::bounded(4);
-
-    const DOCUMENT_GROUP_SIZE: usize = 16384;
 
     let config = config.clone();
 
     thread::spawn(move || {
-        let res = try {
+        let res: anyhow::Result<()> = try {
+            let mut tokens =
+                SChunkReader::<TokenId>::open(&config.dataset.work_dir.join(TOKENIZED_FILE_NAME))?;
+            let mut packer = Packer::new(&config);
             let mut current_batch = Batch::default();
 
-            'outer: loop {
-                let documents = (0..DOCUMENT_GROUP_SIZE)
-                    .filter_map(|_| dataset.next())
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+            for &count in &token_counts {
+                let doc = tokens
+                    .read(count as usize)?
+                    .ok_or_else(|| anyhow!("tokenized file has fewer tokens than counted"))?;
 
-                let tokenized_documents = documents
-                    .into_par_iter()
-                    .map(|doc| tokenizer.tokenize_document(&doc))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let flow = packer.pack_document(doc.len(), |range, completes_batch| {
+                    current_batch.tokens.extend_from_slice(&doc[range.clone()]);
+                    current_batch.seqlens.push(range.len() as u32);
 
-                if tokenized_documents.is_empty() {
-                    break;
-                }
-
-                for doc in tokenized_documents {
-                    let mut consumed = 0;
-                    while consumed < doc.len() {
-                        let needed_batch_tokens =
-                            config.training.microbatch_size as usize - current_batch.tokens.len();
-                        let tokens_to_take = needed_batch_tokens
-                            .min(doc.len() - consumed)
-                            .min(config.model.max_seqlen);
-
-                        current_batch
-                            .tokens
-                            .extend_from_slice(&doc[consumed..][..tokens_to_take]);
-                        current_batch.seqlens.push(tokens_to_take as u32);
-
-                        let (labels, labels_mask): (Vec<_>, Vec<_>) = (consumed + 1
-                            ..consumed + 1 + tokens_to_take)
-                            .map(|i| match doc.get(i) {
-                                Some(&tok) => (tok, true),
-                                None => (TokenId::PLACEHOLDER, false),
-                            })
-                            .collect();
-                        current_batch.labels.extend_from_slice(&labels);
-                        current_batch.labels_mask.extend_from_slice(&labels_mask);
-
-                        if current_batch.tokens.len() == config.training.microbatch_size as usize {
-                            let res = batches_tx.send(mem::take(&mut current_batch));
-                            if res.is_err() {
-                                break 'outer;
-                            }
-                        }
-
-                        consumed += tokens_to_take;
+                    for i in range.start + 1..range.end + 1 {
+                        let (label, mask) = match doc.get(i) {
+                            Some(&tok) => (tok, true),
+                            None => (TokenId::PLACEHOLDER, false),
+                        };
+                        current_batch.labels.push(label);
+                        current_batch.labels_mask.push(mask);
                     }
+
+                    if completes_batch && batches_tx.send(mem::take(&mut current_batch)).is_err() {
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                });
+                if flow.is_break() {
+                    break;
                 }
             }
         };
@@ -401,5 +424,5 @@ fn stream_batches(
         }
     });
 
-    Ok(batches_rx)
+    batches_rx
 }

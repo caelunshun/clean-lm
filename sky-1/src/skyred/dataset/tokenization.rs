@@ -1,10 +1,16 @@
 use crate::skyred::{
     config::DatasetConfig,
-    dataset::{document_file::DocumentReader, sampling::SAMPLE_FILE_NAME, schema::Document},
+    dataset::{
+        document_file::DocumentReader,
+        sampling::SAMPLE_FILE_NAME,
+        schema::Document,
+        tokenized_file::{SChunkWriter, TOKEN_COUNTS_FILE_NAME, TOKENIZED_FILE_NAME},
+    },
 };
 use anyhow::Context;
 use jiff::civil::Date;
 use memchr::memchr2;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use skytokens::{
     text_tokenizer::TextTokenizer,
@@ -13,6 +19,8 @@ use skytokens::{
 };
 use std::io::BufWriter;
 use strum::{EnumIter, IntoEnumIterator};
+
+pub const VOCAB_FILE_NAME: &str = "vocab.json";
 
 pub struct SkyredTokenizer {
     vocab: Vocab<SpecialToken>,
@@ -172,9 +180,63 @@ pub fn train_tokenizer(config: &DatasetConfig) -> anyhow::Result<()> {
     }
 
     serde_json::to_writer_pretty(
-        BufWriter::new(fs_err::File::create(config.work_dir.join("vocab.json"))?),
+        BufWriter::new(fs_err::File::create(config.work_dir.join(VOCAB_FILE_NAME))?),
         &vocab,
     )?;
+
+    Ok(())
+}
+
+pub fn tokenize(config: &DatasetConfig) -> anyhow::Result<()> {
+    const DOCUMENT_GROUP_SIZE: usize = 16384;
+    const TOKEN_CHUNK_ITEMS: usize = 4 << 20;
+    const COUNT_CHUNK_ITEMS: usize = 1 << 20;
+
+    let vocab: Vocab<SpecialToken> =
+        serde_json::from_slice(&fs_err::read(config.work_dir.join(VOCAB_FILE_NAME))?)?;
+    let tokenizer = SkyredTokenizer::new(vocab, config.use_pretokenization)?;
+
+    let mut documents = DocumentReader::open(&config.work_dir.join(SAMPLE_FILE_NAME))?;
+    let num_documents = documents.num_documents();
+    tracing::info!(num_documents, "tokenizing documents");
+
+    let mut tokens_writer = SChunkWriter::<TokenId>::create(
+        &config.work_dir.join(TOKENIZED_FILE_NAME),
+        TOKEN_CHUNK_ITEMS,
+    )?;
+    let mut counts_writer = SChunkWriter::<u32>::create(
+        &config.work_dir.join(TOKEN_COUNTS_FILE_NAME),
+        COUNT_CHUNK_ITEMS,
+    )?;
+
+    let mut num_processed = 0u64;
+    let mut num_tokens = 0u64;
+    loop {
+        let group = (&mut documents)
+            .take(DOCUMENT_GROUP_SIZE)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if group.is_empty() {
+            break;
+        }
+
+        let tokenized = group
+            .par_iter()
+            .map(|doc| tokenizer.tokenize_document(doc))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        for doc in &tokenized {
+            counts_writer.extend(&[u32::try_from(doc.len())?])?;
+            tokens_writer.extend(doc)?;
+            num_tokens += doc.len() as u64;
+        }
+
+        num_processed += group.len() as u64;
+        tracing::info!(num_processed, num_documents, num_tokens, "tokenized group");
+    }
+
+    tokens_writer.finish()?;
+    counts_writer.finish()?;
+    tracing::info!(num_documents, num_tokens, "wrote tokenized documents");
 
     Ok(())
 }

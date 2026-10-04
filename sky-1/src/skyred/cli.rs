@@ -14,6 +14,7 @@ pub struct Cli {
 pub enum Command {
     BuildSample,
     TrainTokenizer,
+    Tokenize,
     Train(training::Cli),
 }
 
@@ -23,6 +24,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::BuildSample => dataset::sampling::build_sample(&config.dataset)?,
         Command::TrainTokenizer => dataset::tokenization::train_tokenizer(&config.dataset)?,
+        Command::Tokenize => dataset::tokenization::tokenize(&config.dataset)?,
         Command::Train(cli) => training::run(&cli, &config)?,
     }
 
