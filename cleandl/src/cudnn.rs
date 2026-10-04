@@ -1,5 +1,9 @@
-use std::{collections::HashMap, fmt};
-
+use crate::{
+    context::Context,
+    disk_cache::DiskCacheKey,
+    par_random,
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
+};
 use bumpalo::Bump;
 use rand::SeedableRng;
 use rand_distr::Uniform;
@@ -19,13 +23,7 @@ use skytens_core::{
     data_type::{ElementType, FloatType, SIntType, UIntType},
     shape::{Shape, Strides},
 };
-
-use crate::{
-    context::Context,
-    disk_cache::DiskCacheKey,
-    par_random,
-    tensor::{TensorView, TensorViewMut, VirtTensorView},
-};
+use std::{collections::HashMap, fmt};
 
 pub fn to_cudnn_data_type(element_type: ElementType) -> DataType {
     match element_type {

@@ -1,5 +1,9 @@
-use std::sync::Arc;
-
+use crate::{
+    context::{Context, ResourceKey},
+    disk_cache::DiskCacheKey,
+    par_random,
+    tensor::{Tensor, TensorView},
+};
 use rand::SeedableRng;
 use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
@@ -9,13 +13,7 @@ use skycuda_cublaslt::{
     Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout, Order,
 };
 use skytens_core::data_type::{ElementType, FloatType};
-
-use crate::{
-    context::{Context, ResourceKey},
-    disk_cache::DiskCacheKey,
-    par_random,
-    tensor::{Tensor, TensorView},
-};
+use std::sync::Arc;
 
 /// Matmul executor with optional residual add.
 #[derive(Debug)]

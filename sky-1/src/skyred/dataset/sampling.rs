@@ -1,9 +1,12 @@
 #![allow(deprecated)]
 
-use std::{
-    cmp::Reverse, collections::BinaryHeap, future::Future, io::Cursor, ops::Range, sync::Arc,
+use crate::skyred::{
+    config::DatasetConfig,
+    dataset::{
+        document_file,
+        schema::{Comment, Document},
+    },
 };
-
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Context, ensure};
 use arrow_array::{
@@ -29,15 +32,10 @@ use reddit_ingest::{
     stats::day_to_date,
 };
 use skytens_core::FastHashMap;
-use tokio::task::JoinSet;
-
-use crate::skyred::{
-    config::DatasetConfig,
-    dataset::{
-        document_file,
-        schema::{Comment, Document},
-    },
+use std::{
+    cmp::Reverse, collections::BinaryHeap, future::Future, io::Cursor, ops::Range, sync::Arc,
 };
+use tokio::task::JoinSet;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 /// Used to impute author name when null.
@@ -721,9 +719,8 @@ impl Filter {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int64Array, LargeStringArray, StringArray};
-
     use super::*;
+    use arrow_array::{Int64Array, LargeStringArray, StringArray};
 
     /// (created_utc, subreddit, title, selftext, author_name)
     type PostRow = (

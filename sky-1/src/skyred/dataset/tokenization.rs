@@ -1,5 +1,7 @@
-use std::io::BufWriter;
-
+use crate::skyred::{
+    config::DatasetConfig,
+    dataset::{document_file::DocumentReader, sampling::SAMPLE_FILE_NAME, schema::Document},
+};
 use anyhow::Context;
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
@@ -8,12 +10,8 @@ use skytokens::{
     training::CorpusBuilder,
     vocab::{SpecialTokenData, Token, TokenId, Vocab},
 };
+use std::io::BufWriter;
 use strum::{EnumIter, IntoEnumIterator};
-
-use crate::skyred::{
-    config::DatasetConfig,
-    dataset::{document_file::DocumentReader, sampling::SAMPLE_FILE_NAME, schema::Document},
-};
 
 pub struct SkyredTokenizer {
     vocab: Vocab<SpecialToken>,

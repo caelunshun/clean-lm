@@ -1,17 +1,15 @@
-use std::sync::Arc;
-
+use crate::{
+    context::{Context, ResourceKey},
+    cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
+    tensor::{Tensor, TensorView, VirtTensorView},
+};
 use skycuda::stream::Stream;
 use skycuda_cudnn::{SdpaAttributes, SdpaBackwardAttributes, TensorId};
 use skytens_core::{
     data_type::{ElementType, FloatType, SIntType},
     shape::{Shape, Strides},
 };
-
-use crate::{
-    context::{Context, ResourceKey},
-    cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
-    tensor::{Tensor, TensorView, VirtTensorView},
-};
+use std::sync::Arc;
 
 /// Sequence length and ragged offset tensors needed for attention
 /// on a packed, ragged QKV tensor.

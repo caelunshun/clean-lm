@@ -7,21 +7,19 @@
 //! - per document: `compressed_len: u32`, `encoded_len: u32`, then a zstd frame
 //!   holding the postcard encoding of the document
 
+use crate::skyred::dataset::schema::Document;
+use anyhow::{Context, anyhow, ensure};
+use rayon::prelude::*;
 use std::{
     io::{BufReader, BufWriter, Read, Write},
     path::Path,
     sync::mpsc::{Receiver, SyncSender, sync_channel},
     thread::JoinHandle,
 };
-
-use anyhow::{Context, anyhow, ensure};
-use rayon::prelude::*;
 use zstd::{
     bulk::{Compressor, Decompressor},
     dict::{DecoderDictionary, EncoderDictionary},
 };
-
-use crate::skyred::dataset::schema::Document;
 
 const ZSTD_LEVEL: i32 = 4;
 const DICT_MAX_SIZE: usize = 256 * 1024;
@@ -233,11 +231,10 @@ fn read_u64(reader: &mut impl Read) -> anyhow::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use jiff::civil::date;
-    use rand::{RngExt, SeedableRng, rngs::StdRng, seq::IndexedRandom};
-
     use super::*;
     use crate::skyred::dataset::schema::Comment;
+    use jiff::civil::date;
+    use rand::{RngExt, SeedableRng, rngs::StdRng, seq::IndexedRandom};
 
     const WORDS: &[&str] = &[
         "the", "reddit", "post", "comment", "thread", "upvote", "deleted", "edit:", "lol", "this",

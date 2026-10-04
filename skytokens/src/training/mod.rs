@@ -2,9 +2,8 @@
 //!
 //! Does not use pre-tokenization, since those techniques have language/script assumptions.
 
-use anyhow::ensure;
-
 use crate::vocab::{Merge, SpecialTokenData, TextToken, Token, TokenId, Vocab};
+use anyhow::ensure;
 use compact_bytes::CompactBytes;
 
 mod corpus;

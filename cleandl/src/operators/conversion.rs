@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
-use skycuda::{module::Module, stream::Stream};
-use skytens_core::data_type::{ElementType, FloatType};
-
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
     tensor::{Tensor, TensorView},
 };
+use skycuda::{module::Module, stream::Stream};
+use skytens_core::data_type::{ElementType, FloatType};
+use std::sync::Arc;
 
 pub struct ConversionExecutor {
     cx: Context,

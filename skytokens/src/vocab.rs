@@ -1,5 +1,3 @@
-use std::{fmt::Display, hash::Hash};
-
 use anyhow::{bail, ensure};
 use bytemuck::{Pod, Zeroable};
 use compact_bytes::CompactBytes;
@@ -7,6 +5,7 @@ use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned},
 };
+use std::{fmt::Display, hash::Hash};
 
 #[derive(Debug, Clone)]
 pub struct Vocab<SP> {

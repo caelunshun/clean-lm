@@ -1,3 +1,6 @@
+use crate::{
+    WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id, red_add_global_f32,
+};
 #[cfg(has_tma)]
 use cuda_device::{
     Barrier,
@@ -19,10 +22,6 @@ use cuda_device::{
 };
 use cuda_device_ext::{bf16, bf16x2};
 use cuda_macros::{cuda_annotate, kernel, launch_bounds};
-
-use crate::{
-    WARP_SIZE, collective_async_copy_g2s_128bit, elements_per_u128, lane_id, red_add_global_f32,
-};
 
 /// Template for fast RMSNorm where the vector size
 /// is small enough to fit within a single warp's registers, enabling

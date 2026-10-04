@@ -1,16 +1,14 @@
-use std::sync::Arc;
-
-use skycuda::{module::Module, stream::Stream};
-use skytens_core::{
-    data_type::{ElementType, FloatType, SIntType},
-    shape::Shape,
-};
-
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
     tensor::{Tensor, TensorView, TensorViewMut},
 };
+use skycuda::{module::Module, stream::Stream};
+use skytens_core::{
+    data_type::{ElementType, FloatType, SIntType},
+    shape::Shape,
+};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct EmbeddingExecutor {

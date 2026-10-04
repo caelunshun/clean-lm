@@ -1,16 +1,14 @@
-use std::sync::Arc;
-
-use skycuda::{module::Module, stream::Stream};
-use skytens_core::{
-    data_type::{ElementType, FloatType},
-    shape::Shape,
-};
-
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
     tensor::{TensorView, TensorViewMut},
 };
+use skycuda::{module::Module, stream::Stream};
+use skytens_core::{
+    data_type::{ElementType, FloatType},
+    shape::Shape,
+};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct AdamWExecutor {

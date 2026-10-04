@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
-use serde::Serialize;
-use skycuda::{function::Function, stream::Stream};
-use skytens_core::data_type::{ElementType, FloatType};
-
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
     tensor::{TensorView, TensorViewMut},
 };
+use serde::Serialize;
+use skycuda::{function::Function, stream::Stream};
+use skytens_core::data_type::{ElementType, FloatType};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct GradientAccumulationExecutor {

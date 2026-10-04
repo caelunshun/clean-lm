@@ -29,8 +29,8 @@
 //! * Warp 3: Epilogue TMA stores
 //! * Warps 4..12: Epilogue compute warps
 
+use crate::lane_id;
 use core::{f32::consts::LOG2_E, mem};
-
 use cuda_device::{
     Barrier, DynamicSharedArray, TmaDescriptor,
     barrier::{
@@ -57,8 +57,6 @@ use cuda_device::{
 };
 use cuda_device_ext::{bf16, bf16x2};
 use cuda_macros::{cluster_launch, cuda_annotate, device, kernel, launch_bounds};
-
-use crate::lane_id;
 
 const TM_CTA: u32 = 128;
 const TM_CGA: u32 = 256;

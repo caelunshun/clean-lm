@@ -1,9 +1,3 @@
-use std::sync::Arc;
-
-use serde::Serialize;
-use skycuda::stream::Stream;
-use skytens_core::data_type::{ElementType, FloatType};
-
 use crate::{
     context::{Context, ResourceKey},
     operators::{
@@ -16,6 +10,10 @@ use crate::{
     },
     tensor::{Tensor, TensorView},
 };
+use serde::Serialize;
+use skycuda::stream::Stream;
+use skytens_core::data_type::{ElementType, FloatType};
+use std::sync::Arc;
 
 /// SwiGLU FFN forward and backward pass executor.
 /// Forward: regular matmul for up-projection and down-projection; fused epilogue swish+hadamard for

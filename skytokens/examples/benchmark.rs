@@ -1,16 +1,14 @@
 // --- LLM-generated --- //
 
+use anyhow::bail;
+use skytokens::{
+    training::{self, Compression, CorpusBuilder},
+    vocab::Vocab,
+};
 use std::{
     env,
     hash::{DefaultHasher, Hash, Hasher},
     time::Instant,
-};
-
-use anyhow::bail;
-
-use skytokens::{
-    training::{self, Compression, CorpusBuilder},
-    vocab::Vocab,
 };
 
 const TARGET_BYTES: usize = 2 << 30;

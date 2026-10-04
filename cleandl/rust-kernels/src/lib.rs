@@ -15,13 +15,12 @@
     clippy::chunks_exact_to_as_chunks
 )]
 
-use core::hint::{self, assert_unchecked};
-
 use bytemuck::Pod;
-use cuda_device::ptx_asm;
+use core::hint::{self, assert_unchecked};
 use cuda_device::{
     async_copy,
     cooperative_groups::ThreadGroup,
+    ptx_asm,
     uniform::{block_dim_x, block_dim_y, block_dim_z},
 };
 use cuda_macros::cuda_annotate;

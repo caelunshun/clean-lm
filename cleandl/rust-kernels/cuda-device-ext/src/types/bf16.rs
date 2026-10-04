@@ -2,10 +2,8 @@
 
 //! Scalar `bf16`.
 
-use bytemuck::Pod;
-use bytemuck::Zeroable;
-use cuda_device::bf16 as raw;
-use cuda_device::convert;
+use bytemuck::{Pod, Zeroable};
+use cuda_device::{bf16 as raw, convert};
 
 /// One bfloat16 value, carried as the `u16` bit pattern
 /// [`cuda_device::bf16`] expects.

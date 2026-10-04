@@ -2,8 +2,10 @@
 //! cannot be spread across chunks, and each chunk is optionally blosc-compressed.
 //! Documents within a chunk are separated by DOC_TERMINATOR_TOKEN.
 
-use std::{cell::RefCell, iter, mem, sync::Arc, thread::available_parallelism};
-
+use crate::{
+    training::{DOC_TERMINATOR, token_id_for_byte},
+    vocab::{Merge, TokenId},
+};
 use anyhow::ensure;
 use blosc2::{
     CParams, CompressAlgo, DParams, SplitMode,
@@ -14,12 +16,8 @@ use priority_queue::PriorityQueue;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use simple_semaphore::Semaphore;
+use std::{cell::RefCell, iter, mem, sync::Arc, thread::available_parallelism};
 use thread_local::ThreadLocal;
-
-use crate::{
-    training::{DOC_TERMINATOR, token_id_for_byte},
-    vocab::{Merge, TokenId},
-};
 
 const TOKENS_PER_CHUNK: usize = 64 * 1024;
 

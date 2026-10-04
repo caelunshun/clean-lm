@@ -1,8 +1,6 @@
-use std::time::Duration;
-
-use skycuda::stream::Stream;
-
 use crate::context::Context;
+use skycuda::stream::Stream;
+use std::time::Duration;
 
 /// Utility to reliably benchmark a kernel, provided
 /// our access to the GPU is exclusive.

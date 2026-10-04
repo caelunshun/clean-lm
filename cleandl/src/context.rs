@@ -1,10 +1,4 @@
-use std::{
-    any::{Any, TypeId},
-    cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
-    sync::{Arc, Mutex},
-};
-
+use crate::disk_cache::DiskCache;
 use bytemuck::Pod;
 use parking_lot::ReentrantMutex;
 use serde::Serialize;
@@ -18,9 +12,13 @@ use skycuda::{
 };
 use skycuda_cublaslt::CublasLtHandle;
 use skycuda_cudnn::CudnnHandle;
+use std::{
+    any::{Any, TypeId},
+    cell::RefCell,
+    collections::{HashMap, hash_map::Entry},
+    sync::{Arc, Mutex},
+};
 use thread_local::ThreadLocal;
-
-use crate::disk_cache::DiskCache;
 
 #[derive(Debug, Clone)]
 pub struct Context(Arc<Inner>);

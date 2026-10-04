@@ -1,5 +1,9 @@
-use std::sync::Arc;
-
+use crate::{
+    model::{BlocksConfig, Sky1Config},
+    training::{
+        model::MetaTensors, parameter::Parameter, weight_update_params::WeightUpdateParams,
+    },
+};
 use cleandl::{
     context::{Context, ResourceKey},
     operators::{
@@ -16,13 +20,7 @@ use cleandl::{
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
-
-use crate::{
-    model::{BlocksConfig, Sky1Config},
-    training::{
-        model::MetaTensors, parameter::Parameter, weight_update_params::WeightUpdateParams,
-    },
-};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct DecoderExecutor {

@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
-use clap::{Parser, Subcommand};
-
 use crate::skyred::{config::Config, dataset};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 pub struct Cli {

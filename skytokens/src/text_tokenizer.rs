@@ -1,10 +1,8 @@
-use std::cmp;
-
+use crate::vocab::{SpecialTokenData, TokenId, Vocab};
 use bit_vec::BitVec;
 use hashbrown::HashMap;
 use priority_queue::PriorityQueue;
-
-use crate::vocab::{SpecialTokenData, TokenId, Vocab};
+use std::cmp;
 
 /// Merge-style tokenizer implementation for a Vocab.
 #[derive(Debug, Clone)]

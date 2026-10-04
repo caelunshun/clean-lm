@@ -1,17 +1,15 @@
-use std::sync::Arc;
-
+use crate::{
+    context::{Context, ResourceKey},
+    kernel::RustKernels,
+    tensor::{Tensor, TensorView, TensorViewMut},
+};
 use anyhow::bail;
 use skycuda::{module::Module, stream::Stream};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
 };
-
-use crate::{
-    context::{Context, ResourceKey},
-    kernel::RustKernels,
-    tensor::{Tensor, TensorView, TensorViewMut},
-};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct NormExecutor {

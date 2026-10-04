@@ -1,5 +1,4 @@
-use std::ops::{Bound, RangeBounds};
-
+use crate::context::Context;
 use bytemuck::Pod;
 use half::bf16;
 use rand::Rng;
@@ -13,8 +12,7 @@ use skytens_core::{
     data_type::{ElementType, FloatType, SIntType, UIntType},
     shape::{Shape, Strides},
 };
-
-use crate::context::Context;
+use std::ops::{Bound, RangeBounds};
 
 /// Tensor stored on some device, owning its backing allocation.
 #[derive(Debug)]

@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
-use serde::Serialize;
-use skycuda::stream::Stream;
-use skytens_core::data_type::{ElementType, FloatType};
-
 use crate::{
     context::{Context, ResourceKey},
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
     tensor::{Tensor, TensorView},
 };
+use serde::Serialize;
+use skycuda::stream::Stream;
+use skytens_core::data_type::{ElementType, FloatType};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct LinearExecutor {

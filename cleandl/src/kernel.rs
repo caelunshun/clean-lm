@@ -1,8 +1,7 @@
+use crate::context::{Context, ResourceKey};
 use anyhow::bail;
 use serde::Serialize;
 use skycuda::module::Module;
-
-use crate::context::{Context, ResourceKey};
 
 #[macro_export]
 macro_rules! include_cubins {

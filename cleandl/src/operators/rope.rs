@@ -1,17 +1,15 @@
-use std::{array, sync::Arc};
-
-use anyhow::bail;
-use half::{f16, slice::HalfFloatSliceExt};
-use serde::Serialize;
-use skycuda::{module::Module, stream::Stream};
-use skytens_core::data_type::{ElementType, FloatType, SIntType};
-use wide::f32x16;
-
 use crate::{
     context::{Context, ResourceKey},
     include_cubins,
     tensor::{Tensor, TensorView, TensorViewMut},
 };
+use anyhow::bail;
+use half::{f16, slice::HalfFloatSliceExt};
+use serde::Serialize;
+use skycuda::{module::Module, stream::Stream};
+use skytens_core::data_type::{ElementType, FloatType, SIntType};
+use std::{array, sync::Arc};
+use wide::f32x16;
 
 #[derive(Debug)]
 #[allow(dead_code)]

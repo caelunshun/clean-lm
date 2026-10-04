@@ -1,5 +1,10 @@
-use std::sync::Arc;
-
+use crate::{
+    context::{Context, ResourceKey},
+    include_cubins,
+    kernel::RustKernels,
+    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
+    tensor::{Tensor, TensorView},
+};
 use serde::Serialize;
 use skycuda::{
     function::Function,
@@ -11,14 +16,7 @@ use skycuda::{
     },
 };
 use skytens_core::data_type::{ElementType, FloatType};
-
-use crate::{
-    context::{Context, ResourceKey},
-    include_cubins,
-    kernel::RustKernels,
-    operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat},
-    tensor::{Tensor, TensorView},
-};
+use std::sync::Arc;
 
 const BF16: ElementType = ElementType::Float(FloatType::Bf16);
 

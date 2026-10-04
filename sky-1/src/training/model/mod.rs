@@ -1,5 +1,7 @@
-use std::sync::Arc;
-
+use crate::{
+    model::Sky1Config,
+    training::{parameter::Parameter, weight_update_params::WeightUpdateParams},
+};
 use cleandl::{
     context::{Context, ResourceKey},
     operators::{
@@ -13,16 +15,12 @@ use cleandl::{
     },
     tensor::{Tensor, TensorView},
 };
+use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
 use skytens_core::data_type::{ElementType, FloatType};
-
-use crate::{
-    model::Sky1Config,
-    training::{parameter::Parameter, weight_update_params::WeightUpdateParams},
-};
-use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
+use std::sync::Arc;
 
 pub mod decoder;
 

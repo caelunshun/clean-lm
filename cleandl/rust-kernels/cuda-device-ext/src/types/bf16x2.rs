@@ -3,10 +3,8 @@
 //! Packed `bf16x2`.
 
 use crate::types::bf16::bf16;
-use bytemuck::Pod;
-use bytemuck::Zeroable;
-use cuda_device::bf16x2 as raw;
-use cuda_device::convert;
+use bytemuck::{Pod, Zeroable};
+use cuda_device::{bf16x2 as raw, convert};
 
 /// Two bfloat16 values packed into the `u32` [`cuda_device::bf16x2`] expects,
 /// low lane first.
