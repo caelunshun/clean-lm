@@ -465,11 +465,14 @@ impl ExecutableCudnnGraph {
             variant_pack.add(*id, memory)?;
         }
 
-        let mut workspace = self.cx.device_memory_pool().alloc_zeroed_on(
-            self.graph
-                .workspace_size_at_index_for(self.best_plan, &variant_pack)?,
-            stream,
-        )?;
+        // Soundness: cuDNN does not require an initialized workspace.
+        let mut workspace = unsafe {
+            self.cx.device_memory_pool().alloc_uninit_on(
+                self.graph
+                    .workspace_size_at_index_for(self.best_plan, &variant_pack)?,
+                stream,
+            )?
+        };
 
         unsafe {
             self.graph

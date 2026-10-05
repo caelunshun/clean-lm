@@ -45,6 +45,31 @@ impl Tensor {
         })
     }
 
+    /// # Safety
+    /// Tensor data must be written to before it is read, else the behavior
+    /// is undefined.
+    pub unsafe fn new_uninit(
+        shape: impl Into<Shape>,
+        element_type: impl Into<ElementType>,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let element_type = element_type.into();
+        let virt = VirtTensorView::new(shape, element_type);
+        let allocation_bytes = virt.required_bytes();
+
+        let storage = unsafe {
+            cx.device_memory_pool()
+                .alloc_uninit_on(allocation_bytes, cx.memset_stream())?
+        };
+
+        Ok(Self {
+            virt,
+            cx: cx.clone(),
+            storage,
+        })
+    }
+
     /// Returns a tensor sampled from the given distribution and RNG.
     ///
     /// Requires a shape and element type that has no per-row padding.
@@ -70,9 +95,11 @@ impl Tensor {
         let data = bytemuck::cast_slice_mut::<u8, T>(host_memory.view_mut()?);
         crate::par_random::par_fill_from_distr(distr, data, rng);
 
-        let mut device_memory = cx
-            .device_memory_pool()
-            .alloc_zeroed_on(allocation_bytes, stream)?;
+        // Soundness: we write to the uninitialized memory.
+        let mut device_memory = unsafe {
+            cx.device_memory_pool()
+                .alloc_uninit_on(allocation_bytes, stream)?
+        };
         stream.copy(&host_memory, &mut device_memory)?;
 
         Ok(Self {
@@ -119,9 +146,11 @@ impl Tensor {
             .alloc_zeroed(allocation_bytes)?;
         staging_memory.view_mut()?.copy_from_slice(bytes);
 
-        let mut device_memory = cx
-            .device_memory_pool()
-            .alloc_zeroed_on(allocation_bytes, stream)?;
+        // Soundness: we write to the uninitialized memory.
+        let mut device_memory = unsafe {
+            cx.device_memory_pool()
+                .alloc_uninit_on(allocation_bytes, stream)?
+        };
         stream.copy(&staging_memory, &mut device_memory)?;
 
         Ok(Self {

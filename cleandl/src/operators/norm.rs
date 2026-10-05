@@ -48,16 +48,22 @@ impl NormExecutor {
         assert_eq!(gamma.shape().dims_slice(), &[inner_dim]);
         assert_eq!(gamma.element_type(), ElementType::Float(FloatType::Bf16));
 
-        let mut out_y = Tensor::new_zeroed(
-            Shape::new([batch_size, inner_dim]),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
-        let mut out_r_inv = Tensor::new_zeroed(
-            Shape::new([batch_size]),
-            ElementType::Float(FloatType::F32),
-            &self.cx,
-        )?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_y = unsafe {
+            Tensor::new_uninit(
+                Shape::new([batch_size, inner_dim]),
+                ElementType::Float(FloatType::Bf16),
+                &self.cx,
+            )?
+        };
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_r_inv = unsafe {
+            Tensor::new_uninit(
+                Shape::new([batch_size]),
+                ElementType::Float(FloatType::F32),
+                &self.cx,
+            )?
+        };
 
         let KernelSpec {
             name: kernel_name,
@@ -134,11 +140,14 @@ impl NormExecutor {
         assert_eq!(out_dgamma.shape(), Shape::new([inner_dim]));
         assert!(out_dgamma.is_packed_row_major());
 
-        let mut out_dx = Tensor::new_zeroed(
-            Shape::new([batch_size, inner_dim]),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_dx = unsafe {
+            Tensor::new_uninit(
+                Shape::new([batch_size, inner_dim]),
+                ElementType::Float(FloatType::Bf16),
+                &self.cx,
+            )?
+        };
 
         let KernelSpec {
             name: kernel_name,

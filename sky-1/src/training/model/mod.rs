@@ -279,29 +279,34 @@ impl Sky1Executor {
         })
     }
 
+    /// Runs backward pass and accumulates gradients.
+    /// 
+    /// `sidecar_stream` is used to enable some inter-kernel parallelism,
+    /// e.g. running wgrad and dgrad alongside each other to hide wave quantization.
     pub fn train_backward(
         &self,
         token_indices: &TensorView,
         meta_tensors: &MetaTensors,
         weights: &mut Sky1Weights,
         saves: &Sky1SavedTensors,
-        stream: &Stream,
+        main_stream: &Stream,
+        sidecar_stream: &Stream,
     ) -> anyhow::Result<()> {
         let lm_head_dw = self.lm_head.backward_wgrad(
             &saves.final_norm_result.view(),
             &saves.logits_grad.view(),
-            stream,
+            sidecar_stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &lm_head_dw.view(),
             &mut weights.lm_head.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
 
         let lm_head_ddata = self.lm_head.backward_dgrad(
             &saves.logits_grad.view(),
             &weights.lm_head.bf16_weights().view(),
-            stream,
+            main_stream,
         )?;
 
         let final_norm_ddata = self.final_norm.rmsnorm_backward(
@@ -311,7 +316,7 @@ impl Sky1Executor {
             &weights.final_norm_gamma.bf16_weights_replica.view(),
             &saves.final_norm_r_inv.view(),
             &mut weights.final_norm_gamma.gradients.view_mut(),
-            stream,
+            main_stream,
         )?;
 
         let mut dy = final_norm_ddata;
@@ -327,7 +332,8 @@ impl Sky1Executor {
                 &mut weights.decoder_blocks[i],
                 &saves.decoder[i],
                 meta_tensors,
-                stream,
+                main_stream,
+                sidecar_stream
             )?;
         }
 
@@ -335,7 +341,7 @@ impl Sky1Executor {
             token_indices,
             &dy.view(),
             &mut weights.embeddings.gradients.view_mut(),
-            stream,
+            main_stream,
         )?;
 
         Ok(())

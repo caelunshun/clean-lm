@@ -7,6 +7,7 @@ use crate::{
         weight_update_params::WeightUpdateParams,
     },
 };
+use anyhow::Context as _;
 use cleandl::{
     context::{Context, ResourceKey},
     operators::{
@@ -23,7 +24,7 @@ use cleandl::{
 use rand::Rng;
 use serde::Serialize;
 use skycuda::stream::Stream;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug)]
 pub struct DecoderExecutor {
@@ -32,7 +33,12 @@ pub struct DecoderExecutor {
     qkv_proj: Arc<LinearExecutor>,
     rope: Arc<RopeExecutor>,
     // qk_norm: Arc<NormExecutor>,
-    attention: Arc<AttentionExecutor>,
+    /// Because backward attention allocates a workspace
+    /// for each sequence to have the maximum possible number
+    /// of tokens, we build multiple attention executors and
+    /// choose based on the actual number of sequences in a batch.
+    attention_executors: BTreeMap<usize, Arc<AttentionExecutor>>,
+
     o_proj: Arc<LinearExecutor>,
     pre_ffn_norm: Arc<NormExecutor>,
     ffn: Arc<SwiGluFfnExecutor>,
@@ -76,7 +82,18 @@ impl ResourceKey for DecoderExecutorKey {
         )?;
         // let qk_norm = NormExecutor::get(cx)?;
 
-        let attention = AttentionExecutor::get(self.config.decoder_attention_config(), cx)?;
+        let mut attention_executors = BTreeMap::new();
+        for lg in 0..=self.config.max_num_sequences.next_power_of_two().ilog2() {
+            let max_num_sequences = 2usize.pow(lg);
+            attention_executors.insert(
+                max_num_sequences,
+                AttentionExecutor::get(
+                    self.config.decoder_attention_config(max_num_sequences),
+                    cx,
+                )?,
+            );
+        }
+
         let o_proj = LinearExecutor::get(
             LinearConfig {
                 estimated_batch_size: self.config.max_batch_decoder_tokens,
@@ -106,7 +123,7 @@ impl ResourceKey for DecoderExecutorKey {
             qkv_proj,
             rope,
             // qk_norm,
-            attention,
+            attention_executors,
             o_proj,
             pre_ffn_norm,
             ffn,
@@ -302,6 +319,19 @@ impl DecoderSavedTensors {
 }
 
 impl DecoderExecutor {
+    fn select_attention_executor(
+        &self,
+        meta_tensors: &MetaTensors,
+    ) -> anyhow::Result<&AttentionExecutor> {
+        let num_sequences = meta_tensors.seqlen.len();
+        Ok(&self
+            .attention_executors
+            .range(num_sequences..)
+            .next()
+            .context("sequence count exceeds configured maximum")?
+            .1)
+    }
+
     pub fn train_forward(
         &self,
         weights: &DecoderWeights,
@@ -411,7 +441,7 @@ impl DecoderExecutor {
         let AttentionForwardOutput {
             out: attn_result,
             stats: attn_stats,
-        } = self.attention.forward_attn(
+        } = self.select_attention_executor(meta_tensors)?.forward_attn(
             &qkv_proj_result.reshaped([
                 batch_size,
                 self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
@@ -493,7 +523,8 @@ impl DecoderExecutor {
         weights: &mut DecoderWeights,
         saves: &DecoderSavedTensors,
         meta_tensors: &MetaTensors,
-        stream: &Stream,
+        main_stream: &Stream,
+        sidecar_stream: &Stream,
     ) -> anyhow::Result<Tensor> {
         let &[batch_size, _] = dy.shape().dims_slice() else {
             panic!()
@@ -505,12 +536,12 @@ impl DecoderExecutor {
         let ffn_down_dw = self.ffn.backward_down_proj_wgrad(
             &saves.ffn_gate_activation_result.view(),
             dy,
-            stream,
+            sidecar_stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &ffn_down_dw.view(),
             &mut weights.ffn_down.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
 
         let DownProjDgradOutput {
@@ -521,44 +552,44 @@ impl DecoderExecutor {
             dy,
             &saves.ffn_gate_result.view(),
             &saves.ffn_up_result.view(),
-            stream,
+            main_stream,
         )?;
 
         // --- FFN up ---
         let ffn_up_dw = self.ffn.backward_up_gate_proj_wgrad(
             &saves.pre_ffn_norm_result.view(),
             &ffn_up_dy.view(),
-            stream,
+            sidecar_stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &ffn_up_dw.view(),
             &mut weights.ffn_up.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
 
         let ffn_up_dx = self.ffn.backward_up_proj_dgrad(
             &ffn_up_dy.view(),
             &weights.ffn_up.bf16_weights().view(),
-            stream,
+            main_stream,
         )?;
 
         // --- FFN gate ---
         let ffn_gate_dw = self.ffn.backward_up_gate_proj_wgrad(
             &saves.pre_ffn_norm_result.view(),
             &ffn_gate_dy.view(),
-            stream,
+            sidecar_stream,
         )?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &ffn_gate_dw.view(),
             &mut weights.ffn_gate.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
 
         let ffn_dx = self.ffn.backward_gate_proj_dgrad(
             &ffn_gate_dy.view(),
             &weights.ffn_gate.bf16_weights().view(),
             &ffn_up_dx.view(),
-            stream,
+            main_stream,
         )?;
 
         // --- FFN pre-norm --- //
@@ -569,43 +600,45 @@ impl DecoderExecutor {
             &weights.pre_ffn_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_ffn_norm_r_inv.view(),
             &mut weights.pre_ffn_norm_gamma.gradients.view_mut(),
-            stream,
+            main_stream,
         )?;
 
         // --- O-proj --- //
         let attn_result = saves.attn_result.reshaped([batch_size, q_features]);
         let o_proj_dw =
             self.o_proj
-                .backward_wgrad(&attn_result, &pre_ffn_norm_dx.view(), stream)?;
+                .backward_wgrad(&attn_result, &pre_ffn_norm_dx.view(), sidecar_stream)?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &o_proj_dw.view(),
             &mut weights.o_proj.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
 
         let o_proj_dx = self.o_proj.backward_dgrad(
             &pre_ffn_norm_dx.view(),
             &weights.o_proj.bf16_weights().view(),
-            stream,
+            main_stream,
         )?;
 
         // --- Attention --- //
-        let AttentionBackwardOutput { mut dqkv } = self.attention.backward_attn(
-            &saves.qkv_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &meta_tensors.decoder_ragged_seqlen,
-            &saves.attn_result.view(),
-            &o_proj_dx.reshaped([
-                batch_size,
-                self.config.num_decoder_q_heads,
-                self.config.head_dim,
-            ]),
-            &saves.attn_stats.view(),
-            stream,
-        )?;
+        let AttentionBackwardOutput { mut dqkv } = self
+            .select_attention_executor(meta_tensors)?
+            .backward_attn(
+                &saves.qkv_proj_result.reshaped([
+                    batch_size,
+                    self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
+                    self.config.head_dim,
+                ]),
+                &meta_tensors.decoder_ragged_seqlen,
+                &saves.attn_result.view(),
+                &o_proj_dx.reshaped([
+                    batch_size,
+                    self.config.num_decoder_q_heads,
+                    self.config.head_dim,
+                ]),
+                &saves.attn_stats.view(),
+                main_stream,
+            )?;
 
         let mut dqk = dqkv.sliced_mut(
             1,
@@ -616,23 +649,27 @@ impl DecoderExecutor {
             &meta_tensors.decoder_ragged_seqlen.cu_seqlen(),
             &meta_tensors.seqlen,
             RopeMode::Backward,
-            stream,
+            main_stream,
         )?;
 
         let dqkv = dqkv.reshaped([batch_size, self.config.qkv_features()]);
 
         // --- QKV-proj --- //
-        let dw_qkv =
-            self.qkv_proj
-                .backward_wgrad(&saves.pre_qkv_norm_result.view(), &dqkv, stream)?;
+        let dw_qkv = self.qkv_proj.backward_wgrad(
+            &saves.pre_qkv_norm_result.view(),
+            &dqkv,
+            sidecar_stream,
+        )?;
         self.gradient_accumulation.add_contribution_to_gradient(
             &dw_qkv.view(),
             &mut weights.qkv_proj.gradients.view_mut(),
-            stream,
+            sidecar_stream,
         )?;
-        let qkv_ddata =
-            self.qkv_proj
-                .backward_dgrad(&dqkv, &weights.qkv_proj.bf16_weights().view(), stream)?;
+        let qkv_ddata = self.qkv_proj.backward_dgrad(
+            &dqkv,
+            &weights.qkv_proj.bf16_weights().view(),
+            main_stream,
+        )?;
 
         // --- Pre-QKV norm --- //
 
@@ -643,7 +680,7 @@ impl DecoderExecutor {
             &weights.pre_qkv_norm_gamma.bf16_weights_replica.view(),
             &saves.pre_qkv_norm_r_inv.view(),
             &mut weights.pre_qkv_norm_gamma.gradients.view_mut(),
-            stream,
+            main_stream,
         )?;
 
         Ok(pre_qkv_ddata)

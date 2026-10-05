@@ -35,6 +35,10 @@ use std::{
 pub struct Cli {
     #[arg(long)]
     pub resume: Option<PathBuf>,
+    /// Stop training after reaching this global step. The LR schedule
+    /// is unaffected and still spans the full dataset.
+    #[arg(long)]
+    pub max_steps: Option<u32>,
 }
 
 pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
@@ -144,6 +148,8 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         // Ensure at most one checkpoint in flight at a time.
         checkpoint_writer.wait()?;
 
+        tracing::info!("dispatching checkpoint save");
+
         let mut builder = CheckpointBuilder::default();
         weights.save_checkpoint(&mut builder, &cx, cx.d2h_copy_stream())?;
 
@@ -184,11 +190,21 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         shutdown_tx.try_send(()).ok();
     })?;
 
+    let sidecar_stream = cx.cuda().create_stream()?;
+
     for (i, batch) in stream_batches(token_counts, config)
         .into_iter()
         .enumerate()
         .skip(train_step as usize * config.training.gradient_accumulation_steps as usize)
     {
+        if cli
+            .max_steps
+            .is_some_and(|max_steps| train_step >= max_steps)
+        {
+            tracing::info!(train_step, "reached max steps");
+            break;
+        }
+
         let token_indices = Tensor::from_slice(
             bytemuck::cast_slice::<TokenId, u32>(&batch.tokens),
             [batch.tokens.len()],
@@ -205,7 +221,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             decoder_ragged_seqlen: RaggedSeqlenTensors::build(
                 &batch.seqlens,
                 &cx,
-                &model_config.decoder_attention_config(),
+                &model_config.decoder_attention_config(batch.seqlens.len()),
             )?,
             seqlen: batch.seqlens,
         };
@@ -225,6 +241,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             &mut weights,
             &saved_tensors,
             cx.default_compute_stream(),
+            &sidecar_stream,
         )?;
 
         let loss = *bytemuck::from_bytes::<f32>(loss.view()?);
@@ -281,6 +298,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
 
             if train_step.is_multiple_of(config.training.steps_per_checkpoint as u32)
                 || i == num_microbatches - 1
+                || cli.max_steps == Some(train_step)
             {
                 checkpoint(&weights, train_step, &loss_history)?;
             }

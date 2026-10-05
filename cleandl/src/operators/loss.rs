@@ -44,11 +44,14 @@ impl LossExecutor {
         };
         assert!(hidden_size.is_multiple_of(16));
 
-        let mut out_stats = Tensor::new_zeroed(
-            Shape::new([batch_size]),
-            ElementType::Float(FloatType::F32),
-            &self.cx,
-        )?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_stats = unsafe {
+            Tensor::new_uninit(
+                Shape::new([batch_size]),
+                ElementType::Float(FloatType::F32),
+                &self.cx,
+            )?
+        };
 
         let kernel = self.module.get_function("online_softmax_stats_128")?;
 
@@ -117,11 +120,14 @@ impl LossExecutor {
         // The loss is an atomic accumulator, so it relies on the allocation being zeroed.
         let mut out_loss =
             Tensor::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &self.cx)?;
-        let mut out_logits_grad = Tensor::new_zeroed(
-            logits.shape(),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_logits_grad = unsafe {
+            Tensor::new_uninit(
+                logits.shape(),
+                ElementType::Float(FloatType::Bf16),
+                &self.cx,
+            )?
+        };
 
         let kernel = self.module.get_function("cross_entropy_loss_fwd_bwd_128")?;
 

@@ -10,8 +10,8 @@ pub struct Sky1Config {
 }
 
 impl Sky1Config {
-    pub fn decoder_attention_config(&self) -> AttentionConfig {
-        self.blocks.decoder_attention_config()
+    pub fn decoder_attention_config(&self, num_sequences: usize) -> AttentionConfig {
+        self.blocks.decoder_attention_config(num_sequences)
     }
 }
 
@@ -23,8 +23,8 @@ pub struct BlocksConfig {
     pub num_decoder_kv_heads: usize,
     pub head_dim: usize,
     pub max_batch_decoder_tokens: usize,
-    pub max_num_sequences: usize,
     pub max_decoder_seqlen: usize,
+    pub max_num_sequences: usize,
     pub rope_base_freq: f32,
 }
 
@@ -34,12 +34,12 @@ impl BlocksConfig {
         self.head_dim * (self.num_decoder_q_heads + 2 * self.num_decoder_kv_heads)
     }
 
-    pub fn decoder_attention_config(&self) -> AttentionConfig {
+    pub fn decoder_attention_config(&self, num_sequences: usize) -> AttentionConfig {
         AttentionConfig {
             is_causal: true,
             max_q_seqlen: self.max_decoder_seqlen,
             max_kv_seqlen: self.max_decoder_seqlen,
-            max_num_sequences: self.max_num_sequences,
+            max_num_sequences: num_sequences.next_power_of_two(),
             q_heads: self.num_decoder_q_heads,
             kv_heads: self.num_decoder_kv_heads,
             head_dim: self.head_dim,

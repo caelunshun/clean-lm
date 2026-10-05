@@ -344,7 +344,8 @@ impl Epilogue for IdentityEpilogue {
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
-        Tensor::new_zeroed([m, n], BF16, cx)
+        // Soundness: the kernel overwrites the data before we can read it.
+        unsafe { Tensor::new_uninit([m, n], BF16, cx) }
     }
 
     fn fallback_epilogue_kernel(&self, _cx: &Context) -> anyhow::Result<Option<Function>> {
@@ -408,10 +409,13 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
-        Ok(SwiGluGateTrainFwdOutputs {
-            gate: Tensor::new_zeroed([m, n], BF16, cx)?,
-            activation: Tensor::new_zeroed([m, n], BF16, cx)?,
-        })
+        // Soundness: the kernel overwrites the data before we can read it.
+        unsafe {
+            Ok(SwiGluGateTrainFwdOutputs {
+                gate: Tensor::new_uninit([m, n], BF16, cx)?,
+                activation: Tensor::new_uninit([m, n], BF16, cx)?,
+            })
+        }
     }
 
     fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>> {
@@ -427,7 +431,8 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         product: Tensor,
         cx: &Context,
     ) -> anyhow::Result<Self::Outputs> {
-        let activation = Tensor::new_zeroed(product.shape(), BF16, cx)?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let activation = unsafe { Tensor::new_uninit(product.shape(), BF16, cx)? };
         Ok(SwiGluGateTrainFwdOutputs {
             gate: product,
             activation,
@@ -511,10 +516,13 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
     }
 
     fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
-        Ok(SwiGluDownTrainDgradOutputs {
-            dgate: Tensor::new_zeroed([m, n], BF16, cx)?,
-            dx: Tensor::new_zeroed([m, n], BF16, cx)?,
-        })
+        // Soundness: the kernel overwrites the data before we can read it.
+        unsafe {
+            Ok(SwiGluDownTrainDgradOutputs {
+                dgate: Tensor::new_uninit([m, n], BF16, cx)?,
+                dx: Tensor::new_uninit([m, n], BF16, cx)?,
+            })
+        }
     }
 
     fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>> {
@@ -530,7 +538,8 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
         product: Tensor,
         cx: &Context,
     ) -> anyhow::Result<Self::Outputs> {
-        let dgate = Tensor::new_zeroed(product.shape(), BF16, cx)?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let dgate = unsafe { Tensor::new_uninit(product.shape(), BF16, cx)? };
         Ok(SwiGluDownTrainDgradOutputs { dgate, dx: product })
     }
 

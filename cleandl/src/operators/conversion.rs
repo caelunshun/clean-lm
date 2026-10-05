@@ -24,8 +24,10 @@ impl ConversionExecutor {
         let n = bf16.shape().element_count();
         assert!(n.is_multiple_of(16));
 
-        let mut f32 =
-            Tensor::new_zeroed(bf16.shape(), ElementType::Float(FloatType::F32), &self.cx)?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut f32 = unsafe {
+            Tensor::new_uninit(bf16.shape(), ElementType::Float(FloatType::F32), &self.cx)?
+        };
 
         let kernel = self.module.get_function("bf16_to_f32_16384")?;
         {
@@ -51,8 +53,10 @@ impl ConversionExecutor {
         let n = f32.shape().element_count();
         assert!(n.is_multiple_of(16));
 
-        let mut bf16 =
-            Tensor::new_zeroed(f32.shape(), ElementType::Float(FloatType::Bf16), &self.cx)?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut bf16 = unsafe {
+            Tensor::new_uninit(f32.shape(), ElementType::Float(FloatType::Bf16), &self.cx)?
+        };
 
         let kernel = self.module.get_function("f32_to_bf16_16384")?;
         {

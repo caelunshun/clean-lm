@@ -73,7 +73,9 @@ impl MatmulExecutor {
             None => assert!(residual.is_none()),
         }
 
-        let mut out = Tensor::new_zeroed([m, n], self.config.out_element_type, &self.cx)?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out =
+            unsafe { Tensor::new_uninit([m, n], self.config.out_element_type, &self.cx)? };
 
         let reshaped_plan;
         let plan = if m != self.config.m || n != self.config.n || k != self.config.k {

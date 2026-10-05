@@ -48,11 +48,14 @@ impl EmbeddingExecutor {
             panic!("wrong shape for token indices")
         };
 
-        let mut out_embeddings = Tensor::new_zeroed(
-            Shape::new([num_tokens, embed_dim]),
-            ElementType::Float(FloatType::Bf16),
-            &self.cx,
-        )?;
+        // Soundness: the kernel overwrites the data before we can read it.
+        let mut out_embeddings = unsafe {
+            Tensor::new_uninit(
+                Shape::new([num_tokens, embed_dim]),
+                ElementType::Float(FloatType::Bf16),
+                &self.cx,
+            )?
+        };
 
         let kernel = self
             .module
