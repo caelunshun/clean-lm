@@ -8,7 +8,7 @@ use crate::{
             SwiGluGateTrainFwdOutputs,
         },
     },
-    tensor::{Tensor, TensorView},
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 use serde::Serialize;
 use skycuda::stream::Stream;
@@ -112,28 +112,34 @@ impl SwiGluFfnExecutor {
         Ok(DownProjDgradOutput { dgate, dup: dx })
     }
 
-    /// Returns the down-projection weight gradient
-    /// `[intermediate_features, out_features]`.
-    pub fn backward_down_proj_wgrad(
+    pub fn backward_down_proj_wgrad_accumulate(
         &self,
         activation: &TensorView<'_>,
         dy: &TensorView<'_>,
+        gradient: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<Tensor> {
-        self.bwd_down_proj_wgrad
-            .matmul(&activation.transposed(0, 1), dy, None, stream)
+    ) -> anyhow::Result<()> {
+        self.bwd_down_proj_wgrad.matmul_accumulate(
+            &activation.transposed(0, 1),
+            dy,
+            gradient,
+            stream,
+        )
     }
 
-    /// Returns an up- or gate-projection weight gradient
-    /// `[in_features, intermediate_features]`.
-    pub fn backward_up_gate_proj_wgrad(
+    pub fn backward_up_gate_proj_wgrad_accumulate(
         &self,
         data: &TensorView<'_>,
         dout: &TensorView<'_>,
+        gradient: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<Tensor> {
-        self.bwd_up_gate_proj_wgrad
-            .matmul(&data.transposed(0, 1), dout, None, stream)
+    ) -> anyhow::Result<()> {
+        self.bwd_up_gate_proj_wgrad.matmul_accumulate(
+            &data.transposed(0, 1),
+            dout,
+            gradient,
+            stream,
+        )
     }
 
     /// Returns the up-projection data gradient `[batch_size, in_features]`.
@@ -235,7 +241,7 @@ impl ResourceKey for SwiGluConfig {
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
                 ab_element_type: ElementType::Float(FloatType::Bf16),
-                out_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::F32),
             },
             cx,
         )?;
@@ -251,7 +257,7 @@ impl ResourceKey for SwiGluConfig {
                 out_format: MatrixFormat::RowMajor,
                 allow_shape_override: true,
                 ab_element_type: ElementType::Float(FloatType::Bf16),
-                out_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::F32),
             },
             cx,
         )?;

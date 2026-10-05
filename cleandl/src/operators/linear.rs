@@ -1,7 +1,7 @@
 use crate::{
     context::{Context, ResourceKey},
     operators::matmul::{MatmulConfig, MatmulExecutor, MatrixFormat, ResidualConfig},
-    tensor::{Tensor, TensorView},
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 use serde::Serialize;
 use skycuda::stream::Stream;
@@ -57,15 +57,16 @@ impl LinearExecutor {
             .matmul(dy, &weight.transposed(0, 1), None, stream)
     }
 
-    /// Returns the weight gradient `[in_features, out_features]`.
-    pub fn backward_wgrad(
+    /// Accumulates the weight gradient into the f32 `gradient` `[in_features, out_features]`.
+    pub fn backward_wgrad_accumulate(
         &self,
         data: &TensorView<'_>,
         dy: &TensorView<'_>,
+        gradient: &mut TensorViewMut<'_>,
         stream: &Stream,
-    ) -> anyhow::Result<Tensor> {
+    ) -> anyhow::Result<()> {
         self.bwd_wgrad
-            .matmul(&data.transposed(0, 1), dy, None, stream)
+            .matmul_accumulate(&data.transposed(0, 1), dy, gradient, stream)
     }
 }
 
@@ -124,7 +125,7 @@ impl ResourceKey for LinearConfig {
                 b_format: MatrixFormat::RowMajor,
                 out_format: MatrixFormat::RowMajor,
                 ab_element_type: ElementType::Float(FloatType::Bf16),
-                out_element_type: ElementType::Float(FloatType::Bf16),
+                out_element_type: ElementType::Float(FloatType::F32),
                 allow_shape_override: true,
             },
             cx,

@@ -40,6 +40,8 @@ impl SkyredTokenizer {
     pub fn tokenize_document(&self, document: &Document) -> anyhow::Result<Vec<TokenId>> {
         let mut tokens = Vec::new();
 
+        self.push_special(&mut tokens, SpecialToken::BeginOfSequence)?;
+
         self.push_text(&mut tokens, &document.subreddit)?;
 
         self.push_special(&mut tokens, SpecialToken::BeginDate)?;
@@ -113,6 +115,7 @@ fn pretokenize(text: &[u8]) -> Vec<&[u8]> {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, EnumIter, Serialize, Deserialize)]
 pub enum SpecialToken {
+    BeginOfSequence,
     BeginDate,
     BeginPostTitle,
     BeginAuthor,

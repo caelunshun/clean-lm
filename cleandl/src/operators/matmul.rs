@@ -2,15 +2,16 @@ use crate::{
     context::{Context, ResourceKey},
     disk_cache::DiskCacheKey,
     par_random,
-    tensor::{Tensor, TensorView},
+    tensor::{Tensor, TensorView, TensorViewMut},
 };
 use rand::SeedableRng;
 use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
-use skycuda::stream::Stream;
+use skycuda::{device_memory::DeviceVisibleMemoryMut, stream::Stream};
 use skycuda_cublaslt::{
-    Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout, Order,
+    Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout,
+    Order, Scalar,
 };
 use skytens_core::data_type::{ElementType, FloatType};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ impl MatmulExecutor {
         cx.get_or_create_resource(config)
     }
 
-    /// Returns the product as a freshly allocated row-major bf16 tensor `[m, n]`.
+    /// Returns the product as a freshly allocated tensor `[m, n]`.
     pub fn matmul(
         &self,
         a: &TensorView<'_>,
@@ -38,26 +39,7 @@ impl MatmulExecutor {
         residual: Option<&TensorView>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        let validate_matrix = |tensor: &TensorView,
-                               rows: usize,
-                               cols: usize,
-                               format: MatrixFormat,
-                               ty: ElementType| {
-            assert_eq!(tensor.element_type(), ty);
-            assert_eq!(tensor.shape().dims_slice(), &[rows, cols]);
-            match format {
-                MatrixFormat::RowMajor => assert_eq!(tensor.strides().dims_slice(), &[cols, 1]),
-                MatrixFormat::ColumnMajor => assert_eq!(tensor.strides().dims_slice(), &[1, rows]),
-            }
-        };
-
-        let (m, n, k) = if self.config.allow_shape_override {
-            (a.shape()[0], b.shape()[1], a.shape()[1])
-        } else {
-            (self.config.m, self.config.n, self.config.k)
-        };
-        validate_matrix(a, m, k, self.config.a_format, self.config.ab_element_type);
-        validate_matrix(b, k, n, self.config.b_format, self.config.ab_element_type);
+        let (m, n, k) = self.validate_inputs(a, b);
 
         match &self.config.residual {
             Some(residual_config) => {
@@ -77,6 +59,67 @@ impl MatmulExecutor {
         let mut out =
             unsafe { Tensor::new_uninit([m, n], self.config.out_element_type, &self.cx)? };
 
+        self.execute(
+            a,
+            b,
+            residual,
+            out.storage_mut(),
+            residual.is_some(),
+            (m, n, k),
+            stream,
+        )?;
+
+        Ok(out)
+    }
+
+    /// Computes `out += a * b` in place. The executor must be configured
+    /// without a residual. `out` must match `out_format` and `out_element_type`,
+    /// and it must be initialized.
+    pub fn matmul_accumulate(
+        &self,
+        a: &TensorView<'_>,
+        b: &TensorView<'_>,
+        out: &mut TensorViewMut<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
+        assert!(
+            self.config.residual.is_none(),
+            "in-place accumulation is incompatible with a separate residual"
+        );
+        let (m, n, k) = self.validate_inputs(a, b);
+        validate_matrix(
+            &out.view(),
+            m,
+            n,
+            self.config.out_format,
+            self.config.out_element_type,
+        );
+
+        self.execute(a, b, None, out.storage_mut(), true, (m, n, k), stream)
+    }
+
+    fn validate_inputs(&self, a: &TensorView<'_>, b: &TensorView<'_>) -> (usize, usize, usize) {
+        let (m, n, k) = if self.config.allow_shape_override {
+            (a.shape()[0], b.shape()[1], a.shape()[1])
+        } else {
+            (self.config.m, self.config.n, self.config.k)
+        };
+        validate_matrix(a, m, k, self.config.a_format, self.config.ab_element_type);
+        validate_matrix(b, k, n, self.config.b_format, self.config.ab_element_type);
+        (m, n, k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute(
+        &self,
+        a: &TensorView<'_>,
+        b: &TensorView<'_>,
+        residual: Option<&TensorView>,
+        out: &mut impl DeviceVisibleMemoryMut,
+        add_c: bool,
+        (m, n, k): (usize, usize, usize),
+        stream: &Stream,
+    ) -> anyhow::Result<()> {
         let reshaped_plan;
         let plan = if m != self.config.m || n != self.config.n || k != self.config.k {
             assert!(self.config.allow_shape_override);
@@ -100,9 +143,12 @@ impl MatmulExecutor {
         )?;
 
         let mut operands = plan.operands();
-        operands.a(a.storage()).b(b.storage()).d(out.storage_mut());
+        operands.a(a.storage()).b(b.storage()).d(out);
         if let Some(residual) = residual {
             operands.c(residual.storage());
+        }
+        if add_c {
+            operands.beta(Scalar::one(self.desc.scale_type));
         }
 
         unsafe {
@@ -111,7 +157,22 @@ impl MatmulExecutor {
 
         drop(operands);
 
-        Ok(out)
+        Ok(())
+    }
+}
+
+fn validate_matrix(
+    tensor: &TensorView,
+    rows: usize,
+    cols: usize,
+    format: MatrixFormat,
+    ty: ElementType,
+) {
+    assert_eq!(tensor.element_type(), ty);
+    assert_eq!(tensor.shape().dims_slice(), &[rows, cols]);
+    match format {
+        MatrixFormat::RowMajor => assert_eq!(tensor.strides().dims_slice(), &[cols, 1]),
+        MatrixFormat::ColumnMajor => assert_eq!(tensor.strides().dims_slice(), &[1, rows]),
     }
 }
 
@@ -235,6 +296,7 @@ fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::R
             operands.a(a.storage()).b(b.storage()).d(out.storage_mut());
             if let Some(residual) = &residual {
                 operands.c(residual.storage());
+                operands.beta(Scalar::one(plan.desc().scale_type));
             }
 
             let mut best_algo_idx = 0;

@@ -13,7 +13,6 @@ use cleandl::{
     operators::{
         adamw::AdamWExecutor,
         attention::{AttentionBackwardOutput, AttentionExecutor, AttentionForwardOutput},
-        gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
         norm::{NormExecutor, RmsNormForwardOutput},
         rope::{RopeConfig, RopeExecutor, RopeMode},
@@ -42,7 +41,6 @@ pub struct DecoderExecutor {
     o_proj: Arc<LinearExecutor>,
     pre_ffn_norm: Arc<NormExecutor>,
     ffn: Arc<SwiGluFfnExecutor>,
-    gradient_accumulation: Arc<GradientAccumulationExecutor>,
     optimizer: Arc<AdamWExecutor>,
 }
 
@@ -114,7 +112,6 @@ impl ResourceKey for DecoderExecutorKey {
             cx,
         )?;
 
-        let gradient_accumulation = GradientAccumulationExecutor::get(cx)?;
         let optimizer = AdamWExecutor::get(cx)?;
 
         Ok(DecoderExecutor {
@@ -127,7 +124,6 @@ impl ResourceKey for DecoderExecutorKey {
             o_proj,
             pre_ffn_norm,
             ffn,
-            gradient_accumulation,
             optimizer,
         })
     }
@@ -534,13 +530,9 @@ impl DecoderExecutor {
 
         // --- FFN down --- //
 
-        let ffn_down_dw = self.ffn.backward_down_proj_wgrad(
+        self.ffn.backward_down_proj_wgrad_accumulate(
             &saves.ffn_gate_activation_result.view(),
             dy,
-            sidecar_stream,
-        )?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_down_dw.view(),
             &mut weights.ffn_down.gradients.view_mut(),
             sidecar_stream,
         )?;
@@ -557,13 +549,9 @@ impl DecoderExecutor {
         )?;
 
         // --- FFN up ---
-        let ffn_up_dw = self.ffn.backward_up_gate_proj_wgrad(
+        self.ffn.backward_up_gate_proj_wgrad_accumulate(
             &saves.pre_ffn_norm_result.view(),
             &ffn_up_dy.view(),
-            sidecar_stream,
-        )?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_up_dw.view(),
             &mut weights.ffn_up.gradients.view_mut(),
             sidecar_stream,
         )?;
@@ -575,13 +563,9 @@ impl DecoderExecutor {
         )?;
 
         // --- FFN gate ---
-        let ffn_gate_dw = self.ffn.backward_up_gate_proj_wgrad(
+        self.ffn.backward_up_gate_proj_wgrad_accumulate(
             &saves.pre_ffn_norm_result.view(),
             &ffn_gate_dy.view(),
-            sidecar_stream,
-        )?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &ffn_gate_dw.view(),
             &mut weights.ffn_gate.gradients.view_mut(),
             sidecar_stream,
         )?;
@@ -606,11 +590,9 @@ impl DecoderExecutor {
 
         // --- O-proj --- //
         let attn_result = saves.attn_result.reshaped([batch_size, q_features]);
-        let o_proj_dw =
-            self.o_proj
-                .backward_wgrad(&attn_result, &pre_ffn_norm_dx.view(), sidecar_stream)?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &o_proj_dw.view(),
+        self.o_proj.backward_wgrad_accumulate(
+            &attn_result,
+            &pre_ffn_norm_dx.view(),
             &mut weights.o_proj.gradients.view_mut(),
             sidecar_stream,
         )?;
@@ -656,13 +638,9 @@ impl DecoderExecutor {
         let dqkv = dqkv.reshaped([batch_size, self.config.qkv_features()]);
 
         // --- QKV-proj --- //
-        let dw_qkv = self.qkv_proj.backward_wgrad(
+        self.qkv_proj.backward_wgrad_accumulate(
             &saves.pre_qkv_norm_result.view(),
             &dqkv,
-            sidecar_stream,
-        )?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &dw_qkv.view(),
             &mut weights.qkv_proj.gradients.view_mut(),
             sidecar_stream,
         )?;

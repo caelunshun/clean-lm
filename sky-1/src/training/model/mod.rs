@@ -12,7 +12,6 @@ use cleandl::{
         adamw::AdamWExecutor,
         attention::RaggedSeqlenTensors,
         embedding::EmbeddingExecutor,
-        gradient_accumulation::GradientAccumulationExecutor,
         linear::{LinearConfig, LinearExecutor},
         loss::{CrossEntropyLossOutput, LossExecutor},
         norm::{NormExecutor, RmsNormForwardOutput},
@@ -147,7 +146,6 @@ pub struct Sky1Executor {
     final_norm: Arc<NormExecutor>,
     lm_head: Arc<LinearExecutor>,
     loss: Arc<LossExecutor>,
-    gradient_accumulation: Arc<GradientAccumulationExecutor>,
     optimizer: Arc<AdamWExecutor>,
 }
 
@@ -189,7 +187,6 @@ impl ResourceKey for Sky1ExecutorKey {
             final_norm,
             lm_head,
             loss,
-            gradient_accumulation: GradientAccumulationExecutor::get(cx)?,
             optimizer,
         })
     }
@@ -292,13 +289,9 @@ impl Sky1Executor {
         main_stream: &Stream,
         sidecar_stream: &Stream,
     ) -> anyhow::Result<()> {
-        let lm_head_dw = self.lm_head.backward_wgrad(
+        self.lm_head.backward_wgrad_accumulate(
             &saves.final_norm_result.view(),
             &saves.logits_grad.view(),
-            sidecar_stream,
-        )?;
-        self.gradient_accumulation.add_contribution_to_gradient(
-            &lm_head_dw.view(),
             &mut weights.lm_head.gradients.view_mut(),
             sidecar_stream,
         )?;
