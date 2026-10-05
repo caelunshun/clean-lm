@@ -160,9 +160,12 @@ impl ResourceKey for MatmulConfig {
             ));
         }
 
-        let plan = cx
-            .cublaslt()
-            .build_plan(&desc, &MatmulPreference::default().requested_algo_count(32))?;
+        let plan = cx.cublaslt().build_plan(
+            &desc,
+            &MatmulPreference::default()
+                .requested_algo_count(32)
+                .max_workspace_bytes(64 << 30),
+        )?;
 
         let algo = if cx.is_autotuning_enabled() {
             let index = autotune(&plan, self, cx)?;

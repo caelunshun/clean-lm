@@ -40,6 +40,7 @@ impl BlocksConfig {
             max_q_seqlen: self.max_decoder_seqlen,
             max_kv_seqlen: self.max_decoder_seqlen,
             max_num_sequences: num_sequences.next_power_of_two(),
+            max_total_tokens: self.max_batch_decoder_tokens,
             q_heads: self.num_decoder_q_heads,
             kv_heads: self.num_decoder_kv_heads,
             head_dim: self.head_dim,

@@ -29,6 +29,8 @@ pub struct RaggedSeqlenTensors {
     offset_v: Tensor,
     /// Offset of each sequence within the `[T, q_heads, head_dim]` output tensor, in units of elements.
     offset_o: Tensor,
+    /// Offset of each sequence within the ragged `[T, q_heads]` stats tensor, in units of elements.
+    offset_stats: Tensor,
 }
 
 impl RaggedSeqlenTensors {
@@ -71,6 +73,7 @@ impl RaggedSeqlenTensors {
             offset_k: upload(&offsets(packed_row_stride, q_span))?,
             offset_v: upload(&offsets(packed_row_stride, q_span + kv_span))?,
             offset_o: upload(&offsets(q_span, 0))?,
+            offset_stats: upload(&offsets(config.q_heads, 0))?,
             cu_seqlen: upload(&cu_seqlens)?,
         })
     }
@@ -84,12 +87,13 @@ impl RaggedSeqlenTensors {
 /// laid out as row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`
 /// (Q heads first, then K heads, then V heads).
 ///
-/// Due to apparent cuDNN API inconsistencies, the stats tensor
-/// is not ragged like the others. It must be padded to shape [max_num_sequences, max_output_seqlen, num_q_heads].
+/// The stats tensor is ragged only on SM90 and SM10x. On other architectures, it is padded to shape
+/// `[max_num_sequences, max_q_seqlen, q_heads]`.
 #[derive(Debug)]
 pub struct AttentionExecutor {
     config: AttentionConfig,
     cx: Context,
+    ragged_stats: bool,
     forward_graph: ExecutableCudnnGraph,
     /// Q, K, V tensor IDs, all bound to the packed QKV buffer.
     forward_input_qkv: [TensorId; 3],
@@ -97,6 +101,7 @@ pub struct AttentionExecutor {
     forward_input_offset_k: TensorId,
     forward_input_offset_v: TensorId,
     forward_input_offset_o: TensorId,
+    forward_input_offset_stats: Option<TensorId>,
     forward_input_seqlen_q: TensorId,
     forward_input_seqlen_kv: TensorId,
     forward_output_o: TensorId,
@@ -107,6 +112,7 @@ pub struct AttentionExecutor {
     backward_input_offset_k: TensorId,
     backward_input_offset_v: TensorId,
     backward_input_offset_o: TensorId,
+    backward_input_offset_stats: Option<TensorId>,
     backward_input_seqlen_q: TensorId,
     backward_input_seqlen_kv: TensorId,
     backward_input_o: TensorId,
@@ -121,7 +127,8 @@ pub struct AttentionExecutor {
 pub struct AttentionForwardOutput {
     /// Attention output, row-major bf16 `[T, q_heads, head_dim]`.
     pub out: Tensor,
-    /// Softmax stats, row-major f32 `[max_num_sequences, max_q_seqlen, q_heads]`.
+    /// Softmax stats, row-major f32 `[T, q_heads]` if ragged stats are supported on the device,
+    /// else `[max_num_sequences, max_q_seqlen, q_heads]`.
     pub stats: Tensor,
 }
 
@@ -152,6 +159,34 @@ impl AttentionExecutor {
         shape[0]
     }
 
+    fn new_stats(&self, num_tokens: usize) -> anyhow::Result<Tensor> {
+        let shape = if self.ragged_stats {
+            Shape::new([num_tokens, self.config.q_heads])
+        } else {
+            Shape::new([
+                self.config.max_num_sequences,
+                self.config.max_q_seqlen,
+                self.config.q_heads,
+            ])
+        };
+        Tensor::new_zeroed(shape, ElementType::Float(FloatType::F32), &self.cx)
+    }
+
+    /// Shape of stats as returned by [`Self::new_stats`], in the layout bound in the graphs.
+    /// For padded stats, dims 1 and 2 must additionally be transposed.
+    fn stats_graph_shape(&self, num_tokens: usize) -> Shape {
+        if self.ragged_stats {
+            Shape::new([num_tokens, self.config.q_heads, 1])
+        } else {
+            Shape::new([
+                self.config.max_num_sequences,
+                self.config.max_q_seqlen,
+                self.config.q_heads,
+                1,
+            ])
+        }
+    }
+
     /// `qkv` expected as packed row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`.
     pub fn forward_attn(
         &self,
@@ -161,65 +196,51 @@ impl AttentionExecutor {
     ) -> anyhow::Result<AttentionForwardOutput> {
         let b = self.config.max_num_sequences;
         let num_tokens = self.check_qkv(qkv);
+        assert!(num_tokens <= self.config.max_total_tokens);
 
         let mut out = Tensor::new_zeroed(
             [num_tokens, self.config.q_heads, self.config.head_dim],
             qkv.element_type(),
             &self.cx,
         )?;
-        let mut out_stats = Tensor::new_zeroed(
-            [
-                self.config.max_num_sequences,
-                self.config.max_q_seqlen,
-                self.config.q_heads,
-            ],
-            ElementType::Float(FloatType::F32),
-            &self.cx,
-        )?;
+        let mut out_stats = self.new_stats(num_tokens)?;
+        let stats_shape = self.stats_graph_shape(num_tokens);
 
+        let [offset_q, offset_k, offset_v, offset_o, offset_stats] = [
+            &seqlens.offset_q,
+            &seqlens.offset_k,
+            &seqlens.offset_v,
+            &seqlens.offset_o,
+            &seqlens.offset_stats,
+        ]
+        .map(|offset| offset.reshaped([b + 1, 1, 1, 1]));
+        let seqlen = seqlens.seqlen.reshaped([b, 1, 1, 1]);
+        let mut inputs = vec![
+            (self.forward_input_qkv[0], qkv),
+            (self.forward_input_qkv[1], qkv),
+            (self.forward_input_qkv[2], qkv),
+            (self.forward_input_offset_q, &offset_q),
+            (self.forward_input_offset_k, &offset_k),
+            (self.forward_input_offset_v, &offset_v),
+            (self.forward_input_offset_o, &offset_o),
+            (self.forward_input_seqlen_q, &seqlen),
+            (self.forward_input_seqlen_kv, &seqlen),
+        ];
+        if let Some(id) = self.forward_input_offset_stats {
+            inputs.push((id, &offset_stats));
+        }
+        let mut padded_stats;
+        let stats_view = if self.ragged_stats {
+            out_stats.reshaped_mut(stats_shape)
+        } else {
+            padded_stats = out_stats.reshaped_mut(stats_shape);
+            padded_stats.transposed_mut(1, 2)
+        };
         self.forward_graph.execute(
-            &[
-                (self.forward_input_qkv[0], qkv),
-                (self.forward_input_qkv[1], qkv),
-                (self.forward_input_qkv[2], qkv),
-                (
-                    self.forward_input_offset_q,
-                    &seqlens.offset_q.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.forward_input_offset_k,
-                    &seqlens.offset_k.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.forward_input_offset_v,
-                    &seqlens.offset_v.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.forward_input_offset_o,
-                    &seqlens.offset_o.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.forward_input_seqlen_q,
-                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
-                ),
-                (
-                    self.forward_input_seqlen_kv,
-                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
-                ),
-            ],
+            &inputs,
             &mut [
                 (self.forward_output_o, out.view_mut()),
-                (
-                    self.forward_output_stats,
-                    out_stats
-                        .reshaped_mut([
-                            self.config.max_num_sequences,
-                            self.config.max_q_seqlen,
-                            self.config.q_heads,
-                            1,
-                        ])
-                        .transposed_mut(1, 2),
-                ),
+                (self.forward_output_stats, stats_view),
             ],
             stream,
         )?;
@@ -242,53 +263,45 @@ impl AttentionExecutor {
         stream: &Stream,
     ) -> anyhow::Result<AttentionBackwardOutput> {
         let b = self.config.max_num_sequences;
-        self.check_qkv(qkv);
+        let num_tokens = self.check_qkv(qkv);
+        assert!(num_tokens <= self.config.max_total_tokens);
 
         let mut grad_qkv = Tensor::new_zeroed(qkv.shape(), qkv.element_type(), &self.cx)?;
 
+        let stats_shape = self.stats_graph_shape(num_tokens);
+        let stats = if self.ragged_stats {
+            stats.reshaped(stats_shape)
+        } else {
+            stats.reshaped(stats_shape).transposed(1, 2)
+        };
+        let [offset_q, offset_k, offset_v, offset_o, offset_stats] = [
+            &seqlens.offset_q,
+            &seqlens.offset_k,
+            &seqlens.offset_v,
+            &seqlens.offset_o,
+            &seqlens.offset_stats,
+        ]
+        .map(|offset| offset.reshaped([b + 1, 1, 1, 1]));
+        let seqlen = seqlens.seqlen.reshaped([b, 1, 1, 1]);
+        let mut inputs = vec![
+            (self.backward_input_qkv[0], qkv),
+            (self.backward_input_qkv[1], qkv),
+            (self.backward_input_qkv[2], qkv),
+            (self.backward_input_offset_q, &offset_q),
+            (self.backward_input_offset_k, &offset_k),
+            (self.backward_input_offset_v, &offset_v),
+            (self.backward_input_offset_o, &offset_o),
+            (self.backward_input_seqlen_q, &seqlen),
+            (self.backward_input_seqlen_kv, &seqlen),
+            (self.backward_input_o, out),
+            (self.backward_input_do, out_grad),
+            (self.backward_input_stats, &stats),
+        ];
+        if let Some(id) = self.backward_input_offset_stats {
+            inputs.push((id, &offset_stats));
+        }
         self.backward_graph.execute_aliased(
-            &[
-                (self.backward_input_qkv[0], qkv),
-                (self.backward_input_qkv[1], qkv),
-                (self.backward_input_qkv[2], qkv),
-                (
-                    self.backward_input_offset_q,
-                    &seqlens.offset_q.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.backward_input_offset_k,
-                    &seqlens.offset_k.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.backward_input_offset_v,
-                    &seqlens.offset_v.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.backward_input_offset_o,
-                    &seqlens.offset_o.reshaped([b + 1, 1, 1, 1]),
-                ),
-                (
-                    self.backward_input_seqlen_q,
-                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
-                ),
-                (
-                    self.backward_input_seqlen_kv,
-                    &seqlens.seqlen.reshaped([b, 1, 1, 1]),
-                ),
-                (self.backward_input_o, out),
-                (self.backward_input_do, out_grad),
-                (
-                    self.backward_input_stats,
-                    &stats
-                        .reshaped([
-                            self.config.max_num_sequences,
-                            self.config.max_q_seqlen,
-                            self.config.q_heads,
-                            1,
-                        ])
-                        .transposed(1, 2),
-                ),
-            ],
+            &inputs,
             &mut [(&self.backward_output_dqkv[..], grad_qkv.view_mut())],
             stream,
         )?;
@@ -302,6 +315,8 @@ pub struct AttentionConfig {
     pub max_q_seqlen: usize,
     pub max_kv_seqlen: usize,
     pub max_num_sequences: usize,
+    /// Upper bound on the total number of packed tokens `T`.
+    pub max_total_tokens: usize,
     pub q_heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -375,6 +390,7 @@ impl ResourceKey for AttentionConfig {
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         let attn_scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let ragged_stats = !matches!(cx.cuda().compute_capability_major(), 8 | 12);
 
         let forward_graph = CudnnGraphBuilder::new(cx)?;
 
@@ -402,7 +418,8 @@ impl ResourceKey for AttentionConfig {
                 .generate_stats(true)
                 .causal_mask(self.is_causal)
                 .padding_mask(true)
-                .seq_len(forward_seqlen_q, forward_seqlen_kv),
+                .seq_len(forward_seqlen_q, forward_seqlen_kv)
+                .max_total_seq_len(self.max_total_tokens, self.max_total_tokens),
         )?;
         let forward_output_o = forward_output_o.unwrap();
         let forward_output_stats = forward_output_stats.unwrap();
@@ -410,6 +427,11 @@ impl ResourceKey for AttentionConfig {
         forward_output_o.set_ragged_offset(forward_offset_o, None);
         let forward_output_stats_id =
             forward_graph.mark_output(forward_output_stats, &self.stats_layout());
+        let forward_offset_stats = ragged_stats.then(|| {
+            let offset = forward_graph.bind_tensor(&self.ragged_offset_layout());
+            forward_output_stats.set_ragged_offset(offset, None);
+            offset
+        });
 
         let forward_input_qkv = [
             forward_input_q.uid(),
@@ -420,6 +442,7 @@ impl ResourceKey for AttentionConfig {
         let forward_input_offset_k = forward_offset_k.uid();
         let forward_input_offset_v = forward_offset_v.uid();
         let forward_input_offset_o = forward_offset_o.uid();
+        let forward_input_offset_stats = forward_offset_stats.map(|t| t.uid());
         let forward_input_seqlen_q = forward_seqlen_q.uid();
         let forward_input_seqlen_kv = forward_seqlen_kv.uid();
         let forward_graph = forward_graph.build()?;
@@ -445,6 +468,11 @@ impl ResourceKey for AttentionConfig {
         backward_input_v.set_ragged_offset(backward_offset_v, None);
         backward_input_o.set_ragged_offset(backward_offset_o, None);
         backward_input_do.set_ragged_offset(backward_offset_o, None);
+        let backward_offset_stats = ragged_stats.then(|| {
+            let offset = backward_graph.bind_tensor(&self.ragged_offset_layout());
+            backward_input_stats.set_ragged_offset(offset, None);
+            offset
+        });
 
         let [backward_output_dq, backward_output_dk, backward_output_dv] =
             backward_graph.graph().sdpa_backward(
@@ -461,6 +489,7 @@ impl ResourceKey for AttentionConfig {
                     ..SdpaBackwardAttributes::new()
                         .attn_scale(attn_scale)
                         .causal_mask(self.is_causal)
+                        .max_total_seq_len(self.max_total_tokens, self.max_total_tokens)
                 },
             )?;
         let backward_output_dq = backward_output_dq.unwrap();
@@ -485,6 +514,7 @@ impl ResourceKey for AttentionConfig {
         let backward_input_offset_k = backward_offset_k.uid();
         let backward_input_offset_v = backward_offset_v.uid();
         let backward_input_offset_o = backward_offset_o.uid();
+        let backward_input_offset_stats = backward_offset_stats.map(|t| t.uid());
         let backward_input_seqlen_q = backward_seqlen_q.uid();
         let backward_input_seqlen_kv = backward_seqlen_kv.uid();
         let backward_input_o = backward_input_o.uid();
@@ -495,12 +525,14 @@ impl ResourceKey for AttentionConfig {
         Ok(AttentionExecutor {
             config: self.clone(),
             cx: cx.clone(),
+            ragged_stats,
             forward_graph,
             forward_input_qkv,
             forward_input_offset_q,
             forward_input_offset_k,
             forward_input_offset_v,
             forward_input_offset_o,
+            forward_input_offset_stats,
             forward_input_seqlen_q,
             forward_input_seqlen_kv,
             forward_output_o: forward_output_o_id,
@@ -511,6 +543,7 @@ impl ResourceKey for AttentionConfig {
             backward_input_offset_k,
             backward_input_offset_v,
             backward_input_offset_o,
+            backward_input_offset_stats,
             backward_input_seqlen_q,
             backward_input_seqlen_kv,
             backward_input_o,

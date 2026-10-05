@@ -54,6 +54,7 @@ fn attention() -> anyhow::Result<()> {
         max_q_seqlen: max_seqlen,
         max_kv_seqlen: max_seqlen,
         max_num_sequences: num_sequences,
+        max_total_tokens: total_tokens,
         q_heads: Q_HEADS,
         kv_heads: KV_HEADS,
         head_dim: HEAD_DIM,

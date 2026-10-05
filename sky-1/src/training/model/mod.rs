@@ -280,7 +280,7 @@ impl Sky1Executor {
     }
 
     /// Runs backward pass and accumulates gradients.
-    /// 
+    ///
     /// `sidecar_stream` is used to enable some inter-kernel parallelism,
     /// e.g. running wgrad and dgrad alongside each other to hide wave quantization.
     pub fn train_backward(
@@ -333,7 +333,7 @@ impl Sky1Executor {
                 &saves.decoder[i],
                 meta_tensors,
                 main_stream,
-                sidecar_stream
+                sidecar_stream,
             )?;
         }
 
