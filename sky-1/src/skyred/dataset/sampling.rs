@@ -304,12 +304,18 @@ async fn open_posts(
             let parts = col.path().parts();
             let (top, leaf) = (parts[0].as_str(), parts[parts.len() - 1].as_str());
             if top == "comments" {
-                with_comments && matches!(leaf, "id" | "parent_id" | "author_name" | "body")
+                with_comments
+                    && matches!(leaf, "id" | "parent_id" | "author_name" | "body" | "score")
             } else {
                 parts.len() == 1
                     && matches!(
                         top,
-                        "created_utc" | "subreddit" | "title" | "selftext" | "author_name"
+                        "created_utc"
+                            | "subreddit"
+                            | "title"
+                            | "selftext"
+                            | "author_name"
+                            | "score"
                     )
             }
         })
@@ -354,6 +360,7 @@ fn sample_batch(
         parent_id: column(comment_fields, "parent_id")?.as_string(),
         author: column(comment_fields, "author_name")?.as_string(),
         body: column(comment_fields, "body")?.as_string(),
+        score: column(comment_fields, "score")?.as_primitive(),
     };
 
     for row in 0..batch.len() {
@@ -383,6 +390,10 @@ fn sample_batch(
     Ok(())
 }
 
+fn nullable_score(scores: &PrimitiveArray<Int64Type>, i: usize) -> Option<i64> {
+    scores.is_valid(i).then(|| scores.value(i))
+}
+
 fn column<'a>(array: &'a StructArray, name: &str) -> anyhow::Result<&'a ArrayRef> {
     array
         .column_by_name(name)
@@ -395,6 +406,7 @@ struct PostColumns<'a> {
     title: &'a StringArray,
     selftext: &'a LargeStringArray,
     author: &'a StringArray,
+    score: &'a PrimitiveArray<Int64Type>,
 }
 
 impl<'a> PostColumns<'a> {
@@ -405,6 +417,7 @@ impl<'a> PostColumns<'a> {
             title: column(batch, "title")?.as_string(),
             selftext: column(batch, "selftext")?.as_string(),
             author: column(batch, "author_name")?.as_string(),
+            score: column(batch, "score")?.as_primitive(),
         })
     }
 
@@ -425,13 +438,14 @@ impl<'a> PostColumns<'a> {
     }
 
     /// Returns the post's date and subreddit, or `None` if the post is excluded
-    /// by missing data, the minimum year, or the author and text filters.
+    /// by missing data, the minimum year, or the filters.
     fn stratum(&self, row: usize, filter: &Filter) -> Option<(Date, &'a str)> {
         if self.subreddit.is_null(row) {
             return None;
         }
         let date = day_to_date(self.created_utc.value(row).div_euclid(SECONDS_PER_DAY))?;
         if filter.should_prune_year(date.year())
+            || filter.should_prune_post_score(nullable_score(self.score, row))
             || filter.should_prune_author(self.author.value(row))
             || filter.should_prune_text(self.title.value(row))
             || filter.should_prune_text(self.selftext.value(row))
@@ -448,6 +462,7 @@ struct CommentColumns<'a> {
     parent_id: &'a StringArray,
     author: &'a StringArray,
     body: &'a LargeStringArray,
+    score: &'a PrimitiveArray<Int64Type>,
 }
 
 impl CommentColumns<'_> {
@@ -456,6 +471,10 @@ impl CommentColumns<'_> {
     }
 
     fn passes_filter(&self, i: usize, filter: &Filter) -> bool {
+        if filter.should_prune_comment_score(nullable_score(self.score, i)) {
+            return false;
+        }
+
         if filter.should_prune_author(self.author.value(i)) {
             return false;
         }
@@ -469,7 +488,7 @@ impl CommentColumns<'_> {
 
     /// Selects a root-to-leaf comment chain of maximal depth,
     /// breaking ties uniformly at random. Comments are filtered
-    /// according to the author and text filters.
+    /// according to the author, text, and score filters.
     fn deepest_chain(
         &self,
         range: Range<usize>,
@@ -707,6 +726,14 @@ impl Filter {
         self.config.min_year.is_some_and(|min| year < min)
     }
 
+    pub fn should_prune_post_score(&self, score: Option<i64>) -> bool {
+        below_min_magnitude(score, self.config.min_post_score_magnitude)
+    }
+
+    pub fn should_prune_comment_score(&self, score: Option<i64>) -> bool {
+        below_min_magnitude(score, self.config.min_comment_score_magnitude)
+    }
+
     pub fn should_prune_author(&self, author: &str) -> bool {
         let trimmed = author.trim_ascii();
         self.config.prune_authors.iter().any(|a| a == trimmed)
@@ -722,18 +749,24 @@ impl Filter {
     }
 }
 
+/// Null scores are not pruned, since scores are apparently missing for some periods
+fn below_min_magnitude(score: Option<i64>, min: Option<u64>) -> bool {
+    score.zip(min).is_some_and(|(s, m)| s.unsigned_abs() < m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, LargeStringArray, StringArray};
 
-    /// (created_utc, subreddit, title, selftext, author_name)
+    /// (created_utc, subreddit, title, selftext, author_name, score)
     type PostRow = (
         i64,
         Option<&'static str>,
         &'static str,
         Option<&'static str>,
         Option<&'static str>,
+        Option<i64>,
     );
 
     fn test_config() -> DatasetConfig {
@@ -749,6 +782,8 @@ mod tests {
             prune_texts: ["[removed]".into()].into_iter().collect(),
             prune_phrases: [].into_iter().collect(),
             prune_authors: ["AutoModerator".into()].into_iter().collect(),
+            min_post_score_magnitude: None,
+            min_comment_score_magnitude: None,
             total_vocab_size: 0,
             bpe_training_fused_merges: 1,
             use_pretokenization: false,
@@ -761,14 +796,35 @@ mod tests {
         // 2024-12-31T00:00:00Z and 2025-01-01T00:00:00Z.
         let (y2024, y2025) = (1_735_603_200, 1_735_689_600);
         let rows: [PostRow; 8] = [
-            (y2024, Some("a"), "t", Some("s"), Some("u")),
-            (y2024, Some("a"), "t", None, None),
-            (y2024, Some("b"), "t", Some("s"), Some("u")),
-            (y2025, Some("a"), "t", Some("s"), Some("u")),
-            (y2025, None, "t", Some("s"), Some("u")),
-            (y2025, Some("a"), " [removed] ", Some("s"), Some("u")),
-            (y2025, Some("a"), "t", Some("[removed]"), Some("u")),
-            (y2025, Some("b"), "t", Some("s"), Some("AutoModerator")),
+            (y2024, Some("a"), "t", Some("s"), Some("u"), Some(5)),
+            (y2024, Some("a"), "t", None, None, Some(-3)),
+            (y2024, Some("b"), "t", Some("s"), Some("u"), None),
+            (y2025, Some("a"), "t", Some("s"), Some("u"), Some(-2)),
+            (y2025, None, "t", Some("s"), Some("u"), Some(10)),
+            (
+                y2025,
+                Some("a"),
+                " [removed] ",
+                Some("s"),
+                Some("u"),
+                Some(10),
+            ),
+            (
+                y2025,
+                Some("a"),
+                "t",
+                Some("[removed]"),
+                Some("u"),
+                Some(10),
+            ),
+            (
+                y2025,
+                Some("b"),
+                "t",
+                Some("s"),
+                Some("AutoModerator"),
+                Some(10),
+            ),
         ];
         let batch = RecordBatch::try_from_iter([
             (
@@ -790,6 +846,10 @@ mod tests {
             (
                 "author_name",
                 Arc::new(StringArray::from_iter(rows.iter().map(|r| r.4))),
+            ),
+            (
+                "score",
+                Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.5))),
             ),
         ])
         .unwrap();
@@ -817,6 +877,31 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(counts, expected);
+
+        let mut counts = Strata::<u64>::default();
+        let config = DatasetConfig {
+            min_post_score_magnitude: Some(3),
+            ..test_config()
+        };
+        count_batch(&batch, &Filter::new(&config), &mut counts).unwrap();
+        let expected: Strata<u64> = [(
+            2024,
+            [("a".into(), 2), ("b".into(), 1)].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(counts, expected);
+    }
+
+    #[test]
+    fn score_magnitude_filter() {
+        assert!(!below_min_magnitude(Some(0), None));
+        assert!(!below_min_magnitude(None, Some(5)));
+        assert!(below_min_magnitude(Some(4), Some(5)));
+        assert!(below_min_magnitude(Some(-4), Some(5)));
+        assert!(!below_min_magnitude(Some(5), Some(5)));
+        assert!(!below_min_magnitude(Some(-5), Some(5)));
+        assert!(!below_min_magnitude(Some(i64::MIN), Some(1)));
     }
 
     #[test]

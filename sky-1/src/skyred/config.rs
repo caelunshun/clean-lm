@@ -30,6 +30,11 @@ pub struct DatasetConfig {
     pub prune_phrases: Vec<CompactString>,
     /// Matches exact author username. Case-sensitive.
     pub prune_authors: Vec<CompactString>,
+    /// Posts whose absolute score is below this are excluded.
+    #[serde(default)]
+    pub min_post_score_magnitude: Option<u64>,
+    #[serde(default)]
+    pub min_comment_score_magnitude: Option<u64>,
     /// Total vocabulary size including special tokens.
     pub total_vocab_size: u32,
     pub tokenizer_train_sample_limit: Option<u64>,
