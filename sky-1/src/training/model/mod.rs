@@ -196,8 +196,6 @@ impl ResourceKey for Sky1ExecutorKey {
 pub struct Sky1SavedTensors {
     embedding_output: Tensor,
     decoder: Vec<DecoderSavedTensors>,
-    final_norm_r_inv: Tensor,
-    final_norm_result: Tensor,
     logits_grad: Tensor,
     loss: Tensor,
 }
@@ -244,7 +242,7 @@ impl Sky1Executor {
 
         let RmsNormForwardOutput {
             y: final_norm_result,
-            r_inv: final_norm_r_inv,
+            ..
         } = self.final_norm.rmsnorm_forward(
             &output,
             &weights.final_norm_gamma.bf16_weights().view(),
@@ -269,8 +267,6 @@ impl Sky1Executor {
         Ok(Sky1SavedTensors {
             embedding_output,
             decoder: decoder_saves,
-            final_norm_r_inv,
-            final_norm_result,
             logits_grad,
             loss,
         })
@@ -289,8 +285,18 @@ impl Sky1Executor {
         main_stream: &Stream,
         sidecar_stream: &Stream,
     ) -> anyhow::Result<()> {
+        let decoder_output = saves.decoder.last().unwrap().output().view();
+        let RmsNormForwardOutput {
+            y: final_norm_result,
+            r_inv: final_norm_r_inv,
+        } = self.final_norm.rmsnorm_forward(
+            &decoder_output,
+            &weights.final_norm_gamma.bf16_weights().view(),
+            main_stream,
+        )?;
+
         self.lm_head.backward_wgrad_accumulate(
-            &saves.final_norm_result.view(),
+            &final_norm_result.view(),
             &saves.logits_grad.view(),
             &mut weights.lm_head.gradients.view_mut(),
             sidecar_stream,
@@ -303,11 +309,11 @@ impl Sky1Executor {
         )?;
 
         let final_norm_ddata = self.final_norm.rmsnorm_backward(
-            &saves.decoder.last().unwrap().output().view(),
+            &decoder_output,
             &lm_head_ddata.view(),
             None,
             &weights.final_norm_gamma.bf16_weights_replica.view(),
-            &saves.final_norm_r_inv.view(),
+            &final_norm_r_inv.view(),
             &mut weights.final_norm_gamma.gradients.view_mut(),
             main_stream,
         )?;

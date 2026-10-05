@@ -293,8 +293,6 @@ impl DecoderWeights {
 /// Saved tensors for the backward pass.
 #[derive(Debug)]
 pub struct DecoderSavedTensors {
-    pre_qkv_norm_r_inv: Tensor,
-    pre_qkv_norm_result: Tensor,
     qkv_proj_result: Tensor,
     // q_norm_result: Tensor,
     // q_norm_r_inv: Tensor,
@@ -303,8 +301,6 @@ pub struct DecoderSavedTensors {
     attn_result: Tensor,
     attn_stats: Tensor,
     o_proj_result: Tensor,
-    pre_ffn_norm_result: Tensor,
-    pre_ffn_norm_r_inv: Tensor,
     ffn_up_result: Tensor,
     ffn_gate_result: Tensor,
     ffn_gate_activation_result: Tensor,
@@ -346,7 +342,7 @@ impl DecoderExecutor {
         // --- Attention pre-norm --- //
         let RmsNormForwardOutput {
             y: pre_qkv_norm_result,
-            r_inv: pre_qkv_norm_r_inv,
+            ..
         } = self.pre_qkv_norm.rmsnorm_forward(
             x,
             &weights.pre_qkv_norm_gamma.bf16_weights().view(),
@@ -464,7 +460,7 @@ impl DecoderExecutor {
         // --- FFN pre-norm --- //
         let RmsNormForwardOutput {
             y: pre_ffn_norm_result,
-            r_inv: pre_ffn_norm_r_inv,
+            ..
         } = self.pre_ffn_norm.rmsnorm_forward(
             &o_proj_result.view(),
             &weights.pre_ffn_norm_gamma.bf16_weights().view(),
@@ -496,8 +492,6 @@ impl DecoderExecutor {
         )?;
 
         Ok(DecoderSavedTensors {
-            pre_qkv_norm_r_inv,
-            pre_qkv_norm_result,
             qkv_proj_result,
             // q_norm_result,
             // q_norm_r_inv,
@@ -506,8 +500,6 @@ impl DecoderExecutor {
             attn_result,
             attn_stats,
             o_proj_result,
-            pre_ffn_norm_result,
-            pre_ffn_norm_r_inv,
             ffn_up_result,
             ffn_gate_result,
             ffn_gate_activation_result,
@@ -551,9 +543,19 @@ impl DecoderExecutor {
             main_stream,
         )?;
 
+        // --- FFN pre-norm recomputation --- //
+        let RmsNormForwardOutput {
+            y: pre_ffn_norm_result,
+            r_inv: pre_ffn_norm_r_inv,
+        } = self.pre_ffn_norm.rmsnorm_forward(
+            &saves.o_proj_result.view(),
+            &weights.pre_ffn_norm_gamma.bf16_weights().view(),
+            main_stream,
+        )?;
+
         // --- FFN up ---
         self.ffn.backward_up_gate_proj_wgrad_accumulate(
-            &saves.pre_ffn_norm_result.view(),
+            &pre_ffn_norm_result.view(),
             &ffn_up_dy.view(),
             &mut weights.ffn_up.gradients.view_mut(),
             sidecar_stream,
@@ -567,7 +569,7 @@ impl DecoderExecutor {
 
         // --- FFN gate ---
         self.ffn.backward_up_gate_proj_wgrad_accumulate(
-            &saves.pre_ffn_norm_result.view(),
+            &pre_ffn_norm_result.view(),
             &ffn_gate_dy.view(),
             &mut weights.ffn_gate.gradients.view_mut(),
             sidecar_stream,
@@ -586,7 +588,7 @@ impl DecoderExecutor {
             &ffn_dx.view(),
             Some(dy),
             &weights.pre_ffn_norm_gamma.bf16_weights_replica.view(),
-            &saves.pre_ffn_norm_r_inv.view(),
+            &pre_ffn_norm_r_inv.view(),
             &mut weights.pre_ffn_norm_gamma.gradients.view_mut(),
             main_stream,
         )?;
@@ -640,9 +642,19 @@ impl DecoderExecutor {
 
         let dqkv = dqkv.reshaped([batch_size, self.config.qkv_features()]);
 
+        // --- Pre-QKV norm recomputation --- //
+        let RmsNormForwardOutput {
+            y: pre_qkv_norm_result,
+            r_inv: pre_qkv_norm_r_inv,
+        } = self.pre_qkv_norm.rmsnorm_forward(
+            x,
+            &weights.pre_qkv_norm_gamma.bf16_weights().view(),
+            main_stream,
+        )?;
+
         // --- QKV-proj --- //
         self.qkv_proj.backward_wgrad_accumulate(
-            &saves.pre_qkv_norm_result.view(),
+            &pre_qkv_norm_result.view(),
             &dqkv,
             &mut weights.qkv_proj.gradients.view_mut(),
             sidecar_stream,
@@ -660,7 +672,7 @@ impl DecoderExecutor {
             &qkv_ddata.view(),
             Some(&pre_ffn_norm_dx.view()),
             &weights.pre_qkv_norm_gamma.bf16_weights_replica.view(),
-            &saves.pre_qkv_norm_r_inv.view(),
+            &pre_qkv_norm_r_inv.view(),
             &mut weights.pre_qkv_norm_gamma.gradients.view_mut(),
             main_stream,
         )?;
