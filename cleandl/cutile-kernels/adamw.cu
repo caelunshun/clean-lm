@@ -80,7 +80,7 @@ adamw_weight_update_clipped_f32grad_f32master_bf16replica_4096_persistent(
                                               ct::round_subnormals_to_zero_t{}) +
                                      1e-8f),
                                     ct::round_approximate_t{}, ct::round_subnormals_to_zero_t{}) +
-                            (weight_decay * lr) * weight_tile);
+                            weight_decay * weight_tile);
 
         weight_view.store_masked(weight_tile, i);
         weight_bf16_replica_view.store_masked(

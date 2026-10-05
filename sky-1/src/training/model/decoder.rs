@@ -151,7 +151,10 @@ impl DecoderWeights {
     ) -> anyhow::Result<Self> {
         let ffn_up_gate_stdev = 1.0 / (config.blocks.hidden_size as f32).sqrt();
         let o_proj_stdev = 1.0
-            / (config.blocks.hidden_size as f32 * 2.0 * config.num_decoder_blocks as f32).sqrt();
+            / ((config.blocks.head_dim * config.blocks.num_decoder_q_heads) as f32
+                * 2.0
+                * config.num_decoder_blocks as f32)
+                .sqrt();
         let ffn_down_stdev = 1.0
             / (config.blocks.ffn_intermediate_size as f32 * 2.0 * config.num_decoder_blocks as f32)
                 .sqrt();
