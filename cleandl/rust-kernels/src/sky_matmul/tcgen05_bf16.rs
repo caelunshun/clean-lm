@@ -29,7 +29,6 @@
 //! * Warp 3: Epilogue TMA stores
 //! * Warps 4..12: Epilogue compute warps
 
-use crate::lane_id;
 use core::{f32::consts::LOG2_E, mem};
 use cuda_device::{
     Barrier, DynamicSharedArray, TmaDescriptor,

@@ -161,6 +161,9 @@ fn rmsnorm_bf16_warp_persistent<
 
         // Replicate gamma into registers.
         let mut thr_gamma = [bf16::ZERO; { VECTOR_SIZE / WARP_SIZE as usize }];
+        assert!(
+            VECTOR_SIZE.is_multiple_of(WARP_SIZE as usize * elements_per_u128::<bf16>() as usize)
+        );
         let chunks_per_thread = VECTOR_SIZE as u32 / WARP_SIZE / elements_per_u128::<bf16>();
         #[llvm_unroll]
         for j in 0..chunks_per_thread {
@@ -335,6 +338,29 @@ pub fn rmsnorm_bf16_warp_persistent_inner2048(
     }
 
     rmsnorm_bf16_warp_persistent::<2048, PREFETCH_STAGES, 12>(
+        gmem_x, gmem_gamma, gmem_y, gmem_r_inv, num_rows,
+    );
+}
+
+#[kernel]
+#[launch_bounds(384, 1)]
+pub fn rmsnorm_bf16_warp_persistent_inner1536(
+    gmem_x: *const bf16,
+    gmem_gamma: *const bf16,
+    gmem_y: *mut bf16,
+    gmem_r_inv: *mut f32,
+    num_rows: u32,
+) {
+    cfg_select! {
+        has_227kb_smem => {
+            const PREFETCH_STAGES: usize = 3;
+        }
+        _ => {
+            const PREFETCH_STAGES: usize = 1;
+        }
+    }
+
+    rmsnorm_bf16_warp_persistent::<1536, PREFETCH_STAGES, 12>(
         gmem_x, gmem_gamma, gmem_y, gmem_r_inv, num_rows,
     );
 }
@@ -735,6 +761,39 @@ pub fn rmsnorm_bwd_bf16_cta_persistent_inner2048(
     }
 
     rmsnorm_bwd_bf16_cta_persistent::<2048, 4, PREFETCH_STAGES, 8>(
+        gmem_x,
+        gmem_dy,
+        gmem_residual_gradient_stream,
+        gmem_gamma,
+        gmem_r_inv,
+        gmem_dx,
+        gmem_dgamma,
+        num_rows,
+    );
+}
+
+#[kernel]
+#[launch_bounds(64, 1)]
+pub fn rmsnorm_bwd_bf16_cta_persistent_inner1536(
+    gmem_x: *const bf16,
+    gmem_dy: *const bf16,
+    gmem_residual_gradient_stream: *const bf16,
+    gmem_gamma: *const bf16,
+    gmem_r_inv: *const f32,
+    gmem_dx: *mut bf16,
+    gmem_dgamma: *mut DeviceAtomicF32,
+    num_rows: u32,
+) {
+    cfg_select! {
+        has_227kb_smem => {
+            const PREFETCH_STAGES: usize = 3;
+        }
+        _ => {
+            const PREFETCH_STAGES: usize = 1;
+        }
+    }
+
+    rmsnorm_bwd_bf16_cta_persistent::<1536, 4, PREFETCH_STAGES, 2>(
         gmem_x,
         gmem_dy,
         gmem_residual_gradient_stream,

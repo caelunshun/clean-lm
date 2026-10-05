@@ -73,7 +73,8 @@ impl NormExecutor {
         let kernel = self.module.get_function(kernel_name)?;
         kernel.set_max_dynamic_smem(dynamic_smem)?;
 
-        let occupancy = stream.device().sm_count();
+        let occupancy = stream.device().sm_count()
+            * kernel.max_active_blocks_per_sm(cta_threads, dynamic_smem)?;
 
         {
             let x_memory = x.storage();
@@ -157,7 +158,8 @@ impl NormExecutor {
         let kernel = self.module.get_function(kernel_name)?;
         kernel.set_max_dynamic_smem(dynamic_smem)?;
 
-        let occupancy = stream.device().sm_count();
+        let occupancy = stream.device().sm_count()
+            * kernel.max_active_blocks_per_sm(cta_threads, dynamic_smem)?;
 
         {
             let x_memory = x.storage();
@@ -217,6 +219,11 @@ fn fwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec>
             cta_threads: 384,
             dynamic_smem: fwd_required_smem(2048, prefetch_stages(cx), 12, cx),
         }),
+        1536 => Ok(KernelSpec {
+            name: "rmsnorm_bf16_warp_persistent_inner1536",
+            cta_threads: 384,
+            dynamic_smem: fwd_required_smem(1536, prefetch_stages(cx), 12, cx),
+        }),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
 }
@@ -227,6 +234,11 @@ fn bwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec>
             name: "rmsnorm_bwd_bf16_cta_persistent_inner2048",
             cta_threads: 256,
             dynamic_smem: bwd_required_smem(2048, 4, prefetch_stages(cx), 8),
+        }),
+        1536 => Ok(KernelSpec {
+            name: "rmsnorm_bwd_bf16_cta_persistent_inner1536",
+            cta_threads: 64,
+            dynamic_smem: bwd_required_smem(1536, 4, prefetch_stages(cx), 2),
         }),
         dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
