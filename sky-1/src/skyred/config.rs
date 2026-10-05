@@ -57,6 +57,7 @@ pub struct TrainingConfig {
     pub enable_autotuning: bool,
     pub steps_per_checkpoint: usize,
     pub max_kept_checkpoints: usize,
+    pub max_gpu_memory_gib: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

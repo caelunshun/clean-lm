@@ -81,6 +81,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         0,
         DeviceMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 40,
+            max_total_bytes: Some(config.training.max_gpu_memory_gib << 30),
         },
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 40,

@@ -32,6 +32,7 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
         0,
         DeviceMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
+            max_total_bytes: None,
         },
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,

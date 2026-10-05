@@ -324,7 +324,7 @@ impl DecoderExecutor {
         meta_tensors: &MetaTensors,
     ) -> anyhow::Result<&AttentionExecutor> {
         let num_sequences = meta_tensors.seqlen.len();
-        Ok(&self
+        Ok(self
             .attention_executors
             .range(num_sequences..)
             .next()
@@ -516,6 +516,7 @@ impl DecoderExecutor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn train_backward(
         &self,
         dy: &TensorView,
