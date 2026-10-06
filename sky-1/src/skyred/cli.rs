@@ -1,6 +1,12 @@
-use crate::skyred::{config::Config, dataset, training};
+use crate::skyred::{
+    config::{Config, SensitivePhrase},
+    dataset, training,
+};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{
+    io::{Write, stdin, stdout},
+    path::PathBuf,
+};
 
 #[derive(Debug, Parser)]
 pub struct Cli {
@@ -16,6 +22,7 @@ pub enum Command {
     TrainTokenizer,
     Tokenize,
     Train(training::Cli),
+    EncodeSensitivePhrase,
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -26,6 +33,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::TrainTokenizer => dataset::tokenization::train_tokenizer(&config.dataset)?,
         Command::Tokenize => dataset::tokenization::tokenize(&config.dataset)?,
         Command::Train(cli) => training::run(&cli, &config)?,
+        Command::EncodeSensitivePhrase => {
+            let mut phrase = String::new();
+            print!("Enter phrase: ");
+            stdout().flush()?;
+            stdin().read_line(&mut phrase)?;
+            let phrase = phrase.trim();
+            println!("{}", SensitivePhrase(phrase.into()).encode());
+        }
     }
 
     Ok(())

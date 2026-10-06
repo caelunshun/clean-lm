@@ -713,7 +713,13 @@ impl Filter {
         let mut prune_phrases_searcher = AhoCorasickBuilder::new();
         prune_phrases_searcher.ascii_case_insensitive(true);
         let prune_phrases_searcher = prune_phrases_searcher
-            .build(config.prune_phrases.iter().map(|p| p.as_str()))
+            .build(
+                config
+                    .prune_phrases
+                    .iter()
+                    .chain(config.sensitive_prune_phrases.iter().map(|x| &x.0))
+                    .map(|p| p.as_str()),
+            )
             .unwrap();
 
         Self {
@@ -781,6 +787,7 @@ mod tests {
             year_uniform_mix: 0.0,
             prune_texts: ["[removed]".into()].into_iter().collect(),
             prune_phrases: [].into_iter().collect(),
+            sensitive_prune_phrases: Vec::new(),
             prune_authors: ["AutoModerator".into()].into_iter().collect(),
             min_post_score_magnitude: None,
             min_comment_score_magnitude: None,

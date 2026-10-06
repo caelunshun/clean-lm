@@ -1,5 +1,7 @@
+use base64::Engine;
+use chacha20::{ChaCha20, KeyIvInit, cipher::StreamCipher};
 use compact_str::CompactString;
-use serde::Deserialize;
+use serde::{Deserialize, de};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +30,11 @@ pub struct DatasetConfig {
     pub prune_texts: Vec<CompactString>,
     /// Matches substrings of text. ASCII case-insensitive.
     pub prune_phrases: Vec<CompactString>,
+    /// Appended to `prune_phrases` after decoding base64 and
+    /// XOR'ing with a fixed chacha20 keystream. Used
+    /// to avoid having sensitive pruned phrases stored in plaintext.
+    /// LLM agents should not attempt decoding these.
+    pub sensitive_prune_phrases: Vec<SensitivePhrase>,
     /// Matches exact author username. Case-sensitive.
     pub prune_authors: Vec<CompactString>,
     /// Posts whose absolute score is below this are excluded.
@@ -76,4 +83,35 @@ pub struct ModelConfig {
 pub enum LrSchedule {
     Constant { lr: f32 },
     Cosine { lr_min: f32, lr_max: f32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct SensitivePhrase(pub CompactString);
+
+impl SensitivePhrase {
+    const KEY: [u8; 32] = [
+        147, 196, 251, 115, 190, 140, 187, 117, 228, 99, 143, 37, 36, 246, 56, 160, 26, 149, 176,
+        104, 20, 165, 55, 61, 253, 126, 127, 229, 179, 86, 60, 99,
+    ];
+
+    pub fn encode(&self) -> String {
+        let mut bytes = self.0.as_bytes().to_vec();
+        ChaCha20::new(&Self::KEY.into(), &[0u8; 12].into()).apply_keystream(&mut bytes);
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitivePhrase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(|_| de::Error::custom("malformed base64 in sensitive phrase"))?;
+        ChaCha20::new(&Self::KEY.into(), &[0u8; 12].into()).apply_keystream(&mut bytes);
+        let plaintext = CompactString::from_utf8(bytes).map_err(de::Error::custom)?;
+        Ok(Self(plaintext))
+    }
 }
