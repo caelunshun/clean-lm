@@ -21,3 +21,8 @@ debug = "limited"
 inherits = "release"
 codegen-units = 1
 lto = "thin"
+
+[patch.'https://github.com/caelunshun/skycuda']
+skycuda = { path = "../skycuda" }
+skycuda-cudnn = { path = "../skycuda/skycuda-cudnn" }
+skycuda-cublaslt = { path = "../skycuda/skycuda-cublaslt" }

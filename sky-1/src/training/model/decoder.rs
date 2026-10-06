@@ -22,11 +22,12 @@ use cleandl::{
 };
 use rand::Rng;
 use serde::Serialize;
-use skycuda::stream::Stream;
+use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug)]
 pub struct DecoderExecutor {
+    cx: Context,
     config: BlocksConfig,
     pre_qkv_norm: Arc<NormExecutor>,
     qkv_proj: Arc<LinearExecutor>,
@@ -115,6 +116,7 @@ impl ResourceKey for DecoderExecutorKey {
         let optimizer = AdamWExecutor::get(cx)?;
 
         Ok(DecoderExecutor {
+            cx: cx.clone(),
             config: self.config.clone(),
             pre_qkv_norm,
             qkv_proj,
@@ -333,6 +335,7 @@ impl DecoderExecutor {
         x: &TensorView,
         meta_tensors: &MetaTensors,
         stream: &Stream,
+        activations_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<DecoderSavedTensors> {
         let &[batch_size, hidden_size] = x.shape().dims_slice() else {
             panic!()
@@ -350,10 +353,11 @@ impl DecoderExecutor {
         )?;
 
         // --- QKV projection --- //
-        let mut qkv_proj_result = self.qkv_proj.forward(
+        let mut qkv_proj_result = self.qkv_proj.forward_with_pool(
             &pre_qkv_norm_result.view(),
             &weights.qkv_proj.bf16_weights().view(),
             stream,
+            activations_pool,
         )?;
 
         let mut qkv_reshaped = qkv_proj_result.reshaped_mut([
@@ -436,18 +440,22 @@ impl DecoderExecutor {
         let AttentionForwardOutput {
             out: attn_result,
             stats: attn_stats,
-        } = self.select_attention_executor(meta_tensors)?.forward_attn(
-            &qkv_proj_result.reshaped([
-                batch_size,
-                self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
-                self.config.head_dim,
-            ]),
-            &meta_tensors.decoder_ragged_seqlen,
-            stream,
-        )?;
+        } = self
+            .select_attention_executor(meta_tensors)?
+            .forward_attn_with_pool(
+                &qkv_proj_result.reshaped([
+                    batch_size,
+                    self.config.num_decoder_q_heads + 2 * self.config.num_decoder_kv_heads,
+                    self.config.head_dim,
+                ]),
+                &meta_tensors.decoder_ragged_seqlen,
+                stream,
+                self.cx.device_memory_pool(),
+                activations_pool,
+            )?;
 
         // --- O-proj --- //
-        let o_proj_result = self.o_proj.forward_with_residual(
+        let o_proj_result = self.o_proj.forward_with_residual_with_pool(
             &attn_result.reshaped([
                 batch_size,
                 self.config.head_dim * self.config.num_decoder_q_heads,
@@ -455,6 +463,7 @@ impl DecoderExecutor {
             &weights.o_proj.bf16_weights().view(),
             x,
             stream,
+            activations_pool,
         )?;
 
         // --- FFN pre-norm --- //
@@ -468,27 +477,30 @@ impl DecoderExecutor {
         )?;
 
         // --- FFN --- //
-        let ffn_up_result = self.ffn.forward_up_proj(
+        let ffn_up_result = self.ffn.forward_up_proj_with_pool(
             &pre_ffn_norm_result.view(),
             &weights.ffn_up.bf16_weights().view(),
             stream,
+            activations_pool,
         )?;
 
         let GateProjForwardOutput {
             gate: ffn_gate_result,
             activation: ffn_gate_activation_result,
-        } = self.ffn.forward_gate_proj(
+        } = self.ffn.forward_gate_proj_with_pool(
             &pre_ffn_norm_result.view(),
             &ffn_up_result.view(),
             &weights.ffn_gate.bf16_weights().view(),
             stream,
+            activations_pool,
         )?;
 
-        let ffn_down_result = self.ffn.forward_down_proj(
+        let ffn_down_result = self.ffn.forward_down_proj_with_pool(
             &ffn_gate_activation_result.view(),
             &weights.ffn_down.bf16_weights().view(),
             &o_proj_result.view(),
             stream,
+            activations_pool,
         )?;
 
         Ok(DecoderSavedTensors {
@@ -517,6 +529,7 @@ impl DecoderExecutor {
         meta_tensors: &MetaTensors,
         main_stream: &Stream,
         sidecar_stream: &Stream,
+        activations_pool: &DeviceMemoryPool
     ) -> anyhow::Result<Tensor> {
         let &[batch_size, _] = dy.shape().dims_slice() else {
             panic!()
@@ -626,6 +639,7 @@ impl DecoderExecutor {
                 ]),
                 &saves.attn_stats.view(),
                 main_stream,
+                activations_pool
             )?;
 
         let mut dqk = dqkv.sliced_mut(

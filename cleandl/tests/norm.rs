@@ -31,10 +31,7 @@ const DGAMMA_REL_TOLERANCE: f32 = 1e-3;
 fn rms_prenorm() -> anyhow::Result<()> {
     let cx = Context::new(
         0,
-        DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 1 << 30,
-            max_total_bytes: None,
-        },
+        DeviceMemoryPoolOptions::default(),
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },

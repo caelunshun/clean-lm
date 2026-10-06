@@ -3,7 +3,7 @@ use crate::{
     include_cubins,
     tensor::{Tensor, TensorView, TensorViewMut},
 };
-use skycuda::{module::Module, stream::Stream};
+use skycuda::{device_memory_pool::DeviceMemoryPool, module::Module, stream::Stream};
 use skytens_core::{
     data_type::{ElementType, FloatType, UIntType},
     shape::Shape,
@@ -22,11 +22,12 @@ impl EmbeddingExecutor {
     }
 
     /// Returns the looked-up embeddings as bf16 `[num_tokens, embed_dim]`.
-    pub fn embedding_lookup(
+    pub fn embedding_lookup_with_pool(
         &self,
         embedding_table: &TensorView<'_>,
         token_indices: &TensorView<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Tensor> {
         assert_eq!(
             embedding_table.element_type(),
@@ -50,10 +51,11 @@ impl EmbeddingExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_embeddings = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 Shape::new([num_tokens, embed_dim]),
                 ElementType::Float(FloatType::Bf16),
                 &self.cx,
+                pool,
             )?
         };
 
@@ -83,6 +85,20 @@ impl EmbeddingExecutor {
         }
 
         Ok(out_embeddings)
+    }
+
+    pub fn embedding_lookup(
+        &self,
+        embedding_table: &TensorView<'_>,
+        token_indices: &TensorView<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<Tensor> {
+        self.embedding_lookup_with_pool(
+            embedding_table,
+            token_indices,
+            stream,
+            self.cx.device_memory_pool(),
+        )
     }
 
     /// Accumulates the embedding-table gradient in-place; `dl_din` must be pre-zeroed.

@@ -3,7 +3,7 @@ use crate::{
     cudnn::{CudnnGraphBuilder, ExecutableCudnnGraph},
     tensor::{Tensor, TensorView, VirtTensorView},
 };
-use skycuda::stream::Stream;
+use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use skycuda_cudnn::{SdpaAttributes, SdpaBackwardAttributes, TensorId};
 use skytens_core::{
     data_type::{ElementType, FloatType, SIntType},
@@ -159,7 +159,7 @@ impl AttentionExecutor {
         shape[0]
     }
 
-    fn new_stats(&self, num_tokens: usize) -> anyhow::Result<Tensor> {
+    fn new_stats(&self, num_tokens: usize, pool: &DeviceMemoryPool) -> anyhow::Result<Tensor> {
         let shape = if self.ragged_stats {
             Shape::new([num_tokens, self.config.q_heads])
         } else {
@@ -169,7 +169,7 @@ impl AttentionExecutor {
                 self.config.q_heads,
             ])
         };
-        Tensor::new_zeroed(shape, ElementType::Float(FloatType::F32), &self.cx)
+        Tensor::new_zeroed_with_pool(shape, ElementType::Float(FloatType::F32), &self.cx, pool)
     }
 
     /// Shape of stats as returned by [`Self::new_stats`], in the layout bound in the graphs.
@@ -188,22 +188,26 @@ impl AttentionExecutor {
     }
 
     /// `qkv` expected as packed row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`.
-    pub fn forward_attn(
+    /// Outputs are allocated from `pool`; the cuDNN workspace from `workspace_pool`.
+    pub fn forward_attn_with_pool(
         &self,
         qkv: &TensorView<'_>,
         seqlens: &RaggedSeqlenTensors,
         stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<AttentionForwardOutput> {
         let b = self.config.max_num_sequences;
         let num_tokens = self.check_qkv(qkv);
         assert!(num_tokens <= self.config.max_total_tokens);
 
-        let mut out = Tensor::new_zeroed(
+        let mut out = Tensor::new_zeroed_with_pool(
             [num_tokens, self.config.q_heads, self.config.head_dim],
             qkv.element_type(),
             &self.cx,
+            pool,
         )?;
-        let mut out_stats = self.new_stats(num_tokens)?;
+        let mut out_stats = self.new_stats(num_tokens, pool)?;
         let stats_shape = self.stats_graph_shape(num_tokens);
 
         let [offset_q, offset_k, offset_v, offset_o, offset_stats] = [
@@ -243,6 +247,7 @@ impl AttentionExecutor {
                 (self.forward_output_stats, stats_view),
             ],
             stream,
+            workspace_pool,
         )?;
         Ok(AttentionForwardOutput {
             out,
@@ -250,10 +255,28 @@ impl AttentionExecutor {
         })
     }
 
+    pub fn forward_attn(
+        &self,
+        qkv: &TensorView<'_>,
+        seqlens: &RaggedSeqlenTensors,
+        stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<AttentionForwardOutput> {
+        self.forward_attn_with_pool(
+            qkv,
+            seqlens,
+            stream,
+            workspace_pool,
+            self.cx.device_memory_pool(),
+        )
+    }
+
     /// `qkv` expected as packed row-major bf16 `[T, q_heads + 2 * kv_heads, head_dim]`.
     /// `out`, `out_grad` expected as row-major bf16 `[T, q_heads, head_dim]`.
     /// Stats expected as returned by [`Self::forward_attn`].
-    pub fn backward_attn(
+    /// Outputs are allocated from `pool`; the cuDNN workspace from `workspace_pool`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_attn_with_pool(
         &self,
         qkv: &TensorView<'_>,
         seqlens: &RaggedSeqlenTensors,
@@ -261,12 +284,15 @@ impl AttentionExecutor {
         out_grad: &TensorView<'_>,
         stats: &TensorView<'_>,
         stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<AttentionBackwardOutput> {
         let b = self.config.max_num_sequences;
         let num_tokens = self.check_qkv(qkv);
         assert!(num_tokens <= self.config.max_total_tokens);
 
-        let mut grad_qkv = Tensor::new_zeroed(qkv.shape(), qkv.element_type(), &self.cx)?;
+        let mut grad_qkv =
+            Tensor::new_zeroed_with_pool(qkv.shape(), qkv.element_type(), &self.cx, pool)?;
 
         let stats_shape = self.stats_graph_shape(num_tokens);
         let stats = if self.ragged_stats {
@@ -304,8 +330,32 @@ impl AttentionExecutor {
             &inputs,
             &mut [(&self.backward_output_dqkv[..], grad_qkv.view_mut())],
             stream,
+            workspace_pool,
         )?;
         Ok(AttentionBackwardOutput { dqkv: grad_qkv })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn backward_attn(
+        &self,
+        qkv: &TensorView<'_>,
+        seqlens: &RaggedSeqlenTensors,
+        out: &TensorView<'_>,
+        out_grad: &TensorView<'_>,
+        stats: &TensorView<'_>,
+        stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<AttentionBackwardOutput> {
+        self.backward_attn_with_pool(
+            qkv,
+            seqlens,
+            out,
+            out_grad,
+            stats,
+            stream,
+            workspace_pool,
+            self.cx.device_memory_pool(),
+        )
     }
 }
 

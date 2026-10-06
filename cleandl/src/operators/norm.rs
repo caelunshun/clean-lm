@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::bail;
 use half::bf16;
-use skycuda::{module::Module, stream::Stream};
+use skycuda::{device_memory_pool::DeviceMemoryPool, module::Module, stream::Stream};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
@@ -33,11 +33,12 @@ impl NormExecutor {
     }
 
     /// Computes `RMSNorm(x) * gamma`
-    pub fn rmsnorm_forward(
+    pub fn rmsnorm_forward_with_pool(
         &self,
         x: &TensorView<'_>,
         gamma: &TensorView<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<RmsNormForwardOutput> {
         let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
@@ -50,18 +51,20 @@ impl NormExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_y = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 Shape::new([batch_size, inner_dim]),
                 ElementType::Float(FloatType::Bf16),
                 &self.cx,
+                pool,
             )?
         };
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_r_inv = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 Shape::new([batch_size]),
                 ElementType::Float(FloatType::F32),
                 &self.cx,
+                pool,
             )?
         };
 
@@ -103,11 +106,20 @@ impl NormExecutor {
         })
     }
 
+    pub fn rmsnorm_forward(
+        &self,
+        x: &TensorView<'_>,
+        gamma: &TensorView<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<RmsNormForwardOutput> {
+        self.rmsnorm_forward_with_pool(x, gamma, stream, self.cx.device_memory_pool())
+    }
+
     /// Backward pass for [`Self::rmsnorm_forward`], returning `dx`.
     ///
     /// `out_dgamma` is accumulated into by the kernel, so it must be pre-zeroed.
     #[allow(clippy::too_many_arguments)]
-    pub fn rmsnorm_backward(
+    pub fn rmsnorm_backward_with_pool(
         &self,
         x: &TensorView<'_>,
         dy: &TensorView<'_>,
@@ -116,6 +128,7 @@ impl NormExecutor {
         r_inv: &TensorView<'_>,
         out_dgamma: &mut TensorViewMut<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Tensor> {
         let &[batch_size, inner_dim] = x.shape().dims_slice() else {
             panic!("wrong shape for prev_layer_output");
@@ -143,10 +156,11 @@ impl NormExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_dx = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 Shape::new([batch_size, inner_dim]),
                 ElementType::Float(FloatType::Bf16),
                 &self.cx,
+                pool,
             )?
         };
 
@@ -192,6 +206,29 @@ impl NormExecutor {
         }
 
         Ok(out_dx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_backward(
+        &self,
+        x: &TensorView<'_>,
+        dy: &TensorView<'_>,
+        residual_gradient_stream: Option<&TensorView<'_>>,
+        gamma: &TensorView<'_>,
+        r_inv: &TensorView<'_>,
+        out_dgamma: &mut TensorViewMut<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<Tensor> {
+        self.rmsnorm_backward_with_pool(
+            x,
+            dy,
+            residual_gradient_stream,
+            gamma,
+            r_inv,
+            out_dgamma,
+            stream,
+            self.cx.device_memory_pool(),
+        )
     }
 }
 

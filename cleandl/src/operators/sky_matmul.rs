@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 use skycuda::{
+    device_memory_pool::DeviceMemoryPool,
     function::Function,
     launch::LaunchBuilder,
     stream::Stream,
@@ -72,12 +73,13 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
     }
 
     /// Computes `epilogue(a @ b)`, where `a` is `[m, k]` and `b` is `[k, n]`.
-    pub fn execute(
+    pub fn execute_with_pool(
         &self,
         a: &TensorView,
         b: &TensorView,
         epilogue_args: E::Args<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<E::Outputs> {
         let &[m, k] = a.shape().dims_slice() else {
             panic!("A must be a matrix");
@@ -91,14 +93,14 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
             Backend::Native(native) => {
                 validate_matrix(a, m, k, self.config.format_a);
                 validate_matrix(b, k, n, self.config.format_b);
-                self.execute_native(native, a, b, m, n, k, epilogue_args, stream)
+                self.execute_native(native, a, b, m, n, k, epilogue_args, stream, pool)
             }
             Backend::Fallback { matmul, epilogue } => {
-                let product = matmul.matmul(a, b, None, stream)?;
+                let product = matmul.matmul_with_pool(a, b, None, stream, pool)?;
                 let mut outputs = self
                     .config
                     .epilogue
-                    .alloc_fallback_outputs(product, &self.cx)?;
+                    .alloc_fallback_outputs(product, &self.cx, pool)?;
                 if let Some(epilogue_kernel) = epilogue {
                     let mut launch = stream.launch_builder(epilogue_kernel);
                     let (grid_x, grid_y, grid_z) =
@@ -116,6 +118,16 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         }
     }
 
+    pub fn execute(
+        &self,
+        a: &TensorView,
+        b: &TensorView,
+        epilogue_args: E::Args<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<E::Outputs> {
+        self.execute_with_pool(a, b, epilogue_args, stream, self.cx.device_memory_pool())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_native(
         &self,
@@ -127,6 +139,7 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         k: usize,
         epilogue_args: E::Args<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<E::Outputs> {
         assert!(m > 0 && n > 0 && k > 0, "empty matmuls are unsupported");
         assert!(k.is_multiple_of(8), "K must be a multiple of 8");
@@ -142,7 +155,7 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         let max_cgas = (self.cx.cuda().sm_count() / NATIVE_CGA_SIZE as usize).max(1);
         let num_cgas = u32::try_from(num_tiles.min(max_cgas))?;
 
-        let mut outputs = self.config.epilogue.alloc_outputs(m, n, &self.cx)?;
+        let mut outputs = self.config.epilogue.alloc_outputs(m, n, &self.cx, pool)?;
         {
             let a_tma = TensorMap::new(
                 a.storage(),
@@ -232,7 +245,13 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
     #[doc(hidden)]
     fn native_kernel_name(&self) -> &'static str;
     #[doc(hidden)]
-    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs>;
+    fn alloc_outputs(
+        &self,
+        m: usize,
+        n: usize,
+        cx: &Context,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Self::Outputs>;
     #[doc(hidden)]
     fn fallback_epilogue_kernel(&self, cx: &Context) -> anyhow::Result<Option<Function>>;
     /// Allocates the fallback outputs, possibly reusing the row-major `[m, n]` bf16
@@ -242,6 +261,7 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
         &self,
         product: Tensor,
         cx: &Context,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs>;
     /// Called after the common arguments (m, n, k, raster params, A/B descriptors)
     /// have been passed.
@@ -343,9 +363,15 @@ impl Epilogue for IdentityEpilogue {
         "sky_matmul_sm10x_128x256_2cta_64x6"
     }
 
-    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
+    fn alloc_outputs(
+        &self,
+        m: usize,
+        n: usize,
+        cx: &Context,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        unsafe { Tensor::new_uninit([m, n], BF16, cx) }
+        unsafe { Tensor::new_uninit_with_pool([m, n], BF16, cx, pool) }
     }
 
     fn fallback_epilogue_kernel(&self, _cx: &Context) -> anyhow::Result<Option<Function>> {
@@ -356,6 +382,7 @@ impl Epilogue for IdentityEpilogue {
         &self,
         product: Tensor,
         _cx: &Context,
+        _pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         Ok(product)
     }
@@ -408,12 +435,18 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         "sky_matmul_swiglu_gate_train_fwd_sm10x_128x256_2cta_64x6_epi1"
     }
 
-    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
+    fn alloc_outputs(
+        &self,
+        m: usize,
+        n: usize,
+        cx: &Context,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
         unsafe {
             Ok(SwiGluGateTrainFwdOutputs {
-                gate: Tensor::new_uninit([m, n], BF16, cx)?,
-                activation: Tensor::new_uninit([m, n], BF16, cx)?,
+                gate: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
+                activation: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
             })
         }
     }
@@ -430,9 +463,10 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         &self,
         product: Tensor,
         cx: &Context,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        let activation = unsafe { Tensor::new_uninit(product.shape(), BF16, cx)? };
+        let activation = unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, cx, pool)? };
         Ok(SwiGluGateTrainFwdOutputs {
             gate: product,
             activation,
@@ -515,12 +549,18 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
         "sky_matmul_swiglu_down_train_dgrad_sm10x_128x256_2cta_64x6_epi1"
     }
 
-    fn alloc_outputs(&self, m: usize, n: usize, cx: &Context) -> anyhow::Result<Self::Outputs> {
+    fn alloc_outputs(
+        &self,
+        m: usize,
+        n: usize,
+        cx: &Context,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
         unsafe {
             Ok(SwiGluDownTrainDgradOutputs {
-                dgate: Tensor::new_uninit([m, n], BF16, cx)?,
-                dx: Tensor::new_uninit([m, n], BF16, cx)?,
+                dgate: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
+                dx: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
             })
         }
     }
@@ -537,9 +577,10 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
         &self,
         product: Tensor,
         cx: &Context,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        let dgate = unsafe { Tensor::new_uninit(product.shape(), BF16, cx)? };
+        let dgate = unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, cx, pool)? };
         Ok(SwiGluDownTrainDgradOutputs { dgate, dx: product })
     }
 

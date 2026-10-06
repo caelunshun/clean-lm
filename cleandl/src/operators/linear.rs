@@ -4,7 +4,7 @@ use crate::{
     tensor::{Tensor, TensorView, TensorViewMut},
 };
 use serde::Serialize;
-use skycuda::stream::Stream;
+use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType};
 use std::sync::Arc;
 
@@ -26,16 +26,38 @@ impl LinearExecutor {
     }
 
     /// Returns the output activations `[batch_size, out_features]`.
+    pub fn forward_with_pool(
+        &self,
+        data: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.fwd.matmul_with_pool(data, weight, None, stream, pool)
+    }
+
     pub fn forward(
         &self,
         data: &TensorView<'_>,
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.fwd.matmul(data, weight, None, stream)
+        self.forward_with_pool(data, weight, stream, data.cx().device_memory_pool())
     }
 
     /// Returns the output activations `[batch_size, out_features]`.
+    pub fn forward_with_residual_with_pool(
+        &self,
+        data: &TensorView,
+        weight: &TensorView,
+        residual: &TensorView,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.fwd
+            .matmul_with_pool(data, weight, Some(residual), stream, pool)
+    }
+
     pub fn forward_with_residual(
         &self,
         data: &TensorView,
@@ -43,18 +65,34 @@ impl LinearExecutor {
         residual: &TensorView,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.fwd.matmul(data, weight, Some(residual), stream)
+        self.forward_with_residual_with_pool(
+            data,
+            weight,
+            residual,
+            stream,
+            data.cx().device_memory_pool(),
+        )
     }
 
     /// Returns the data gradient `[batch_size, in_features]`.
+    pub fn backward_dgrad_with_pool(
+        &self,
+        dy: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.bwd_dgrad
+            .matmul_with_pool(dy, &weight.transposed(0, 1), None, stream, pool)
+    }
+
     pub fn backward_dgrad(
         &self,
         dy: &TensorView<'_>,
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.bwd_dgrad
-            .matmul(dy, &weight.transposed(0, 1), None, stream)
+        self.backward_dgrad_with_pool(dy, weight, stream, dy.cx().device_memory_pool())
     }
 
     /// Accumulates the weight gradient into the f32 `gradient` `[in_features, out_features]`.

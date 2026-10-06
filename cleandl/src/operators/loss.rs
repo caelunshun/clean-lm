@@ -3,7 +3,7 @@ use crate::{
     include_cubins,
     tensor::{Tensor, TensorView},
 };
-use skycuda::{module::Module, stream::Stream};
+use skycuda::{device_memory_pool::DeviceMemoryPool, module::Module, stream::Stream};
 use skytens_core::{
     data_type::{ElementType, FloatType, UIntType},
     shape::Shape,
@@ -31,10 +31,11 @@ impl LossExecutor {
     }
 
     /// `x` has shape `[batch_size, hidden_size]`; the returned stats have shape `[batch_size]`.
-    pub fn online_softmax_stats(
+    pub fn online_softmax_stats_with_pool(
         &self,
         x: &TensorView<'_>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Tensor> {
         assert_eq!(x.element_type(), ElementType::Float(FloatType::Bf16));
         assert!(x.is_packed_row_major());
@@ -46,10 +47,11 @@ impl LossExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_stats = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 Shape::new([batch_size]),
                 ElementType::Float(FloatType::F32),
                 &self.cx,
+                pool,
             )?
         };
 
@@ -71,17 +73,26 @@ impl LossExecutor {
         Ok(out_stats)
     }
 
+    pub fn online_softmax_stats(
+        &self,
+        x: &TensorView<'_>,
+        stream: &Stream,
+    ) -> anyhow::Result<Tensor> {
+        self.online_softmax_stats_with_pool(x, stream, self.cx.device_memory_pool())
+    }
+
     /// `logits` has shape `[batch_size, num_classes]` and `stats` and `labels`
     /// shape `[batch_size]`. `labels_mask` has length `batch_size`; rows with a
     /// `false` entry are excluded from the loss and receive zero gradient, and the
     /// mean is taken over the unmasked rows only.
-    pub fn cross_entropy_loss_fwd_bwd(
+    pub fn cross_entropy_loss_fwd_bwd_with_pool(
         &self,
         logits: &TensorView<'_>,
         stats: &TensorView<'_>,
         labels: &TensorView<'_>,
         labels_mask: &[bool],
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<CrossEntropyLossOutput> {
         assert_eq!(logits.element_type(), ElementType::Float(FloatType::Bf16));
         assert_eq!(stats.element_type(), ElementType::Float(FloatType::F32));
@@ -118,14 +129,19 @@ impl LossExecutor {
         }
 
         // The loss is an atomic accumulator, so it relies on the allocation being zeroed.
-        let mut out_loss =
-            Tensor::new_zeroed(Shape::new([]), ElementType::Float(FloatType::F32), &self.cx)?;
+        let mut out_loss = Tensor::new_zeroed_with_pool(
+            Shape::new([]),
+            ElementType::Float(FloatType::F32),
+            &self.cx,
+            pool,
+        )?;
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out_logits_grad = unsafe {
-            Tensor::new_uninit(
+            Tensor::new_uninit_with_pool(
                 logits.shape(),
                 ElementType::Float(FloatType::Bf16),
                 &self.cx,
+                pool,
             )?
         };
 
@@ -158,6 +174,24 @@ impl LossExecutor {
             loss: out_loss,
             logits_grad: out_logits_grad,
         })
+    }
+
+    pub fn cross_entropy_loss_fwd_bwd(
+        &self,
+        logits: &TensorView<'_>,
+        stats: &TensorView<'_>,
+        labels: &TensorView<'_>,
+        labels_mask: &[bool],
+        stream: &Stream,
+    ) -> anyhow::Result<CrossEntropyLossOutput> {
+        self.cross_entropy_loss_fwd_bwd_with_pool(
+            logits,
+            stats,
+            labels,
+            labels_mask,
+            stream,
+            self.cx.device_memory_pool(),
+        )
     }
 }
 

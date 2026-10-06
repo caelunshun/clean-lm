@@ -3,7 +3,7 @@ use crate::{
     include_cubins,
     tensor::{Tensor, TensorView},
 };
-use skycuda::{module::Module, stream::Stream};
+use skycuda::{device_memory_pool::DeviceMemoryPool, module::Module, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType};
 use std::sync::Arc;
 
@@ -18,7 +18,12 @@ impl ConversionExecutor {
     }
 
     /// Converts a bf16 tensor to a newly allocated f32 tensor of the same shape.
-    pub fn bf16_to_f32(&self, bf16: &TensorView<'_>, stream: &Stream) -> anyhow::Result<Tensor> {
+    pub fn bf16_to_f32_with_pool(
+        &self,
+        bf16: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
         assert_eq!(bf16.element_type(), ElementType::Float(FloatType::Bf16));
         assert!(bf16.is_packed_row_major());
         let n = bf16.shape().element_count();
@@ -26,7 +31,12 @@ impl ConversionExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut f32 = unsafe {
-            Tensor::new_uninit(bf16.shape(), ElementType::Float(FloatType::F32), &self.cx)?
+            Tensor::new_uninit_with_pool(
+                bf16.shape(),
+                ElementType::Float(FloatType::F32),
+                &self.cx,
+                pool,
+            )?
         };
 
         let kernel = self.module.get_function("bf16_to_f32_16384")?;
@@ -46,8 +56,17 @@ impl ConversionExecutor {
         Ok(f32)
     }
 
+    pub fn bf16_to_f32(&self, bf16: &TensorView<'_>, stream: &Stream) -> anyhow::Result<Tensor> {
+        self.bf16_to_f32_with_pool(bf16, stream, self.cx.device_memory_pool())
+    }
+
     /// Converts an f32 tensor to a newly allocated bf16 tensor of the same shape.
-    pub fn f32_to_bf16(&self, f32: &TensorView<'_>, stream: &Stream) -> anyhow::Result<Tensor> {
+    pub fn f32_to_bf16_with_pool(
+        &self,
+        f32: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
         assert_eq!(f32.element_type(), ElementType::Float(FloatType::F32));
         assert!(f32.is_packed_row_major());
         let n = f32.shape().element_count();
@@ -55,7 +74,12 @@ impl ConversionExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut bf16 = unsafe {
-            Tensor::new_uninit(f32.shape(), ElementType::Float(FloatType::Bf16), &self.cx)?
+            Tensor::new_uninit_with_pool(
+                f32.shape(),
+                ElementType::Float(FloatType::Bf16),
+                &self.cx,
+                pool,
+            )?
         };
 
         let kernel = self.module.get_function("f32_to_bf16_16384")?;
@@ -73,6 +97,10 @@ impl ConversionExecutor {
         }
 
         Ok(bf16)
+    }
+
+    pub fn f32_to_bf16(&self, f32: &TensorView<'_>, stream: &Stream) -> anyhow::Result<Tensor> {
+        self.f32_to_bf16_with_pool(f32, stream, self.cx.device_memory_pool())
     }
 }
 

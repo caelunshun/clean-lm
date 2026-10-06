@@ -11,7 +11,7 @@ use crate::{
     tensor::{Tensor, TensorView, TensorViewMut},
 };
 use serde::Serialize;
-use skycuda::stream::Stream;
+use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType};
 use std::sync::Arc;
 
@@ -61,16 +61,41 @@ impl SwiGluFfnExecutor {
     }
 
     /// Returns the up projection `[batch_size, intermediate_features]`.
+    pub fn forward_up_proj_with_pool(
+        &self,
+        data: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.fwd_up_proj
+            .matmul_with_pool(data, weight, None, stream, pool)
+    }
+
     pub fn forward_up_proj(
         &self,
         data: &TensorView<'_>,
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.fwd_up_proj.matmul(data, weight, None, stream)
+        self.forward_up_proj_with_pool(data, weight, stream, data.cx().device_memory_pool())
     }
 
     /// Gate projection fused with swish + hadamard product.
+    pub fn forward_gate_proj_with_pool(
+        &self,
+        data: &TensorView<'_>,
+        up: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<GateProjForwardOutput> {
+        let SwiGluGateTrainFwdOutputs { gate, activation } = self
+            .fwd_fused_gate
+            .execute_with_pool(data, weight, up, stream, pool)?;
+        Ok(GateProjForwardOutput { gate, activation })
+    }
+
     pub fn forward_gate_proj(
         &self,
         data: &TensorView<'_>,
@@ -78,12 +103,22 @@ impl SwiGluFfnExecutor {
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<GateProjForwardOutput> {
-        let SwiGluGateTrainFwdOutputs { gate, activation } =
-            self.fwd_fused_gate.execute(data, weight, up, stream)?;
-        Ok(GateProjForwardOutput { gate, activation })
+        self.forward_gate_proj_with_pool(data, up, weight, stream, data.cx().device_memory_pool())
     }
 
     /// Returns the FFN output `[batch_size, out_features]`, with the residual added.
+    pub fn forward_down_proj_with_pool(
+        &self,
+        activation: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        residual: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.fwd_down_proj
+            .matmul_with_pool(activation, weight, Some(residual), stream, pool)
+    }
+
     pub fn forward_down_proj(
         &self,
         activation: &TensorView<'_>,
@@ -91,8 +126,33 @@ impl SwiGluFfnExecutor {
         residual: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.fwd_down_proj
-            .matmul(activation, weight, Some(residual), stream)
+        self.forward_down_proj_with_pool(
+            activation,
+            weight,
+            residual,
+            stream,
+            activation.cx().device_memory_pool(),
+        )
+    }
+
+    pub fn backward_down_proj_dgrad_with_pool(
+        &self,
+        weight: &TensorView<'_>,
+        dy: &TensorView<'_>,
+        gate: &TensorView<'_>,
+        up: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<DownProjDgradOutput> {
+        let SwiGluDownTrainDgradOutputs { dgate, dx } =
+            self.bwd_down_proj_dgrad.execute_with_pool(
+                dy,
+                &weight.transposed(0, 1),
+                SwiGluDownTrainDgradArgs { gate, x: up },
+                stream,
+                pool,
+            )?;
+        Ok(DownProjDgradOutput { dgate, dup: dx })
     }
 
     pub fn backward_down_proj_dgrad(
@@ -103,13 +163,14 @@ impl SwiGluFfnExecutor {
         up: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<DownProjDgradOutput> {
-        let SwiGluDownTrainDgradOutputs { dgate, dx } = self.bwd_down_proj_dgrad.execute(
+        self.backward_down_proj_dgrad_with_pool(
+            weight,
             dy,
-            &weight.transposed(0, 1),
-            SwiGluDownTrainDgradArgs { gate, x: up },
+            gate,
+            up,
             stream,
-        )?;
-        Ok(DownProjDgradOutput { dgate, dup: dx })
+            dy.cx().device_memory_pool(),
+        )
     }
 
     pub fn backward_down_proj_wgrad_accumulate(
@@ -143,18 +204,45 @@ impl SwiGluFfnExecutor {
     }
 
     /// Returns the up-projection data gradient `[batch_size, in_features]`.
+    pub fn backward_up_proj_dgrad_with_pool(
+        &self,
+        dout: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.bwd_up_proj_dgrad
+            .matmul_with_pool(dout, &weight.transposed(0, 1), None, stream, pool)
+    }
+
     pub fn backward_up_proj_dgrad(
         &self,
         dout: &TensorView<'_>,
         weight: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.bwd_up_proj_dgrad
-            .matmul(dout, &weight.transposed(0, 1), None, stream)
+        self.backward_up_proj_dgrad_with_pool(dout, weight, stream, dout.cx().device_memory_pool())
     }
 
     /// Returns the total FFN data gradient `[batch_size, in_features]`, summing the
     /// gate-projection dgrad with `ddata_up`.
+    pub fn backward_gate_proj_dgrad_with_pool(
+        &self,
+        dout: &TensorView<'_>,
+        weight: &TensorView<'_>,
+        ddata_up: &TensorView<'_>,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
+        self.bwd_gate_proj_dgrad.matmul_with_pool(
+            dout,
+            &weight.transposed(0, 1),
+            Some(ddata_up),
+            stream,
+            pool,
+        )
+    }
+
     pub fn backward_gate_proj_dgrad(
         &self,
         dout: &TensorView<'_>,
@@ -162,8 +250,13 @@ impl SwiGluFfnExecutor {
         ddata_up: &TensorView<'_>,
         stream: &Stream,
     ) -> anyhow::Result<Tensor> {
-        self.bwd_gate_proj_dgrad
-            .matmul(dout, &weight.transposed(0, 1), Some(ddata_up), stream)
+        self.backward_gate_proj_dgrad_with_pool(
+            dout,
+            weight,
+            ddata_up,
+            stream,
+            dout.cx().device_memory_pool(),
+        )
     }
 }
 

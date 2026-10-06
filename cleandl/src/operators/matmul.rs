@@ -8,7 +8,9 @@ use rand::SeedableRng;
 use rand_distr::Uniform;
 use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
-use skycuda::{device_memory::DeviceVisibleMemoryMut, stream::Stream};
+use skycuda::{
+    device_memory::DeviceVisibleMemoryMut, device_memory_pool::DeviceMemoryPool, stream::Stream,
+};
 use skycuda_cublaslt::{
     Algorithm, ComputeType, DataType, MatmulDesc, MatmulPlan, MatmulPreference, MatrixLayout,
     Order, Scalar,
@@ -32,12 +34,13 @@ impl MatmulExecutor {
     }
 
     /// Returns the product as a freshly allocated tensor `[m, n]`.
-    pub fn matmul(
+    pub fn matmul_with_pool(
         &self,
         a: &TensorView<'_>,
         b: &TensorView<'_>,
         residual: Option<&TensorView>,
         stream: &Stream,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Tensor> {
         let (m, n, k) = self.validate_inputs(a, b);
 
@@ -56,8 +59,9 @@ impl MatmulExecutor {
         }
 
         // Soundness: the kernel overwrites the data before we can read it.
-        let mut out =
-            unsafe { Tensor::new_uninit([m, n], self.config.out_element_type, &self.cx)? };
+        let mut out = unsafe {
+            Tensor::new_uninit_with_pool([m, n], self.config.out_element_type, &self.cx, pool)?
+        };
 
         self.execute(
             a,
@@ -70,6 +74,16 @@ impl MatmulExecutor {
         )?;
 
         Ok(out)
+    }
+
+    pub fn matmul(
+        &self,
+        a: &TensorView<'_>,
+        b: &TensorView<'_>,
+        residual: Option<&TensorView>,
+        stream: &Stream,
+    ) -> anyhow::Result<Tensor> {
+        self.matmul_with_pool(a, b, residual, stream, a.cx().device_memory_pool())
     }
 
     /// Computes `out += a * b` in place. The executor must be configured

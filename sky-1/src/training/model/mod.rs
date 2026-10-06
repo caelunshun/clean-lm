@@ -21,7 +21,7 @@ use cleandl::{
 use decoder::{DecoderExecutor, DecoderSavedTensors, DecoderWeights};
 use rand::Rng;
 use serde::Serialize;
-use skycuda::stream::Stream;
+use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use skytens_core::data_type::{ElementType, FloatType};
 use std::sync::Arc;
 
@@ -207,6 +207,7 @@ impl Sky1SavedTensors {
 }
 
 impl Sky1Executor {
+    #[allow(clippy::too_many_arguments)]
     pub fn train_forward(
         &self,
         token_indices: &TensorView,
@@ -215,11 +216,13 @@ impl Sky1Executor {
         meta_tensors: &MetaTensors,
         weights: &Sky1Weights,
         stream: &Stream,
+        activations_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Sky1SavedTensors> {
-        let embedding_output = self.embedding.embedding_lookup(
+        let embedding_output = self.embedding.embedding_lookup_with_pool(
             &weights.embeddings.master_weights.view(),
             token_indices,
             stream,
+            activations_pool,
         )?;
 
         let mut decoder_saves: Vec<DecoderSavedTensors> = Vec::new();
@@ -234,6 +237,7 @@ impl Sky1Executor {
                 &block_input,
                 meta_tensors,
                 stream,
+                activations_pool,
             )?;
             decoder_saves.push(saves);
         }
@@ -256,13 +260,15 @@ impl Sky1Executor {
         )?;
 
         let loss_stats = self.loss.online_softmax_stats(&logits.view(), stream)?;
-        let CrossEntropyLossOutput { loss, logits_grad } = self.loss.cross_entropy_loss_fwd_bwd(
-            &logits.view(),
-            &loss_stats.view(),
-            labels,
-            labels_mask,
-            stream,
-        )?;
+        let CrossEntropyLossOutput { loss, logits_grad } =
+            self.loss.cross_entropy_loss_fwd_bwd_with_pool(
+                &logits.view(),
+                &loss_stats.view(),
+                labels,
+                labels_mask,
+                stream,
+                activations_pool,
+            )?;
 
         Ok(Sky1SavedTensors {
             embedding_output,
@@ -281,42 +287,47 @@ impl Sky1Executor {
         token_indices: &TensorView,
         meta_tensors: &MetaTensors,
         weights: &mut Sky1Weights,
-        saves: &Sky1SavedTensors,
+        saves: Sky1SavedTensors,
         main_stream: &Stream,
         sidecar_stream: &Stream,
+        activations_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<()> {
-        let decoder_output = saves.decoder.last().unwrap().output().view();
-        let RmsNormForwardOutput {
-            y: final_norm_result,
-            r_inv: final_norm_r_inv,
-        } = self.final_norm.rmsnorm_forward(
-            &decoder_output,
-            &weights.final_norm_gamma.bf16_weights().view(),
-            main_stream,
-        )?;
+        let final_norm_ddata = {
+            let decoder_output = saves.decoder.last().unwrap().output().view();
+            let RmsNormForwardOutput {
+                y: final_norm_result,
+                r_inv: final_norm_r_inv,
+            } = self.final_norm.rmsnorm_forward(
+                &decoder_output,
+                &weights.final_norm_gamma.bf16_weights().view(),
+                main_stream,
+            )?;
 
-        self.lm_head.backward_wgrad_accumulate(
-            &final_norm_result.view(),
-            &saves.logits_grad.view(),
-            &mut weights.lm_head.gradients.view_mut(),
-            sidecar_stream,
-        )?;
+            self.lm_head.backward_wgrad_accumulate(
+                &final_norm_result.view(),
+                &saves.logits_grad.view(),
+                &mut weights.lm_head.gradients.view_mut(),
+                sidecar_stream,
+            )?;
 
-        let lm_head_ddata = self.lm_head.backward_dgrad(
-            &saves.logits_grad.view(),
-            &weights.lm_head.bf16_weights().view(),
-            main_stream,
-        )?;
+            let lm_head_ddata = self.lm_head.backward_dgrad(
+                &saves.logits_grad.view(),
+                &weights.lm_head.bf16_weights().view(),
+                main_stream,
+            )?;
 
-        let final_norm_ddata = self.final_norm.rmsnorm_backward(
-            &decoder_output,
-            &lm_head_ddata.view(),
-            None,
-            &weights.final_norm_gamma.bf16_weights_replica.view(),
-            &final_norm_r_inv.view(),
-            &mut weights.final_norm_gamma.gradients.view_mut(),
-            main_stream,
-        )?;
+            self.final_norm.rmsnorm_backward(
+                &decoder_output,
+                &lm_head_ddata.view(),
+                None,
+                &weights.final_norm_gamma.bf16_weights_replica.view(),
+                &final_norm_r_inv.view(),
+                &mut weights.final_norm_gamma.gradients.view_mut(),
+                main_stream,
+            )?
+        };
+
+        drop(saves.logits_grad);
 
         let mut dy = final_norm_ddata;
         for i in (0..weights.decoder_blocks.len()).rev() {
@@ -333,6 +344,7 @@ impl Sky1Executor {
                 meta_tensors,
                 main_stream,
                 sidecar_stream,
+                activations_pool,
             )?;
         }
 

@@ -5,6 +5,7 @@ use rand::Rng;
 use rand_distr::Distribution;
 use skycuda::{
     device_memory::DeviceMemory,
+    device_memory_pool::DeviceMemoryPool,
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
@@ -24,19 +25,53 @@ pub struct Tensor {
 
 impl Tensor {
     /// Returns a zeroed, row-major tensor allocation.
-    pub fn new_zeroed(
+    #[track_caller]
+    pub fn new_zeroed_with_pool(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
         cx: &Context,
+        pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self> {
         let shape = shape.into();
         let element_type = element_type.into();
         let virt = VirtTensorView::new(shape, element_type);
         let allocation_bytes = virt.required_bytes();
 
-        let storage = cx
-            .device_memory_pool()
-            .alloc_zeroed_on(allocation_bytes, cx.memset_stream())?;
+        let storage = pool.alloc_zeroed_on(allocation_bytes, cx.memset_stream())?;
+
+        Ok(Self {
+            virt,
+            cx: cx.clone(),
+            storage,
+        })
+    }
+
+    /// Returns a zeroed, row-major tensor allocation.
+    #[track_caller]
+    pub fn new_zeroed(
+        shape: impl Into<Shape>,
+        element_type: impl Into<ElementType>,
+        cx: &Context,
+    ) -> anyhow::Result<Self> {
+        Self::new_zeroed_with_pool(shape, element_type, cx, cx.device_memory_pool())
+    }
+
+    /// # Safety
+    /// Tensor data must be written to before it is read, else the behavior
+    /// is undefined.
+    #[track_caller]
+    pub unsafe fn new_uninit_with_pool(
+        shape: impl Into<Shape>,
+        element_type: impl Into<ElementType>,
+        cx: &Context,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let element_type = element_type.into();
+        let virt = VirtTensorView::new(shape, element_type);
+        let allocation_bytes = virt.required_bytes();
+
+        let storage = unsafe { pool.alloc_uninit_on(allocation_bytes, cx.memset_stream())? };
 
         Ok(Self {
             virt,
@@ -48,31 +83,19 @@ impl Tensor {
     /// # Safety
     /// Tensor data must be written to before it is read, else the behavior
     /// is undefined.
+    #[track_caller]
     pub unsafe fn new_uninit(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
         cx: &Context,
     ) -> anyhow::Result<Self> {
-        let shape = shape.into();
-        let element_type = element_type.into();
-        let virt = VirtTensorView::new(shape, element_type);
-        let allocation_bytes = virt.required_bytes();
-
-        let storage = unsafe {
-            cx.device_memory_pool()
-                .alloc_uninit_on(allocation_bytes, cx.memset_stream())?
-        };
-
-        Ok(Self {
-            virt,
-            cx: cx.clone(),
-            storage,
-        })
+        unsafe { Self::new_uninit_with_pool(shape, element_type, cx, cx.device_memory_pool()) }
     }
 
     /// Returns a tensor sampled from the given distribution and RNG.
     ///
     /// Requires a shape and element type that has no per-row padding.
+    #[track_caller]
     pub fn from_distr<T: TensorElement>(
         distr: impl Distribution<T> + Send + Sync,
         rng: &mut impl Rng,
@@ -109,6 +132,7 @@ impl Tensor {
         })
     }
 
+    #[track_caller]
     pub fn from_slice<T: TensorElement>(
         slice: &[T],
         shape: impl Into<Shape>,
@@ -124,6 +148,7 @@ impl Tensor {
         )
     }
 
+    #[track_caller]
     pub fn from_bytes(
         bytes: &[u8],
         element_type: impl Into<ElementType>,

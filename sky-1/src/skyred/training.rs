@@ -80,14 +80,23 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     let cx = Context::new(
         0,
         DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 1 << 40,
-            max_total_bytes: Some(config.training.max_gpu_memory_gib << 30),
+            enable_profiling: true,
+            max_total_bytes: 0,
+            max_reserved_free_bytes: 2 << 30,
         },
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 40,
         },
         config.training.enable_autotuning,
     )?;
+    // let activations_pool = cx
+    //     .cuda()
+    //     .create_device_memory_pool(DeviceMemoryPoolOptions {
+    //         enable_profiling: true,
+    //         max_reserved_free_bytes: 2 << 30,
+    //         max_total_bytes: 0,
+    //     })?;
+    let activations_pool = cx.device_memory_pool().clone();
 
     let model_config = crate::model::Sky1Config {
         blocks: crate::model::BlocksConfig {
@@ -234,15 +243,17 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             &meta_tensors,
             &weights,
             cx.default_compute_stream(),
+            &activations_pool,
         )?;
         let loss = cx.download_from_device(saved_tensors.loss().storage(), cx.d2h_copy_stream())?;
         executor.train_backward(
             &token_indices.view(),
             &meta_tensors,
             &mut weights,
-            &saved_tensors,
+            saved_tensors,
             cx.default_compute_stream(),
             &sidecar_stream,
+            &activations_pool,
         )?;
 
         let loss = *bytemuck::from_bytes::<f32>(loss.view()?);

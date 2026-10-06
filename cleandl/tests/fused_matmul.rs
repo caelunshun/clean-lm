@@ -32,10 +32,7 @@ const ABS_TOLERANCE: f32 = 1e-3;
 fn fused_matmul() -> anyhow::Result<()> {
     let cx = Context::new(
         0,
-        DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 1 << 30,
-            max_total_bytes: None,
-        },
+        DeviceMemoryPoolOptions::default(),
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
@@ -88,6 +85,7 @@ fn fused_matmul() -> anyhow::Result<()> {
         ],
         &mut [(c_id, c.reshaped_mut([1, M_ACTUAL, N]))],
         &stream,
+        cx.device_memory_pool(),
     )?;
 
     // Read the result back to the host.

@@ -35,10 +35,7 @@ const ABS_TOLERANCE: f32 = 4e-3;
 fn attention() -> anyhow::Result<()> {
     let cx = Context::new(
         0,
-        DeviceMemoryPoolOptions {
-            max_reserved_free_bytes: 1 << 30,
-            max_total_bytes: None,
-        },
+        DeviceMemoryPoolOptions::default(),
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
@@ -99,8 +96,12 @@ fn attention() -> anyhow::Result<()> {
     let seqlens_host: Vec<u32> = SEQLENS.iter().map(|&len| len as u32).collect();
     let seqlen_tensors = RaggedSeqlenTensors::build(&seqlens_host, &cx, &config)?;
 
-    let AttentionForwardOutput { out, stats } =
-        executor.forward_attn(&qkv.view(), &seqlen_tensors, &stream)?;
+    let AttentionForwardOutput { out, stats } = executor.forward_attn(
+        &qkv.view(),
+        &seqlen_tensors,
+        &stream,
+        cx.device_memory_pool(),
+    )?;
 
     // Read the result back to the host.
     let out_staging = cx.download_from_device(out.storage(), &stream)?;
@@ -151,6 +152,7 @@ fn attention() -> anyhow::Result<()> {
         &out_grad.view(),
         &stats.view(),
         &stream,
+        cx.device_memory_pool(),
     )?;
     let dqkv_staging = cx.download_from_device(dqkv.storage(), &stream)?;
     stream.block_on()?;

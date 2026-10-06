@@ -4,6 +4,7 @@ use crate::{
     par_random,
     tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
+use anyhow::Context as _;
 use bumpalo::Bump;
 use rand::SeedableRng;
 use rand_distr::Uniform;
@@ -11,6 +12,7 @@ use rand_xoshiro::Xoroshiro128StarStar;
 use serde::{Deserialize, Serialize};
 use skycuda::{
     device_memory::DeviceMemory,
+    device_memory_pool::DeviceMemoryPool,
     host_pinned_memory::HostPinnedMemory,
     memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
@@ -365,12 +367,13 @@ impl ExecutableCudnnGraph {
         inputs: &[(TensorId, &TensorView<'_>)],
         outputs: &mut [(TensorId, TensorViewMut<'_>)],
         stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<()> {
         let mut outputs: Vec<(&[TensorId], TensorViewMut<'_>)> = outputs
             .iter_mut()
             .map(|(id, view)| (std::slice::from_ref(&*id), view.view_mut()))
             .collect();
-        self.execute_aliased(inputs, &mut outputs, stream)
+        self.execute_aliased(inputs, &mut outputs, stream, workspace_pool)
     }
 
     /// Like [`Self::execute`], but each output allocation may be bound to several
@@ -382,6 +385,7 @@ impl ExecutableCudnnGraph {
         inputs: &[(TensorId, &TensorView<'_>)],
         outputs: &mut [(&[TensorId], TensorViewMut<'_>)],
         stream: &Stream,
+        workspace_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<()> {
         assert_eq!(stream.device(), self.cx.cuda());
 
@@ -465,13 +469,19 @@ impl ExecutableCudnnGraph {
             variant_pack.add(*id, memory)?;
         }
 
+        let workspace_size = self
+            .graph
+            .workspace_size_at_index_for(self.best_plan, &variant_pack)?;
         // Soundness: cuDNN does not require an initialized workspace.
         let mut workspace = unsafe {
-            self.cx.device_memory_pool().alloc_uninit_on(
-                self.graph
-                    .workspace_size_at_index_for(self.best_plan, &variant_pack)?,
-                stream,
-            )?
+            workspace_pool
+                .alloc_uninit_on(workspace_size, stream)
+                .with_context(|| {
+                    format!(
+                        "failed to allocate workspace of {} MiB",
+                        workspace_size / 1024 / 1024
+                    )
+                })?
         };
 
         unsafe {
