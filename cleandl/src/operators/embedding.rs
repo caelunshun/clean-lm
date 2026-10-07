@@ -54,6 +54,7 @@ impl EmbeddingExecutor {
             Tensor::new_uninit_with_pool(
                 Shape::new([num_tokens, embed_dim]),
                 ElementType::Float(FloatType::Bf16),
+                stream,
                 &self.cx,
                 pool,
             )?

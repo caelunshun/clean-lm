@@ -159,7 +159,12 @@ impl AttentionExecutor {
         shape[0]
     }
 
-    fn new_stats(&self, num_tokens: usize, pool: &DeviceMemoryPool) -> anyhow::Result<Tensor> {
+    fn new_stats(
+        &self,
+        num_tokens: usize,
+        stream: &Stream,
+        pool: &DeviceMemoryPool,
+    ) -> anyhow::Result<Tensor> {
         let shape = if self.ragged_stats {
             Shape::new([num_tokens, self.config.q_heads])
         } else {
@@ -169,7 +174,13 @@ impl AttentionExecutor {
                 self.config.q_heads,
             ])
         };
-        Tensor::new_zeroed_with_pool(shape, ElementType::Float(FloatType::F32), &self.cx, pool)
+        Tensor::new_zeroed_with_pool(
+            shape,
+            ElementType::Float(FloatType::F32),
+            stream,
+            &self.cx,
+            pool,
+        )
     }
 
     /// Shape of stats as returned by [`Self::new_stats`], in the layout bound in the graphs.
@@ -204,10 +215,11 @@ impl AttentionExecutor {
         let mut out = Tensor::new_zeroed_with_pool(
             [num_tokens, self.config.q_heads, self.config.head_dim],
             qkv.element_type(),
+            stream,
             &self.cx,
             pool,
         )?;
-        let mut out_stats = self.new_stats(num_tokens, pool)?;
+        let mut out_stats = self.new_stats(num_tokens, stream, pool)?;
         let stats_shape = self.stats_graph_shape(num_tokens);
 
         let [offset_q, offset_k, offset_v, offset_o, offset_stats] = [
@@ -292,7 +304,7 @@ impl AttentionExecutor {
         assert!(num_tokens <= self.config.max_total_tokens);
 
         let mut grad_qkv =
-            Tensor::new_zeroed_with_pool(qkv.shape(), qkv.element_type(), &self.cx, pool)?;
+            Tensor::new_zeroed_with_pool(qkv.shape(), qkv.element_type(), stream, &self.cx, pool)?;
 
         let stats_shape = self.stats_graph_shape(num_tokens);
         let stats = if self.ragged_stats {

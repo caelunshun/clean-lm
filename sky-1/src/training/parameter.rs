@@ -41,7 +41,7 @@ impl Parameter {
         cx: &Context,
     ) -> anyhow::Result<Self> {
         let mut initial_master_weights =
-            Tensor::new_zeroed(shape, ElementType::Float(FloatType::F32), cx)?;
+            Tensor::new_zeroed(shape, ElementType::Float(FloatType::F32), stream, cx)?;
         stream.fill(initial_master_weights.storage_mut(), x)?;
         Self::with_initial_weights(initial_master_weights, stream, cx)
     }
@@ -57,16 +57,19 @@ impl Parameter {
         let adam_m = Tensor::new_zeroed(
             initial_master_weights.shape(),
             ElementType::Float(FloatType::F32),
+            stream,
             cx,
         )?;
         let adam_v = Tensor::new_zeroed(
             initial_master_weights.shape(),
             ElementType::Float(FloatType::F32),
+            stream,
             cx,
         )?;
         let gradients = Tensor::new_zeroed(
             initial_master_weights.shape(),
             ElementType::Float(FloatType::F32),
+            stream,
             cx,
         )?;
 
@@ -92,6 +95,7 @@ impl Parameter {
         let gradients = Tensor::new_zeroed(
             initial_master_weights.shape(),
             ElementType::Float(FloatType::F32),
+            stream,
             cx,
         )?;
 

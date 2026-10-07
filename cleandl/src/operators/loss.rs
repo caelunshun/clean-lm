@@ -50,6 +50,7 @@ impl LossExecutor {
             Tensor::new_uninit_with_pool(
                 Shape::new([batch_size]),
                 ElementType::Float(FloatType::F32),
+                stream,
                 &self.cx,
                 pool,
             )?
@@ -132,6 +133,7 @@ impl LossExecutor {
         let mut out_loss = Tensor::new_zeroed_with_pool(
             Shape::new([]),
             ElementType::Float(FloatType::F32),
+            stream,
             &self.cx,
             pool,
         )?;
@@ -140,6 +142,7 @@ impl LossExecutor {
             Tensor::new_uninit_with_pool(
                 logits.shape(),
                 ElementType::Float(FloatType::Bf16),
+                stream,
                 &self.cx,
                 pool,
             )?

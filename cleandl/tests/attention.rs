@@ -63,6 +63,7 @@ fn attention() -> anyhow::Result<()> {
     let mut qkv = Tensor::new_zeroed(
         Shape::new([total_tokens, PACKED_HEADS, HEAD_DIM]),
         bf16_type,
+        &stream,
         &cx,
     )?;
 

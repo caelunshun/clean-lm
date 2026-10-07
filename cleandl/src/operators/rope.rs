@@ -160,7 +160,7 @@ fn build_tables(
 
 fn upload_table(data: &[f16], shape: [usize; 2], cx: &Context) -> anyhow::Result<Tensor> {
     let stream = cx.h2d_copy_stream();
-    let mut tensor = Tensor::new_zeroed(shape, ElementType::Float(FloatType::F16), cx)?;
+    let mut tensor = Tensor::new_zeroed(shape, ElementType::Float(FloatType::F16), stream, cx)?;
     let bytes: &[u8] = bytemuck::cast_slice(data);
     let mut staging = cx.host_pinned_memory_pool().alloc_zeroed(bytes.len())?;
     staging.view_mut()?.copy_from_slice(bytes);

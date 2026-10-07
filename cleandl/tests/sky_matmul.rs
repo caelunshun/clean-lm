@@ -128,7 +128,7 @@ fn sky_matmul_swiglu_gate_train_fwd() -> anyhow::Result<()> {
 
             let mut rng = StdRng::seed_from_u64(0xf00d + (m * n * k) as u64);
             let x_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
-            let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
+            let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &stream, &cx)?;
             cx.upload_to_device(&x_host, x.storage_mut(), &stream)?;
 
             let SwiGluGateTrainFwdOutputs { gate, activation } =
@@ -188,8 +188,8 @@ fn sky_matmul_swiglu_down_train_dgrad() -> anyhow::Result<()> {
             let mut rng = StdRng::seed_from_u64(0xbeef + (m * n * k) as u64);
             let gate_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
             let x_host = par_vec_from_distr(StandardNormal.map(bf16::from_f32), m * n, &mut rng);
-            let mut gate = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
-            let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &cx)?;
+            let mut gate = Tensor::new_zeroed(Shape::new([m, n]), BF16, &stream, &cx)?;
+            let mut x = Tensor::new_zeroed(Shape::new([m, n]), BF16, &stream, &cx)?;
             cx.upload_to_device(&gate_host, gate.storage_mut(), &stream)?;
             cx.upload_to_device(&x_host, x.storage_mut(), &stream)?;
 
@@ -281,8 +281,8 @@ impl Inputs {
             MatrixFormat::RowMajor => [k, n],
             MatrixFormat::ColumnMajor => [n, k],
         };
-        let mut a = Tensor::new_zeroed(Shape::new(a_shape), BF16, cx)?;
-        let mut b = Tensor::new_zeroed(Shape::new(b_shape), BF16, cx)?;
+        let mut a = Tensor::new_zeroed(Shape::new(a_shape), BF16, stream, cx)?;
+        let mut b = Tensor::new_zeroed(Shape::new(b_shape), BF16, stream, cx)?;
         cx.upload_to_device(&a_host, a.storage_mut(), stream)?;
         cx.upload_to_device(&b_host, b.storage_mut(), stream)?;
 

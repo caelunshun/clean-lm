@@ -47,12 +47,12 @@ fn adamw_weight_update() -> anyhow::Result<()> {
     let shape = Shape::new([N]);
     let f32_type = ElementType::Float(FloatType::F32);
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut gradient = Tensor::new_zeroed(shape, f32_type, &cx)?;
-    let mut weight = Tensor::new_zeroed(shape, f32_type, &cx)?;
-    let mut weight_bf16_replica = Tensor::new_zeroed(shape, bf16_type, &cx)?;
-    let mut adam_m = Tensor::new_zeroed(shape, f32_type, &cx)?;
-    let mut adam_v = Tensor::new_zeroed(shape, f32_type, &cx)?;
-    let mut gradient_l2_global_sum = Tensor::new_zeroed(Shape::new([]), f32_type, &cx)?;
+    let mut gradient = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut weight = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut weight_bf16_replica = Tensor::new_zeroed(shape, bf16_type, &stream, &cx)?;
+    let mut adam_m = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut adam_v = Tensor::new_zeroed(shape, f32_type, &stream, &cx)?;
+    let mut gradient_l2_global_sum = Tensor::new_zeroed(Shape::new([]), f32_type, &stream, &cx)?;
 
     let mut rng = StdRng::seed_from_u64(0xADA3);
     let mut sample = |count: usize, scale: f32| -> Vec<f32> {

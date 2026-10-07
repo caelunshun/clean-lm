@@ -365,7 +365,8 @@ impl Sky1Executor {
         train_step: u32,
         stream: &Stream,
     ) -> anyhow::Result<()> {
-        let mut grad_sum2 = Tensor::new_zeroed([], ElementType::Float(FloatType::F32), &self.cx)?;
+        let mut grad_sum2 =
+            Tensor::new_zeroed([], ElementType::Float(FloatType::F32), stream, &self.cx)?;
         for param in [
             &weights.embeddings,
             &weights.final_norm_gamma,

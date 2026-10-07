@@ -100,7 +100,7 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
                 let mut outputs = self
                     .config
                     .epilogue
-                    .alloc_fallback_outputs(product, &self.cx, pool)?;
+                    .alloc_fallback_outputs(product, stream, &self.cx, pool)?;
                 if let Some(epilogue_kernel) = epilogue {
                     let mut launch = stream.launch_builder(epilogue_kernel);
                     let (grid_x, grid_y, grid_z) =
@@ -155,7 +155,10 @@ impl<E: Epilogue> SkyMatmulExecutor<E> {
         let max_cgas = (self.cx.cuda().sm_count() / NATIVE_CGA_SIZE as usize).max(1);
         let num_cgas = u32::try_from(num_tiles.min(max_cgas))?;
 
-        let mut outputs = self.config.epilogue.alloc_outputs(m, n, &self.cx, pool)?;
+        let mut outputs = self
+            .config
+            .epilogue
+            .alloc_outputs(m, n, stream, &self.cx, pool)?;
         {
             let a_tma = TensorMap::new(
                 a.storage(),
@@ -249,6 +252,7 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
         &self,
         m: usize,
         n: usize,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs>;
@@ -260,6 +264,7 @@ pub trait Epilogue: Serialize + Clone + Send + Sync + 'static {
     fn alloc_fallback_outputs(
         &self,
         product: Tensor,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs>;
@@ -367,11 +372,12 @@ impl Epilogue for IdentityEpilogue {
         &self,
         m: usize,
         n: usize,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        unsafe { Tensor::new_uninit_with_pool([m, n], BF16, cx, pool) }
+        unsafe { Tensor::new_uninit_with_pool([m, n], BF16, stream, cx, pool) }
     }
 
     fn fallback_epilogue_kernel(&self, _cx: &Context) -> anyhow::Result<Option<Function>> {
@@ -381,6 +387,7 @@ impl Epilogue for IdentityEpilogue {
     fn alloc_fallback_outputs(
         &self,
         product: Tensor,
+        _stream: &Stream,
         _cx: &Context,
         _pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
@@ -439,14 +446,15 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
         &self,
         m: usize,
         n: usize,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
         unsafe {
             Ok(SwiGluGateTrainFwdOutputs {
-                gate: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
-                activation: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
+                gate: Tensor::new_uninit_with_pool([m, n], BF16, stream, cx, pool)?,
+                activation: Tensor::new_uninit_with_pool([m, n], BF16, stream, cx, pool)?,
             })
         }
     }
@@ -462,11 +470,13 @@ impl Epilogue for SwiGluGateTrainFwdEpilogue {
     fn alloc_fallback_outputs(
         &self,
         product: Tensor,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        let activation = unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, cx, pool)? };
+        let activation =
+            unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, stream, cx, pool)? };
         Ok(SwiGluGateTrainFwdOutputs {
             gate: product,
             activation,
@@ -553,14 +563,15 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
         &self,
         m: usize,
         n: usize,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
         unsafe {
             Ok(SwiGluDownTrainDgradOutputs {
-                dgate: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
-                dx: Tensor::new_uninit_with_pool([m, n], BF16, cx, pool)?,
+                dgate: Tensor::new_uninit_with_pool([m, n], BF16, stream, cx, pool)?,
+                dx: Tensor::new_uninit_with_pool([m, n], BF16, stream, cx, pool)?,
             })
         }
     }
@@ -576,11 +587,13 @@ impl Epilogue for SwiGluDownTrainDgradEpilogue {
     fn alloc_fallback_outputs(
         &self,
         product: Tensor,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self::Outputs> {
         // Soundness: the kernel overwrites the data before we can read it.
-        let dgate = unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, cx, pool)? };
+        let dgate =
+            unsafe { Tensor::new_uninit_with_pool(product.shape(), BF16, stream, cx, pool)? };
         Ok(SwiGluDownTrainDgradOutputs { dgate, dx: product })
     }
 

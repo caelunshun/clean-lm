@@ -75,7 +75,7 @@ fn run_case(
     let f32_type = ElementType::Float(FloatType::F32);
 
     let upload = |data: &[bf16], shape: Shape| -> anyhow::Result<Tensor> {
-        let mut tensor = Tensor::new_zeroed(shape, bf16_type, cx)?;
+        let mut tensor = Tensor::new_zeroed(shape, bf16_type, stream, cx)?;
         cx.upload_to_device(data, tensor.storage_mut(), stream)?;
         Ok(tensor)
     };
@@ -85,7 +85,7 @@ fn run_case(
     let residual_gradient_stream = upload(&residual_gradient_stream_host, matrix_shape)?;
     let gamma = upload(&gamma_host, Shape::new([inner_dim]))?;
 
-    let mut dgamma = Tensor::new_zeroed(Shape::new([inner_dim]), f32_type, cx)?;
+    let mut dgamma = Tensor::new_zeroed(Shape::new([inner_dim]), f32_type, stream, cx)?;
 
     let residual_gradient_stream_view = with_residuals.then(|| residual_gradient_stream.view());
 

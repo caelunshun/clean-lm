@@ -53,9 +53,9 @@ fn linear_backward_wgrad_accumulate() -> anyhow::Result<()> {
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
     let f32_type = ElementType::Float(FloatType::F32);
-    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, cx)?;
-    let mut dy = Tensor::new_zeroed([BATCH_SIZE, OUT_FEATURES], bf16_type, cx)?;
-    let mut gradient = Tensor::new_zeroed([IN_FEATURES, OUT_FEATURES], f32_type, cx)?;
+    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, &stream, cx)?;
+    let mut dy = Tensor::new_zeroed([BATCH_SIZE, OUT_FEATURES], bf16_type, &stream, cx)?;
+    let mut gradient = Tensor::new_zeroed([IN_FEATURES, OUT_FEATURES], f32_type, &stream, cx)?;
 
     let mut rng = StdRng::seed_from_u64(777);
     let scale = (BATCH_SIZE as f32).sqrt().recip();
@@ -126,9 +126,9 @@ fn linear_forward_with_residual() -> anyhow::Result<()> {
     )?;
 
     let bf16_type = ElementType::Float(FloatType::Bf16);
-    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, cx)?;
-    let mut weight = Tensor::new_zeroed([IN_FEATURES, OUT_FEATURES], bf16_type, cx)?;
-    let mut residual = Tensor::new_zeroed([BATCH_SIZE, OUT_FEATURES], bf16_type, cx)?;
+    let mut data = Tensor::new_zeroed([BATCH_SIZE, IN_FEATURES], bf16_type, &stream, cx)?;
+    let mut weight = Tensor::new_zeroed([IN_FEATURES, OUT_FEATURES], bf16_type, &stream, cx)?;
+    let mut residual = Tensor::new_zeroed([BATCH_SIZE, OUT_FEATURES], bf16_type, &stream, cx)?;
 
     let mut rng = StdRng::seed_from_u64(778);
     let scale = (IN_FEATURES as f32).sqrt().recip();

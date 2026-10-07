@@ -34,6 +34,7 @@ impl ConversionExecutor {
             Tensor::new_uninit_with_pool(
                 bf16.shape(),
                 ElementType::Float(FloatType::F32),
+                stream,
                 &self.cx,
                 pool,
             )?
@@ -77,6 +78,7 @@ impl ConversionExecutor {
             Tensor::new_uninit_with_pool(
                 f32.shape(),
                 ElementType::Float(FloatType::Bf16),
+                stream,
                 &self.cx,
                 pool,
             )?

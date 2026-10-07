@@ -42,11 +42,13 @@ fn cross_entropy_loss() -> anyhow::Result<()> {
     let mut logits = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE, NUM_CLASSES]),
         ElementType::Float(FloatType::Bf16),
+        &stream,
         &cx,
     )?;
     let mut labels = Tensor::new_zeroed(
         Shape::new([BATCH_SIZE]),
         ElementType::UInt(UIntType::U32),
+        &stream,
         &cx,
     )?;
 

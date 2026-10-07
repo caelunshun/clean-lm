@@ -60,7 +60,13 @@ impl MatmulExecutor {
 
         // Soundness: the kernel overwrites the data before we can read it.
         let mut out = unsafe {
-            Tensor::new_uninit_with_pool([m, n], self.config.out_element_type, &self.cx, pool)?
+            Tensor::new_uninit_with_pool(
+                [m, n],
+                self.config.out_element_type,
+                stream,
+                &self.cx,
+                pool,
+            )?
         };
 
         self.execute(
@@ -151,10 +157,10 @@ impl MatmulExecutor {
             &self.plan
         };
 
-        let mut workspace = self.cx.device_memory_pool().alloc_zeroed_on(
-            plan.check(&self.algo)?.workspace_size,
-            self.cx.memset_stream(),
-        )?;
+        let mut workspace = self
+            .cx
+            .device_memory_pool()
+            .alloc_zeroed_on(plan.check(&self.algo)?.workspace_size, stream)?;
 
         let mut operands = plan.operands();
         operands.a(a.storage()).b(b.storage()).d(out);
@@ -281,7 +287,8 @@ fn autotune(plan: &MatmulPlan, config: &MatmulConfig, cx: &Context) -> anyhow::R
             cx.cuda().set_as_current()?;
 
             let make_dummy = |rows: usize, cols: usize, element_type: ElementType| {
-                let mut tensor = Tensor::new_zeroed([rows, cols], element_type, cx)?;
+                let mut tensor =
+                    Tensor::new_zeroed([rows, cols], element_type, cx.h2d_copy_stream(), cx)?;
                 let mut data = vec![0u8; tensor.storage().len()];
                 par_random::par_fill_from_distr(
                     Uniform::<u8>::new_inclusive(0, u8::MAX).unwrap(),

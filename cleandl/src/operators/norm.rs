@@ -54,6 +54,7 @@ impl NormExecutor {
             Tensor::new_uninit_with_pool(
                 Shape::new([batch_size, inner_dim]),
                 ElementType::Float(FloatType::Bf16),
+                stream,
                 &self.cx,
                 pool,
             )?
@@ -63,6 +64,7 @@ impl NormExecutor {
             Tensor::new_uninit_with_pool(
                 Shape::new([batch_size]),
                 ElementType::Float(FloatType::F32),
+                stream,
                 &self.cx,
                 pool,
             )?
@@ -159,6 +161,7 @@ impl NormExecutor {
             Tensor::new_uninit_with_pool(
                 Shape::new([batch_size, inner_dim]),
                 ElementType::Float(FloatType::Bf16),
+                stream,
                 &self.cx,
                 pool,
             )?

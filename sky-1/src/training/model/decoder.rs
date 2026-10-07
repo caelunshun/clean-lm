@@ -529,7 +529,7 @@ impl DecoderExecutor {
         meta_tensors: &MetaTensors,
         main_stream: &Stream,
         sidecar_stream: &Stream,
-        activations_pool: &DeviceMemoryPool
+        activations_pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Tensor> {
         let &[batch_size, _] = dy.shape().dims_slice() else {
             panic!()
@@ -639,7 +639,7 @@ impl DecoderExecutor {
                 ]),
                 &saves.attn_stats.view(),
                 main_stream,
-                activations_pool
+                activations_pool,
             )?;
 
         let mut dqk = dqkv.sliced_mut(

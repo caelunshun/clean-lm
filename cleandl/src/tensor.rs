@@ -29,6 +29,7 @@ impl Tensor {
     pub fn new_zeroed_with_pool(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self> {
@@ -37,7 +38,7 @@ impl Tensor {
         let virt = VirtTensorView::new(shape, element_type);
         let allocation_bytes = virt.required_bytes();
 
-        let storage = pool.alloc_zeroed_on(allocation_bytes, cx.memset_stream())?;
+        let storage = pool.alloc_zeroed_on(allocation_bytes, stream)?;
 
         Ok(Self {
             virt,
@@ -51,9 +52,10 @@ impl Tensor {
     pub fn new_zeroed(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
+        stream: &Stream,
         cx: &Context,
     ) -> anyhow::Result<Self> {
-        Self::new_zeroed_with_pool(shape, element_type, cx, cx.device_memory_pool())
+        Self::new_zeroed_with_pool(shape, element_type, stream, cx, cx.device_memory_pool())
     }
 
     /// # Safety
@@ -63,6 +65,7 @@ impl Tensor {
     pub unsafe fn new_uninit_with_pool(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
+        stream: &Stream,
         cx: &Context,
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self> {
@@ -71,7 +74,7 @@ impl Tensor {
         let virt = VirtTensorView::new(shape, element_type);
         let allocation_bytes = virt.required_bytes();
 
-        let storage = unsafe { pool.alloc_uninit_on(allocation_bytes, cx.memset_stream())? };
+        let storage = unsafe { pool.alloc_uninit_on(allocation_bytes, stream)? };
 
         Ok(Self {
             virt,
@@ -87,9 +90,12 @@ impl Tensor {
     pub unsafe fn new_uninit(
         shape: impl Into<Shape>,
         element_type: impl Into<ElementType>,
+        stream: &Stream,
         cx: &Context,
     ) -> anyhow::Result<Self> {
-        unsafe { Self::new_uninit_with_pool(shape, element_type, cx, cx.device_memory_pool()) }
+        unsafe {
+            Self::new_uninit_with_pool(shape, element_type, stream, cx, cx.device_memory_pool())
+        }
     }
 
     /// Returns a tensor sampled from the given distribution and RNG.

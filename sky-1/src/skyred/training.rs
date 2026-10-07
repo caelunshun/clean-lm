@@ -81,7 +81,7 @@ pub fn run(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         0,
         DeviceMemoryPoolOptions {
             enable_profiling: true,
-            max_total_bytes: 0,
+            max_total_bytes: 1 << 40,
             max_reserved_free_bytes: 2 << 30,
         },
         HostPinnedMemoryPoolOptions {
