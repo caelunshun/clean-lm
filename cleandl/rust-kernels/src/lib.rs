@@ -22,6 +22,9 @@ use ptx_std::{
     warp_collectives::{LaneMask, shuffle_xor},
 };
 
+#[cfg(not(target_feature = "sm_90"))]
+compile_error!("rust-kernels requires sm_90 or newer");
+
 pub mod norm;
 pub mod sky_matmul;
 

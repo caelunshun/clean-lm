@@ -5,19 +5,16 @@ use crate::{
 #[cfg(has_227kb_smem)]
 use ptx_std::tma::BulkWait;
 use ptx_std::{
-    Denormals, F32Ext, MBarrier, MemoryOrdering, Scope,
+    Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, Scope,
     atomic::{AtomicSpace, red_add},
     barrier::sync_threads,
-    bf16, bf16x2, block_id, cp_async, dynamic_smem_size, dynamic_smem_start, grid_dim,
-    warp_collectives::{LaneMask, shuffle_xor},
-};
-#[cfg(has_tma)]
-use ptx_std::{
-    PhaseParity,
+    bf16, bf16x2, block_id, cp_async, dynamic_smem_size, dynamic_smem_start,
     fence::{ProxyKind, fence_proxy},
-    tma,
-    warp_collectives::sync_warp,
+    grid_dim, tma,
+    warp_collectives::{LaneMask, shuffle_xor, sync_warp},
 };
+
+const PREFETCH_STAGES: usize = if cfg!(has_227kb_smem) { 3 } else { 1 };
 
 /// Template for fast RMSNorm where the vector size
 /// is small enough to fit within a single warp's registers, enabling
@@ -34,7 +31,6 @@ use ptx_std::{
 #[allow(clippy::assertions_on_constants)] // const assert would trigger bug with generic_const_exprs
 fn rmsnorm_bf16_warp_persistent<
     const VECTOR_SIZE: usize,
-    const PREFETCH_STAGES: usize,
     const NUM_WARPS: usize,
     // Must equal `VECTOR_SIZE / WARP_SIZE`.
     const ELEMENTS_PER_THREAD: usize,
@@ -48,17 +44,9 @@ fn rmsnorm_bf16_warp_persistent<
     const { assert!(ELEMENTS_PER_THREAD == VECTOR_SIZE / WARP_SIZE as usize) };
 
     unsafe {
-        #[cfg(has_tma)]
         let num_mbarriers = PREFETCH_STAGES * NUM_WARPS;
-        #[cfg(not(has_tma))]
-        let num_mbarriers = 0;
 
-        if cfg!(has_227kb_smem) {
-            assert!(cfg!(has_tma));
-        }
-
-        // Not enough SMEM on consumer TMA GPUs for store staging,
-        // so gate on has_227kb_smem insteaed of has_tma.
+        // Not enough SMEM on consumer GPUs for store staging.
         let store_staging_space = if cfg!(has_227kb_smem) {
             size_of::<bf16>() * VECTOR_SIZE * NUM_WARPS
         } else {
@@ -75,7 +63,6 @@ fn rmsnorm_bf16_warp_persistent<
         let smem_gamma = smem_base;
         let get_smem_slot = |i| smem_base.add(VECTOR_SIZE + i * VECTOR_SIZE * NUM_WARPS);
 
-        #[cfg(has_tma)]
         let mbarriers = smem_base
             .add(VECTOR_SIZE + PREFETCH_STAGES * VECTOR_SIZE * NUM_WARPS)
             .cast::<MBarrier>();
@@ -87,20 +74,17 @@ fn rmsnorm_bf16_warp_persistent<
                 + size_of::<MBarrier>() * num_mbarriers / size_of::<bf16>(),
         );
 
-        #[cfg(has_tma)]
         let get_mbarrier =
             #[inline(always)]
             |slot: u32| &*mbarriers.add((warp_id() * PREFETCH_STAGES as u32 + slot) as usize);
 
         // Each warp initializes its mbarriers.
-        #[cfg(has_tma)]
         if lane_id() == 0 {
             #[rustc_unroll(full)]
             for i in 0..PREFETCH_STAGES {
                 get_mbarrier(i as u32).init(1);
             }
         }
-        #[cfg(has_tma)]
         fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
 
         // Warp 0 copies gamma into SMEM.
@@ -119,29 +103,20 @@ fn rmsnorm_bf16_warp_persistent<
         sync_threads();
 
         let do_prefetch = |row_idx: u32, slot_index: u32| {
-            if row_idx < num_rows {
+            if row_idx < num_rows && lane_id() == 0 {
                 let dst = get_smem_slot(slot_index as usize)
                     .add((VECTOR_SIZE as u32 * warp_id()) as usize);
                 let src = gmem_x.add(row_idx as usize * VECTOR_SIZE);
-
-                #[cfg(has_tma)]
-                if lane_id() == 0 {
-                    let bytes = (VECTOR_SIZE * size_of::<bf16>()) as u32;
-                    get_mbarrier(slot_index).arrive_expect_tx(bytes);
-                    tma::bulk_load(
-                        dst.cast(),
-                        src.cast(),
-                        bytes,
-                        get_mbarrier(slot_index),
-                        None,
-                    );
-                }
-
-                #[cfg(not(has_tma))]
-                collective_async_copy_g2s_128bit(src, dst, VECTOR_SIZE as u32, lane_id(), 32);
+                let bytes = (VECTOR_SIZE * size_of::<bf16>()) as u32;
+                get_mbarrier(slot_index).arrive_expect_tx(bytes);
+                tma::bulk_load(
+                    dst.cast(),
+                    src.cast(),
+                    bytes,
+                    get_mbarrier(slot_index),
+                    None,
+                );
             }
-            #[cfg(not(has_tma))]
-            cp_async::commit_group();
         };
 
         let cta_stride = NUM_WARPS as u32 * grid_dim().x;
@@ -177,16 +152,8 @@ fn rmsnorm_bf16_warp_persistent<
             let slot_idx = i as u32 % PREFETCH_STAGES as u32;
 
             // Wait for our SMEM slot to be ready.
-            #[cfg(has_tma)]
-            {
-                let parity = PhaseParity::of_phase(i as u32 / PREFETCH_STAGES as u32);
-                get_mbarrier(slot_idx).wait(parity);
-            }
-            #[cfg(not(has_tma))]
-            {
-                let pipeline_depth_minus_one = const { PREFETCH_STAGES as u32 - 1 };
-                cp_async_wait_group(pipeline_depth_minus_one);
-            }
+            let parity = PhaseParity::of_phase(i as u32 / PREFETCH_STAGES as u32);
+            get_mbarrier(slot_idx).wait(parity);
 
             // Copy row from SMEM into registers.
             let mut thr_x = [bf16::ZERO; ELEMENTS_PER_THREAD];
@@ -208,7 +175,6 @@ fn rmsnorm_bf16_warp_persistent<
             }
 
             // With the SMEM data consumed, we can prefetch the next stage.
-            #[cfg(has_tma)]
             sync_warp(LaneMask::FULL);
             do_prefetch(row_idx + cta_stride * PREFETCH_STAGES as u32, slot_idx);
 
@@ -324,39 +290,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_bf16_warp_persistent_inner2048(
     gmem_r_inv: *mut f32,
     num_rows: u32,
 ) {
-    cfg_select! {
-        has_227kb_smem => {
-            const PREFETCH_STAGES: usize = 3;
-        }
-        _ => {
-            const PREFETCH_STAGES: usize = 1;
-        }
-    }
-
-    rmsnorm_bf16_warp_persistent::<2048, PREFETCH_STAGES, 12, { 2048 / WARP_SIZE as usize }>(
-        gmem_x, gmem_gamma, gmem_y, gmem_r_inv, num_rows,
-    );
-}
-
-#[unsafe(no_mangle)]
-#[nvptx(max_threads_per_cta(384, 1, 1), min_ctas_per_sm(1))]
-pub unsafe extern "ptx-kernel" fn rmsnorm_bf16_warp_persistent_inner1536(
-    gmem_x: *const bf16,
-    gmem_gamma: *const bf16,
-    gmem_y: *mut bf16,
-    gmem_r_inv: *mut f32,
-    num_rows: u32,
-) {
-    cfg_select! {
-        has_227kb_smem => {
-            const PREFETCH_STAGES: usize = 3;
-        }
-        _ => {
-            const PREFETCH_STAGES: usize = 1;
-        }
-    }
-
-    rmsnorm_bf16_warp_persistent::<1536, PREFETCH_STAGES, 12, { 1536 / WARP_SIZE as usize }>(
+    rmsnorm_bf16_warp_persistent::<2048, 12, { 2048 / WARP_SIZE as usize }>(
         gmem_x, gmem_gamma, gmem_y, gmem_r_inv, num_rows,
     );
 }
@@ -373,7 +307,6 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_bf16_warp_persistent_inner1536(
 fn rmsnorm_bwd_bf16_cta_persistent<
     const VECTOR_SIZE: usize,
     const ROWS_PER_ITER: usize,
-    const PREFETCH_STAGES: usize,
     const NUM_WARPS: usize,
     // Must equal `VECTOR_SIZE / NUM_WARPS / WARP_SIZE`.
     const ELEMENTS_PER_ROW_PER_THREAD: usize,
@@ -749,49 +682,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_bwd_bf16_cta_persistent_inner2048(
     gmem_dgamma: *mut f32,
     num_rows: u32,
 ) {
-    cfg_select! {
-        has_227kb_smem => {
-            const PREFETCH_STAGES: usize = 3;
-        }
-        _ => {
-            const PREFETCH_STAGES: usize = 1;
-        }
-    }
-
-    rmsnorm_bwd_bf16_cta_persistent::<2048, 4, PREFETCH_STAGES, 8, { 2048 / 8 / WARP_SIZE as usize }>(
-        gmem_x,
-        gmem_dy,
-        gmem_residual_gradient_stream,
-        gmem_gamma,
-        gmem_r_inv,
-        gmem_dx,
-        gmem_dgamma,
-        num_rows,
-    );
-}
-
-#[unsafe(no_mangle)]
-#[nvptx(max_threads_per_cta(64, 1, 1), min_ctas_per_sm(1))]
-pub unsafe extern "ptx-kernel" fn rmsnorm_bwd_bf16_cta_persistent_inner1536(
-    gmem_x: *const bf16,
-    gmem_dy: *const bf16,
-    gmem_residual_gradient_stream: *const bf16,
-    gmem_gamma: *const bf16,
-    gmem_r_inv: *const f32,
-    gmem_dx: *mut bf16,
-    gmem_dgamma: *mut f32,
-    num_rows: u32,
-) {
-    cfg_select! {
-        has_227kb_smem => {
-            const PREFETCH_STAGES: usize = 3;
-        }
-        _ => {
-            const PREFETCH_STAGES: usize = 1;
-        }
-    }
-
-    rmsnorm_bwd_bf16_cta_persistent::<1536, 4, PREFETCH_STAGES, 2, { 1536 / 2 / WARP_SIZE as usize }>(
+    rmsnorm_bwd_bf16_cta_persistent::<2048, 4, 8, { 2048 / 8 / WARP_SIZE as usize }>(
         gmem_x,
         gmem_dy,
         gmem_residual_gradient_stream,

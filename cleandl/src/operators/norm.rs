@@ -1,11 +1,15 @@
 use crate::{
     context::{Context, ResourceKey},
-    kernel::{RustKernels, rust_kernels_have_227kb_smem, rust_kernels_have_tma},
+    include_cubins,
+    kernel::{RustKernels, rust_kernels_have_227kb_smem, rust_kernels_supported},
     tensor::{Tensor, TensorView, TensorViewMut},
 };
 use anyhow::bail;
 use half::bf16;
-use skycuda::{device_memory_pool::DeviceMemoryPool, module::Module, stream::Stream};
+use skycuda::{
+    device_memory_pool::DeviceMemoryPool, function::Function, launch::LaunchBuilder,
+    module::Module, stream::Stream,
+};
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
@@ -16,6 +20,13 @@ use std::sync::Arc;
 pub struct NormExecutor {
     cx: Context,
     module: Arc<Module>,
+    backend: Backend,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Backend {
+    Rust,
+    CuTile,
 }
 
 /// Outputs of [`NormExecutor::rmsnorm_forward`].
@@ -70,16 +81,8 @@ impl NormExecutor {
             )?
         };
 
-        let KernelSpec {
-            name: kernel_name,
-            cta_threads,
-            dynamic_smem,
-        } = fwd_kernel_spec(inner_dim, &self.cx)?;
-        let kernel = self.module.get_function(kernel_name)?;
-        kernel.set_max_dynamic_smem(dynamic_smem)?;
-
-        let occupancy = stream.device().sm_count()
-            * kernel.max_active_blocks_per_sm(cta_threads, dynamic_smem)?;
+        let spec = fwd_kernel_spec(inner_dim, self.backend, &self.cx)?;
+        let (kernel, grid_size) = self.persistent_kernel(&spec, stream)?;
 
         {
             let x_memory = x.storage();
@@ -93,12 +96,11 @@ impl NormExecutor {
                 .arg(gamma_memory)?
                 .arg(out_y_memory)?
                 .arg(out_r_inv_memory)?
-                .arg(i32::try_from(batch_size)?)?
-                .block_size(cta_threads, 1, 1)?
-                .dynamic_smem(dynamic_smem)?;
+                .arg(i32::try_from(batch_size)?)?;
+            spec.configure(&mut launch)?;
 
             unsafe {
-                launch.launch(occupancy as u32, 1, 1)?;
+                launch.launch(grid_size, 1, 1)?;
             }
         }
 
@@ -167,16 +169,8 @@ impl NormExecutor {
             )?
         };
 
-        let KernelSpec {
-            name: kernel_name,
-            cta_threads,
-            dynamic_smem,
-        } = bwd_kernel_spec(inner_dim, &self.cx)?;
-        let kernel = self.module.get_function(kernel_name)?;
-        kernel.set_max_dynamic_smem(dynamic_smem)?;
-
-        let occupancy = stream.device().sm_count()
-            * kernel.max_active_blocks_per_sm(cta_threads, dynamic_smem)?;
+        let spec = bwd_kernel_spec(inner_dim, self.backend, &self.cx)?;
+        let (kernel, grid_size) = self.persistent_kernel(&spec, stream)?;
 
         {
             let x_memory = x.storage();
@@ -199,12 +193,11 @@ impl NormExecutor {
                 .arg(r_inv_memory)?
                 .arg(out_dx_memory)?
                 .arg(out_dgamma_memory)?
-                .arg(i32::try_from(batch_size)?)?
-                .dynamic_smem(dynamic_smem)?
-                .block_size(cta_threads, 1, 1)?;
-            // Block dim and smem are overriden by TileIR.
+                .arg(i32::try_from(batch_size)?)?;
+            spec.configure(&mut launch)?;
+
             unsafe {
-                launch.launch(occupancy as u32, 1, 1)?;
+                launch.launch(grid_size, 1, 1)?;
             }
         }
 
@@ -233,14 +226,57 @@ impl NormExecutor {
             self.cx.device_memory_pool(),
         )
     }
+
+    /// Returns the kernel and the grid size needed to fill the device.
+    fn persistent_kernel(
+        &self,
+        spec: &KernelSpec,
+        stream: &Stream,
+    ) -> anyhow::Result<(Function, u32)> {
+        let kernel = self.module.get_function(spec.name)?;
+        let blocks_per_sm = match spec.launch_config {
+            Some(LaunchConfig {
+                cta_threads,
+                dynamic_smem,
+            }) => {
+                kernel.set_max_dynamic_smem(dynamic_smem)?;
+                kernel.max_active_blocks_per_sm(cta_threads, dynamic_smem)?
+            }
+            None => kernel.max_active_blocks_per_sm(1, 0)?,
+        };
+        Ok((
+            kernel,
+            u32::try_from(stream.device().sm_count() * blocks_per_sm)?,
+        ))
+    }
 }
 
 const NULL_POINTER: u64 = 0;
 
 struct KernelSpec {
     name: &'static str,
+    /// `None` for cuTile kernels, whose block dim and smem are set by TileIR.
+    launch_config: Option<LaunchConfig>,
+}
+
+struct LaunchConfig {
     cta_threads: u32,
     dynamic_smem: usize,
+}
+
+impl KernelSpec {
+    fn configure(&self, launch: &mut LaunchBuilder<'_>) -> anyhow::Result<()> {
+        if let Some(LaunchConfig {
+            cta_threads,
+            dynamic_smem,
+        }) = self.launch_config
+        {
+            launch
+                .block_size(cta_threads, 1, 1)?
+                .dynamic_smem(dynamic_smem)?;
+        }
+        Ok(())
+    }
 }
 
 /// Prefetch stage count used by the norm kernels in `rust-kernels/src/norm.rs`.
@@ -252,35 +288,37 @@ fn prefetch_stages(cx: &Context) -> usize {
     }
 }
 
-fn fwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec> {
-    match inner_dim {
-        2048 => Ok(KernelSpec {
+fn fwd_kernel_spec(inner_dim: usize, backend: Backend, cx: &Context) -> anyhow::Result<KernelSpec> {
+    match (backend, inner_dim) {
+        (Backend::Rust, 2048) => Ok(KernelSpec {
             name: "rmsnorm_bf16_warp_persistent_inner2048",
-            cta_threads: 384,
-            dynamic_smem: fwd_required_smem(2048, prefetch_stages(cx), 12, cx),
+            launch_config: Some(LaunchConfig {
+                cta_threads: 384,
+                dynamic_smem: fwd_required_smem(2048, prefetch_stages(cx), 12, cx),
+            }),
         }),
-        1536 => Ok(KernelSpec {
-            name: "rmsnorm_bf16_warp_persistent_inner1536",
-            cta_threads: 384,
-            dynamic_smem: fwd_required_smem(1536, prefetch_stages(cx), 12, cx),
+        (Backend::CuTile, 2048) => Ok(KernelSpec {
+            name: "rmsnorm_fwd_inner2048_persistent",
+            launch_config: None,
         }),
-        dim => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
+        (_, dim) => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
 }
 
-fn bwd_kernel_spec(inner_dim: usize, cx: &Context) -> anyhow::Result<KernelSpec> {
-    match inner_dim {
-        2048 => Ok(KernelSpec {
+fn bwd_kernel_spec(inner_dim: usize, backend: Backend, cx: &Context) -> anyhow::Result<KernelSpec> {
+    match (backend, inner_dim) {
+        (Backend::Rust, 2048) => Ok(KernelSpec {
             name: "rmsnorm_bwd_bf16_cta_persistent_inner2048",
-            cta_threads: 256,
-            dynamic_smem: bwd_required_smem(2048, 4, prefetch_stages(cx), 8),
+            launch_config: Some(LaunchConfig {
+                cta_threads: 256,
+                dynamic_smem: bwd_required_smem(2048, 4, prefetch_stages(cx), 8),
+            }),
         }),
-        1536 => Ok(KernelSpec {
-            name: "rmsnorm_bwd_bf16_cta_persistent_inner1536",
-            cta_threads: 64,
-            dynamic_smem: bwd_required_smem(1536, 4, prefetch_stages(cx), 2),
+        (Backend::CuTile, 2048) => Ok(KernelSpec {
+            name: "rmsnorm_bwd_inner2048_persistent",
+            launch_config: None,
         }),
-        dim => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
+        (_, dim) => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }
 }
 
@@ -293,11 +331,6 @@ fn fwd_required_smem(
     num_warps: usize,
     cx: &Context,
 ) -> usize {
-    let num_mbarriers = if rust_kernels_have_tma(cx) {
-        prefetch_stages * num_warps
-    } else {
-        0
-    };
     let store_staging_space = if rust_kernels_have_227kb_smem(cx) {
         size_of::<bf16>() * vector_size * num_warps
     } else {
@@ -305,7 +338,7 @@ fn fwd_required_smem(
     };
     size_of::<bf16>() * vector_size
         + size_of::<bf16>() * (vector_size * prefetch_stages * num_warps)
-        + num_mbarriers * MBARRIER_SIZE
+        + prefetch_stages * num_warps * MBARRIER_SIZE
         + store_staging_space
 }
 
@@ -334,9 +367,18 @@ impl ResourceKey for NormExecutorKey {
     type Resource = NormExecutor;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
+        let (module, backend) = if rust_kernels_supported(cx) {
+            (cx.get_or_create_resource(RustKernels)?, Backend::Rust)
+        } else {
+            (
+                cx.get_or_create_resource(include_cubins!("../../cutile-kernels/norm"))?,
+                Backend::CuTile,
+            )
+        };
         Ok(NormExecutor {
             cx: cx.clone(),
-            module: cx.get_or_create_resource(RustKernels)?,
+            module,
+            backend,
         })
     }
 }

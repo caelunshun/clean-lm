@@ -6,8 +6,15 @@ use skycuda::module::Module;
 #[macro_export]
 macro_rules! include_cubins {
     ($base_path:literal) => {
+        $crate::include_cubins!(@build $base_path, Some(include_bytes!(concat!($base_path, ".sm89.cubin"))))
+    };
+    // For modules that only support sm_90 and newer.
+    ($base_path:literal, sm90_plus) => {
+        $crate::include_cubins!(@build $base_path, None)
+    };
+    (@build $base_path:literal, $sm89:expr) => {
         $crate::kernel::Cubins {
-            sm89: include_bytes!(concat!($base_path, ".sm89.cubin")),
+            sm89: $sm89,
             sm90a: include_bytes!(concat!($base_path, ".sm90a.cubin")),
             sm100a: include_bytes!(concat!($base_path, ".sm100a.cubin")),
             sm103a: include_bytes!(concat!($base_path, ".sm103a.cubin")),
@@ -19,7 +26,7 @@ macro_rules! include_cubins {
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct Cubins<'a> {
-    pub sm89: &'a [u8],
+    pub sm89: Option<&'a [u8]>,
     pub sm90a: &'a [u8],
     pub sm100a: &'a [u8],
     pub sm103a: &'a [u8],
@@ -35,7 +42,10 @@ impl ResourceKey for Cubins<'static> {
             cx.cuda().compute_capability_major(),
             cx.cuda().compute_capability_minor(),
         ) {
-            (8, 9) => self.sm89,
+            (8, 9) => match self.sm89 {
+                Some(cubin) => cubin,
+                None => bail!("module does not support sm 8.9"),
+            },
             (9, 0) => self.sm90a,
             (10, 0) => self.sm100a,
             (10, 3) => self.sm103a,
@@ -56,15 +66,16 @@ impl ResourceKey for RustKernels {
     type Resource = Module;
 
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
-        Ok(
-            (*cx.get_or_create_resource(include_cubins!("../rust-kernels/target/kernels"))?)
-                .clone(),
-        )
+        Ok((*cx.get_or_create_resource(include_cubins!(
+            "../rust-kernels/target/kernels",
+            sm90_plus
+        ))?)
+        .clone())
     }
 }
 
-/// Host equivalent of the `has_tma` cfg alias in `rust-kernels/build.rs`.
-pub(crate) fn rust_kernels_have_tma(cx: &Context) -> bool {
+/// Whether `rust-kernels` can run on this device (requires sm_90+).
+pub(crate) fn rust_kernels_supported(cx: &Context) -> bool {
     cx.cuda().compute_capability_major() >= 9
 }
 

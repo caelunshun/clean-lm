@@ -18,7 +18,7 @@ use skytens_core::{
 };
 
 const BATCH_SIZE: usize = 32769;
-const INNER_DIMS: &[usize] = &[2048, 1536];
+const INNER_DIMS: &[usize] = &[2048];
 const EPSILON: f32 = 1e-6;
 
 const R_INV_REL_TOLERANCE: f32 = 1e-3;

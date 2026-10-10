@@ -13,9 +13,6 @@ fn main() {
         },
         has_tcgen05: {
             any(target_feature = "sm_100f", target_feature = "sm_110f")
-        },
-        has_tma: {
-            target_feature = "sm_90"
         }
     }
 }
