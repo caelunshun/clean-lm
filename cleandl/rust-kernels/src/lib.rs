@@ -3,7 +3,6 @@
     abi_ptx,
     nvptx_ext,
     loop_hints,
-    asm_experimental_arch,
     stmt_expr_attributes,
     min_adt_const_params
 )]
@@ -17,10 +16,7 @@
 )]
 
 use bytemuck::Pod;
-use core::{
-    arch::asm,
-    hint::{self, assert_unchecked},
-};
+use core::hint::{self, assert_unchecked};
 use ptx_std::{
     cp_async, thread_id,
     warp_collectives::{LaneMask, shuffle_xor},
@@ -119,39 +115,4 @@ pub(crate) fn warp_reduce_sum_f32(mut val: f32) -> f32 {
         val += unsafe { shuffle_xor(LaneMask::FULL, val, 1 << i) };
     }
     val
-}
-
-
-/// Creates an L2 cache policy where a fraction of the accessed lines are evicted first
-/// (`createpolicy.fractional.L2::evict_first`).
-#[inline(always)]
-#[allow(unused)]
-pub(crate) fn createpolicy_fractional_evict_first(fraction: f32) -> u64 {
-    let policy: u64;
-    unsafe {
-        asm!(
-            "createpolicy.fractional.L2::evict_first.b64 {policy}, {fraction};",
-            policy = out(reg64) policy,
-            fraction = in(reg32) fraction,
-            options(pure, nomem, nostack),
-        );
-    }
-    policy
-}
-
-/// Creates an L2 cache policy where a fraction of the accessed lines keep their eviction
-/// priority (`createpolicy.fractional.L2::evict_unchanged`).
-#[inline(always)]
-#[allow(unused)]
-pub(crate) fn createpolicy_fractional_evict_unchanged(fraction: f32) -> u64 {
-    let policy: u64;
-    unsafe {
-        asm!(
-            "createpolicy.fractional.L2::evict_unchanged.b64 {policy}, {fraction};",
-            policy = out(reg64) policy,
-            fraction = in(reg32) fraction,
-            options(pure, nomem, nostack),
-        );
-    }
-    policy
 }

@@ -27,10 +27,7 @@
 //! * Warp 3: Epilogue TMA stores
 //! * Warps 4..12: Epilogue compute warps
 
-use crate::{
-    createpolicy_fractional_evict_first, createpolicy_fractional_evict_unchanged, thread_idx,
-    warp_id,
-};
+use crate::{thread_idx, warp_id};
 use core::f32::consts::LOG2_E;
 use ptx_std::{
     Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, Scope,
@@ -39,12 +36,12 @@ use ptx_std::{
     fence::{ProxyKind, fence_proxy},
     grid_dim,
     launch::{decrease_max_registers, increase_max_registers},
-    memory::to_shared_address,
+    memory::{CachePolicy, L2EvictionPriority, to_shared_address},
     tcgen05::{
         self, CtaGroup, CtaMask, F16ElementType, FloatAccumulator, InstrDescriptor, LdStShape,
         Major, MmaKind, MmaModifiers, Packing, SmemDescriptor, Swizzle, TmemAddr,
     },
-    tma::{self, BulkWait, CachePolicy, TmaDescriptor},
+    tma::{self, BulkWait, TmaDescriptor},
     warp_collectives::{LaneMask, elect},
 };
 
@@ -560,8 +557,7 @@ impl<
                                 .arrive_expect_tx(bytes);
 
                             // We expect that auxiliary inputs likely won't be re-accessed soon.
-                            let cache_hint =
-                                CachePolicy::from_bits(createpolicy_fractional_evict_first(1.0));
+                            let cache_hint = CachePolicy::new::<{ L2EvictionPriority::First }>();
                             tma::tma_load_tile::<2>(
                                 self.smem.epi_load_staging_slot(epi_slot_idx),
                                 &self.smem.barriers().epi_load_slot_produced[epi_slot_idx as usize],
@@ -827,7 +823,7 @@ impl<'a> Epilogue<'a> for IdentityEpilogue<'a> {
     fn output_descs(&self) -> Self::OutputDescs {
         [(
             self.out_tma,
-            CachePolicy::from_bits(createpolicy_fractional_evict_unchanged(1.0)),
+            CachePolicy::new::<{ L2EvictionPriority::Unchanged }>(),
         )]
     }
 
@@ -904,11 +900,11 @@ impl<'a> Epilogue<'a> for SwiGluGateTrainFwdEpilogue<'a> {
         [
             (
                 self.g_desc,
-                CachePolicy::from_bits(createpolicy_fractional_evict_first(1.0)),
+                CachePolicy::new::<{ L2EvictionPriority::First }>(),
             ),
             (
                 self.y_desc,
-                CachePolicy::from_bits(createpolicy_fractional_evict_unchanged(1.0)),
+                CachePolicy::new::<{ L2EvictionPriority::Unchanged }>(),
             ),
         ]
     }
@@ -978,11 +974,11 @@ impl<'a> Epilogue<'a> for SwiGluDownTrainDgradEpilogue<'a> {
         [
             (
                 self.dx_desc,
-                CachePolicy::from_bits(createpolicy_fractional_evict_unchanged(1.0)),
+                CachePolicy::new::<{ L2EvictionPriority::Unchanged }>(),
             ),
             (
                 self.dg_desc,
-                CachePolicy::from_bits(createpolicy_fractional_evict_unchanged(1.0)),
+                CachePolicy::new::<{ L2EvictionPriority::Unchanged }>(),
             ),
         ]
     }
