@@ -13,6 +13,9 @@ fn main() {
         },
         has_tcgen05: {
             any(target_feature = "sm_100f", target_feature = "sm_110f")
+        },
+        has_mx_formats: {
+            target_feature = "sm_100"
         }
     }
 }

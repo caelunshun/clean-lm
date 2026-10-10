@@ -4,15 +4,18 @@
     nvptx_ext,
     loop_hints,
     stmt_expr_attributes,
-    min_adt_const_params
+    min_adt_const_params,
+    gca_const_items,
+    gca_min_const_items
 )]
 #![allow(
+    incomplete_features,
     clippy::too_many_arguments,
     clippy::missing_safety_doc,
     // These unidiomatic expressions are needed
     // to get proper loop unrolling in same cases.
     clippy::needless_range_loop,
-    clippy::chunks_exact_to_as_chunks
+    clippy::chunks_exact_to_as_chunks,
 )]
 
 use bytemuck::Pod;
@@ -27,6 +30,7 @@ compile_error!("rust-kernels requires sm_90 or newer");
 
 pub mod norm;
 pub mod sky_matmul;
+mod utils;
 
 const WARP_SIZE: u32 = 32;
 
