@@ -2,10 +2,9 @@
 members = [
     "cleandl",
     "sky-1",
-    "cleandl/rust-kernels",
-    "cleandl/rust-kernels/cuda-device-ext",
     "skytokens",
 ]
+exclude = ["cleandl/rust-kernels"]
 resolver = "3"
 
 [profile.dev.package.'*']

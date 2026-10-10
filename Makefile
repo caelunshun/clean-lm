@@ -5,6 +5,10 @@ ARCHS := sm89 sm90a sm100a sm103a sm120a sm121a
 
 RUST_KERNEL_DIR := cleandl/rust-kernels
 RUST_KERNEL_OUT := $(RUST_KERNEL_DIR)/target/kernels
+PTX_STD_DIR := ../ptx-std
+RUST_KERNEL_DEPS := $(shell find $(RUST_KERNEL_DIR)/src $(PTX_STD_DIR)/src -name '*.rs') \
+	$(RUST_KERNEL_DIR)/Cargo.toml $(RUST_KERNEL_DIR)/build.rs $(RUST_KERNEL_DIR)/.cargo/config.toml \
+	$(PTX_STD_DIR)/Cargo.toml
 
 TARGETS := $(foreach arch,$(ARCHS),$(CU_FILES:.cu=.$(arch).sass))
 TEMPS := $(foreach arch,$(ARCHS),$(CU_FILES:.cu=.$(arch).cubin))
@@ -35,17 +39,12 @@ endef
 
 $(foreach arch,$(ARCHS),$(eval $(call ARCH_RULE,$(arch),sm_$(patsubst sm%,%,$(arch)))))
 
-# Rust kernels, built with cuda-oxide. The build emits PTX into a directory, so
-# each arch gets its own scratch dir which is then collapsed into a single .ptx.
-# Each arch also gets its own cargo target dir so builds don't serialize on
-# cargo's target dir lock.
-# $(1): arch name as used in artifact names (e.g. sm89)
-# $(2): arch name as passed to cargo oxide --arch (e.g. sm_89)
 define RUST_ARCH_RULE
-$$(RUST_KERNEL_OUT).$(1).ptx: $$(shell find $$(RUST_KERNEL_DIR)/src -name '*.rs') $$(RUST_KERNEL_DIR)/Cargo.toml
-	mkdir -p $$(RUST_KERNEL_OUT).$(1).d
-	cd $$(RUST_KERNEL_DIR) && CARGO_TARGET_DIR=$$(abspath $$(RUST_KERNEL_DIR)/target/$(1)) CUDA_OXIDE_PTX_DIR=$$(abspath $$(RUST_KERNEL_OUT).$(1).d) cargo oxide build --arch $(2)
-	cat $$(RUST_KERNEL_OUT).$(1).d/*.ptx > $$@
+$$(RUST_KERNEL_OUT).$(1).ptx: $$(RUST_KERNEL_DEPS)
+	cd $$(RUST_KERNEL_DIR) && cargo +nvptx-ext build --release \
+		--target-dir target/$(1) \
+		--config 'target.nvptx64-nvidia-cuda.rustflags = ["-C", "target-cpu=$(2)"]'
+	cp $$(RUST_KERNEL_DIR)/target/$(1)/nvptx64-nvidia-cuda/release/cleandl_kernels.ptx $$@
 
 $$(RUST_KERNEL_OUT).$(1).cubin: $$(RUST_KERNEL_OUT).$(1).ptx
 	$$(PTXAS) $$(PTXASFLAGS) -arch=$(2) -o $$@ $$<

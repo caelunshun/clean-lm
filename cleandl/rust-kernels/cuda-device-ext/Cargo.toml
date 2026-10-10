@@ -1,8 +1,0 @@
-[package]
-name = "cuda-device-ext"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-cuda-device = { git = "https://github.com/caelunshun/cuda-oxide" }
-bytemuck = { version = "1.25", features = ["derive"] }

@@ -1,0 +1,23 @@
+[target.nvptx64-nvidia-cuda]
+rustflags = [
+    "-C",
+    "target-feature=+ptx93",
+    "-C",
+    "target-cpu=sm_80",
+    "-Z",
+    "unstable-options",
+    "-C",
+    "panic=immediate-abort",
+]
+rustdocflags = [
+    "-C",
+    "target-feature=+ptx93",
+    "-C",
+    "target-cpu=sm_80",
+]
+
+[build]
+target = "nvptx64-nvidia-cuda"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]

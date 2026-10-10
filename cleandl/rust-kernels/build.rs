@@ -6,23 +6,16 @@ fn main() {
     cfg_aliases! {
         has_227kb_smem: {
             any(
-                cuda_arch_specific = "90",
-                cuda_arch_specific = "100",
-                cuda_arch_specific = "103",
-                cuda_arch_specific = "107",
-                cuda_arch_specific = "110"
+                target_feature = "sm_90a",
+                target_feature = "sm_100f",
+                target_feature = "sm_110f"
             )
         },
         has_tcgen05: {
-            any(
-                cuda_arch_specific = "100",
-                cuda_arch_specific = "103",
-                cuda_arch_specific = "107",
-                cuda_arch_specific = "110"
-            )
+            any(target_feature = "sm_100f", target_feature = "sm_110f")
         },
         has_tma: {
-            cuda_arch_min = "90"
+            target_feature = "sm_90"
         }
     }
 }

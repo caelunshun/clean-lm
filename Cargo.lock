@@ -601,19 +601,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cleandl-kernels"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "cfg-if",
- "cfg_aliases",
- "cuda-device",
- "cuda-device-ext",
- "cuda-macros",
- "pastey",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,33 +830,6 @@ dependencies = [
  "dispatch2",
  "nix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "cuda-device"
-version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
-dependencies = [
- "cuda-macros",
-]
-
-[[package]]
-name = "cuda-device-ext"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "cuda-device",
-]
-
-[[package]]
-name = "cuda-macros"
-version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
-dependencies = [
- "proc-macro2",
- "quote",
- "reserved-oxide-symbols",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -2549,12 +2509,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pastey"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3107,11 +3061,6 @@ dependencies = [
  "wasm-streams",
  "web-sys",
 ]
-
-[[package]]
-name = "reserved-oxide-symbols"
-version = "0.2.1"
-source = "git+https://github.com/caelunshun/cuda-oxide#6abdee8d486d12772d9c984a997448e56111ab2b"
 
 [[package]]
 name = "ring"
