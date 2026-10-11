@@ -689,7 +689,7 @@ impl<
                         #[rustc_unroll(full)]
                         for i in 0..EPI_ELEMENTS_PER_THREAD / 2 {
                             thr_row_bf16[i] =
-                                bf16x2::from_f32x2(thr_row[i * 2], thr_row[i * 2 + 1]);
+                                bf16x2::from_f32([thr_row[i * 2], thr_row[i * 2 + 1]].into());
                         }
 
                         let smem = self.smem.epi_store_staging_slot().cast::<bf16>();
@@ -745,7 +745,7 @@ impl<
 
                             #[rustc_unroll(full)]
                             for i in 0..src.len() {
-                                let [a, b] = src[i].to_f32x2();
+                                let [a, b] = src[i].to_f32().to_array();
                                 thr_row[chunk * 8 + i * 2] = a;
                                 thr_row[chunk * 8 + i * 2 + 1] = b;
                             }

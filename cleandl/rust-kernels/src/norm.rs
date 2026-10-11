@@ -184,7 +184,7 @@ fn rmsnorm_bf16_warp_persistent<
             #[rustc_unroll(full)]
             for pair in thr_x.chunks_exact(2) {
                 let pair = bf16x2::new(pair[0], pair[1]);
-                let [v1, v2] = pair.to_f32x2();
+                let [v1, v2] = pair.to_f32().to_array();
                 thr_sum2 += v1 * v1 + v2 * v2;
             }
 
@@ -203,10 +203,12 @@ fn rmsnorm_bf16_warp_persistent<
             for i in 0..thr_x.len() / 2 {
                 let x_pair = &mut thr_x[i * 2..][..2];
                 let gamma_pair = &mut thr_gamma[i * 2..][..2];
-                let [x1, x2] = bf16x2::new(x_pair[0], x_pair[1]).to_f32x2();
-                let [g1, g2] = bf16x2::new(gamma_pair[0], gamma_pair[1]).to_f32x2();
+                let [x1, x2] = bf16x2::new(x_pair[0], x_pair[1]).to_f32().to_array();
+                let [g1, g2] = bf16x2::new(gamma_pair[0], gamma_pair[1])
+                    .to_f32()
+                    .to_array();
                 let (y1, y2) = (x1 * g1 * r_inv, x2 * g2 * r_inv);
-                [x_pair[0], x_pair[1]] = bf16x2::from_f32x2(y1, y2).to_array();
+                [x_pair[0], x_pair[1]] = bf16x2::from_f32([y1, y2].into()).to_array();
             }
 
             let gmem_y = gmem_y.add(row_idx as usize * VECTOR_SIZE);
@@ -543,12 +545,16 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                     let r_inv = thr_r_inv[i];
                     #[rustc_unroll(full)]
                     for j in 0..elements_per_row_per_thread / 2 {
-                        let [x1, x2] =
-                            bf16x2::new(thr_x[offs + j * 2], thr_x[offs + j * 2 + 1]).to_f32x2();
+                        let [x1, x2] = bf16x2::new(thr_x[offs + j * 2], thr_x[offs + j * 2 + 1])
+                            .to_f32()
+                            .to_array();
                         let [dy1, dy2] =
-                            bf16x2::new(thr_dy[offs + j * 2], thr_dy[offs + j * 2 + 1]).to_f32x2();
-                        let [gamma1, gamma2] =
-                            bf16x2::new(thr_gamma[j * 2], thr_gamma[j * 2 + 1]).to_f32x2();
+                            bf16x2::new(thr_dy[offs + j * 2], thr_dy[offs + j * 2 + 1])
+                                .to_f32()
+                                .to_array();
+                        let [gamma1, gamma2] = bf16x2::new(thr_gamma[j * 2], thr_gamma[j * 2 + 1])
+                            .to_f32()
+                            .to_array();
 
                         let x_hat1 = x1 * r_inv;
                         let x_hat2 = x2 * r_inv;
@@ -610,16 +616,19 @@ fn rmsnorm_bwd_bf16_cta_persistent<
                         let x_hat2 = thr_x_hat[offs + j * 2 + 1];
                         let [residual1, residual2] =
                             bf16x2::new(thr_residual[offs + j * 2], thr_residual[offs + j * 2 + 1])
-                                .to_f32x2();
+                                .to_f32()
+                                .to_array();
                         let g1 = thr_g[offs + j * 2];
                         let g2 = thr_g[offs + j * 2 + 1];
                         let [dy1, dy2] =
-                            bf16x2::new(thr_dy[offs + j * 2], thr_dy[offs + j * 2 + 1]).to_f32x2();
+                            bf16x2::new(thr_dy[offs + j * 2], thr_dy[offs + j * 2 + 1])
+                                .to_f32()
+                                .to_array();
 
                         let dx1 = r_inv * (g1 - x_hat1 * c) + residual1;
                         let dx2 = r_inv * (g2 - x_hat2 * c) + residual2;
                         [thr_dx[offs + j * 2], thr_dx[offs + j * 2 + 1]] =
-                            bf16x2::from_f32x2(dx1, dx2).to_array();
+                            bf16x2::from_f32([dx1, dx2].into()).to_array();
 
                         thr_dgamma_partials[j * 2] += dy1 * x_hat1;
                         thr_dgamma_partials[j * 2 + 1] += dy2 * x_hat2;

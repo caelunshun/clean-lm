@@ -3,18 +3,15 @@ rustflags = [
     "-C",
     "target-feature=+ptx93",
     "-C",
-    "target-cpu=sm_100",
+    "target-cpu=sm_100a",
     "-Z",
     "unstable-options",
     "-C",
     "panic=immediate-abort",
+    "-Z",
+    "next-solver",
 ]
-rustdocflags = [
-    "-C",
-    "target-feature=+ptx93",
-    "-C",
-    "target-cpu=sm_100",
-]
+rustdocflags = ["-C", "target-feature=+ptx93", "-C", "target-cpu=sm_100a"]
 
 [build]
 target = "nvptx64-nvidia-cuda"

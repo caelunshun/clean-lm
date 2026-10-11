@@ -5,8 +5,15 @@
     loop_hints,
     stmt_expr_attributes,
     min_adt_const_params,
+    gca_min_const_items,
     gca_const_items,
-    gca_min_const_items
+    gca_adts,
+    adt_const_params,
+    pointer_is_aligned_to,
+    iter_array_chunks,
+    portable_simd,
+    inherent_associated_types,
+    gca_macroless_args
 )]
 #![allow(
     incomplete_features,
@@ -27,16 +34,32 @@ use ptx_std::{
 #[cfg(not(target_feature = "sm_100"))]
 compile_error!("rust-kernels requires sm_100 or newer");
 
-pub mod norm;
+// pub mod norm;
 pub mod rmsnorm;
-pub mod sky_matmul;
+// pub mod sky_matmul;
 mod utils;
 
 const WARP_SIZE: u32 = 32;
 
+pub fn elements_per_u32<T>() -> u32 {
+    const {
+        assert!(size_of::<u32>().is_multiple_of(size_of::<T>()));
+    }
+    (size_of::<u32>() / size_of::<T>()) as u32
+}
+
 pub fn elements_per_u128<T>() -> u32 {
-    assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
+    const {
+        assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
+    }
     (size_of::<u128>() / size_of::<T>()) as u32
+}
+
+pub fn elements_per_u256<T>() -> u32 {
+    const {
+        assert!(32usize.is_multiple_of(size_of::<T>()));
+    }
+    (32 / size_of::<T>()) as u32
 }
 
 /// Collective copy from GMEM into SMEM of a 1D array,
@@ -99,8 +122,8 @@ pub(crate) unsafe fn warp_reduce_sum_bf16x2_f32x2(val: bf16x2) -> [f32; 2] {
     // Micro-optimize by doing the first shuffle with bf16x2,
     // but the rest need f32 to avoid intermediate rounding.
     let peer_val = unsafe { shuffle_xor(LaneMask::FULL, val.to_bits(), 16) };
-    let peer_val = bf16x2::from_bits(peer_val).to_f32x2();
-    let val = val.to_f32x2();
+    let peer_val = bf16x2::from_bits(peer_val).to_f32();
+    let val = val.to_f32();
     let mut sum = [val[0] + peer_val[0], val[1] + peer_val[1]];
 
     #[rustc_unroll(full)]
@@ -130,6 +153,7 @@ pub(crate) unsafe fn warp_reduce_max_f32<const ABS: Absolute>(mut val: f32) -> f
                     use ptx_std::NanHandling;
                     NanHandling::Ignore
                 },
+                _,
             >(LaneMask::FULL, val)
         }
     }
