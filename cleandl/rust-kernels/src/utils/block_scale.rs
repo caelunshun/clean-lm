@@ -1,4 +1,7 @@
-use ptx_std::{F32Ext, Overflow, Relu, Rounding, bf16x2, f8e4m3x2, f8e8m0x2};
+use crate::warp_reduce_max_bf16x2;
+use ptx_std::{
+    F32Ext, Overflow, Relu, Rounding, bf16x2, f8e4m3x2, f8e8m0x2, warp_collectives::Absolute,
+};
 
 const MAX_F8E4M3: f32 = 448.0;
 
@@ -14,6 +17,15 @@ pub trait BlockScaledFormat {
         block1: &Self::BlockBf16,
         quant0: &mut Self::BlockQuantized,
         quant1: &mut Self::BlockQuantized,
+    ) -> Self::ScaleFactorX2;
+}
+
+pub trait BlockSize32ScaledFormat: BlockScaledFormat {
+    type QuantizedX2;
+
+    fn quantize_across_lanes_bf16_2blocks(
+        blocks: bf16x2,
+        quants: &mut Self::QuantizedX2,
     ) -> Self::ScaleFactorX2;
 }
 
@@ -62,6 +74,27 @@ impl BlockScaledFormat for Mxfp8 {
             quant1[i] =
                 f8e4m3x2::from_bf16x2::<{ Relu::Disabled }>(block1[i] * bf16x2::splat(descale1));
         }
+
+        scales
+    }
+}
+
+impl BlockSize32ScaledFormat for Mxfp8 {
+    type QuantizedX2 = f8e4m3x2;
+
+    fn quantize_across_lanes_bf16_2blocks(
+        blocks: bf16x2,
+        quants: &mut Self::QuantizedX2,
+    ) -> Self::ScaleFactorX2 {
+        let amax = unsafe { warp_reduce_max_bf16x2::<{ Absolute::Enabled }>(blocks) };
+
+        let scales = amax * bf16x2::from_f32x2(MAX_F8E4M3.recip(), MAX_F8E4M3.recip());
+        let scales =
+            f8e8m0x2::from_bf16x2::<{ Rounding::Up }, { Overflow::SaturateFinite }>(scales);
+        let descales = scales.to_bf16x2().to_f32x2().map(|x| x.rcp_approx_ftz());
+        let descales = bf16x2::from_f32x2(descales[0], descales[1]);
+
+        *quants = f8e4m3x2::from_bf16x2::<{ Relu::Disabled }>(blocks * descales);
 
         scales
     }

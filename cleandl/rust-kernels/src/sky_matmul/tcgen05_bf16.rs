@@ -27,7 +27,6 @@
 //! * Warp 3: Epilogue TMA stores
 //! * Warps 4..12: Epilogue compute warps
 
-use crate::{thread_idx, warp_id};
 use core::f32::consts::LOG2_E;
 use ptx_std::{
     Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, Scope,
@@ -41,8 +40,10 @@ use ptx_std::{
         self, CtaGroup, CtaMask, F16ElementType, FloatAccumulator, InstrDescriptor, LdStShape,
         Major, MmaKind, MmaModifiers, Packing, SmemDescriptor, Swizzle, TmemAddr,
     },
+    thread_id,
     tma::{self, BulkWait, TmaDescriptor},
     warp_collectives::{LaneMask, elect},
+    warp_id,
 };
 
 const TM_CTA: u32 = 128;
@@ -634,10 +635,10 @@ impl<
     #[inline(always)]
     pub fn run_epi_warps<E: Epilogue<'a>>(&mut self, mut epilogue: E) {
         unsafe {
-            let thread_m = (thread_idx() - 128) % 128;
+            let thread_m = (thread_id().x - 128) % 128;
             let warp_tmem_lane_base = warp_id() % 4 * 32;
             // Offset of this warp's elements within a subtile.
-            let warp_n = (thread_idx() - 128) / 128 * 32;
+            let warp_n = (thread_id().x - 128) / 128 * 32;
 
             let mut accum_slot_idx = 0;
             let mut accum_parity = 0;
@@ -1054,7 +1055,7 @@ fn kernel_template<
         };
         assert!(dynamic_smem_size() == smem.required_space());
 
-        if thread_idx() == 0 {
+        if thread_id().x == 0 {
             init_barriers(&mut smem);
             MBarrier::fence_init();
         }

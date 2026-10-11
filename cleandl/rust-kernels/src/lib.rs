@@ -19,10 +19,9 @@
 )]
 
 use bytemuck::Pod;
-use core::hint::{self, assert_unchecked};
 use ptx_std::{
-    cp_async, thread_id,
-    warp_collectives::{LaneMask, shuffle_xor},
+    bf16x2, cp_async,
+    warp_collectives::{Absolute, LaneMask, shuffle_xor},
 };
 
 #[cfg(not(target_feature = "sm_90"))]
@@ -33,37 +32,6 @@ pub mod sky_matmul;
 mod utils;
 
 const WARP_SIZE: u32 = 32;
-
-#[inline(always)]
-#[allow(unused)]
-fn num_warps() -> u32 {
-    let num_warps = ptx_std::block_size() / WARP_SIZE;
-    unsafe {
-        assert_unchecked(num_warps > 0);
-    }
-    num_warps
-}
-
-/// Index of the executing thread within its (1D) block.
-#[inline(always)]
-fn thread_idx() -> u32 {
-    thread_id().x
-}
-
-/// Index of the executing warp within its (1D) block.
-#[inline(always)]
-fn warp_id() -> u32 {
-    thread_idx() / WARP_SIZE
-}
-
-#[inline(always)]
-fn lane_id() -> u32 {
-    let id = ptx_std::lane_id();
-    unsafe {
-        hint::assert_unchecked(id < 32);
-    }
-    id
-}
 
 pub fn elements_per_u128<T>() -> u32 {
     assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
@@ -116,10 +84,65 @@ pub(crate) fn cp_async_wait_group(pending: u32) {
 }
 
 #[inline(always)]
-pub(crate) fn warp_reduce_sum_f32(mut val: f32) -> f32 {
+pub(crate) unsafe fn warp_reduce_sum_f32(mut val: f32) -> f32 {
     #[rustc_unroll(full)]
     for i in (0..WARP_SIZE.ilog2()).rev() {
         val += unsafe { shuffle_xor(LaneMask::FULL, val, 1 << i) };
     }
     val
+}
+
+#[inline(always)]
+#[allow(unused_mut)]
+pub(crate) unsafe fn warp_reduce_max_f32<const ABS: Absolute>(mut val: f32) -> f32 {
+    #[cfg(target_feature = "sm_100f")]
+    {
+        use ptx_std::warp_collectives::reduce_f32;
+
+        unsafe {
+            reduce_f32::<
+                {
+                    use ptx_std::warp_collectives::ReduxOp;
+                    ReduxOp::Max
+                },
+                ABS,
+                {
+                    use ptx_std::NanHandling;
+                    NanHandling::Ignore
+                },
+            >(LaneMask::FULL, val)
+        }
+    }
+    #[cfg(not(target_feature = "sm_100f"))]
+    {
+        if ABS == Absolute::Enabled {
+            val = val.abs();
+        }
+        #[rustc_unroll(full)]
+        for i in (0..WARP_SIZE.ilog2()).rev() {
+            val = val.max(unsafe { shuffle_xor(LaneMask::FULL, val, 1 << i) });
+        }
+        val
+    }
+}
+
+#[inline(always)]
+#[allow(unused)]
+pub(crate) unsafe fn warp_reduce_max_bf16x2<const ABS: Absolute>(mut val: bf16x2) -> bf16x2 {
+    // #[cfg(target_feature = "sm_100f")]
+    // {
+    //     let [a, b] = val.to_f32x2();
+    //     unsafe { bf16x2::from_f32x2(warp_reduce_max_f32::<ABS>(a), warp_reduce_max_f32::<ABS>(b)) }
+    // }
+    // #[cfg(not(target_feature = "sm_100f"))]
+    {
+        if ABS == Absolute::Enabled {
+            val = val.abs();
+        }
+        #[rustc_unroll(full)]
+        for i in (0..WARP_SIZE.ilog2()).rev() {
+            val = val.max(unsafe { shuffle_xor(LaneMask::FULL, val, 1 << i) });
+        }
+        val
+    }
 }

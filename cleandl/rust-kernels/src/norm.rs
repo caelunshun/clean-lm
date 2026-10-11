@@ -1,6 +1,6 @@
 use crate::{
-    WARP_SIZE, collective_async_copy_g2s_128bit, cp_async_wait_group, elements_per_u128, lane_id,
-    thread_idx, warp_id, warp_reduce_sum_f32,
+    WARP_SIZE, collective_async_copy_g2s_128bit, cp_async_wait_group, elements_per_u128,
+    warp_reduce_sum_f32,
 };
 #[cfg(has_227kb_smem)]
 use ptx_std::tma::BulkWait;
@@ -10,8 +10,9 @@ use ptx_std::{
     barrier::sync_threads,
     bf16, bf16x2, block_id, cp_async, dynamic_smem_size, dynamic_smem_start,
     fence::{ProxyKind, fence_proxy},
-    grid_dim, tma,
+    grid_dim, lane_id, thread_id, tma,
     warp_collectives::{LaneMask, shuffle_xor, sync_warp},
+    warp_id,
 };
 
 const PREFETCH_STAGES: usize = if cfg!(has_227kb_smem) { 3 } else { 1 };
@@ -327,7 +328,7 @@ fn rmsnorm_bwd_bf16_cta_persistent<
     assert!(ROWS_PER_ITER <= WARP_SIZE as usize);
     const { assert!(ELEMENTS_PER_ROW_PER_THREAD == VECTOR_SIZE / NUM_WARPS / WARP_SIZE as usize) };
 
-    let thread_id = thread_idx();
+    let thread_id = thread_id().x;
     let cta_threads = WARP_SIZE * NUM_WARPS as u32;
 
     let elements_per_row_per_thread = ELEMENTS_PER_ROW_PER_THREAD;
