@@ -3,7 +3,7 @@ rustflags = [
     "-C",
     "target-feature=+ptx93",
     "-C",
-    "target-cpu=sm_90",
+    "target-cpu=sm_100",
     "-Z",
     "unstable-options",
     "-C",
@@ -13,7 +13,7 @@ rustdocflags = [
     "-C",
     "target-feature=+ptx93",
     "-C",
-    "target-cpu=sm_90",
+    "target-cpu=sm_100",
 ]
 
 [build]

@@ -82,6 +82,7 @@ impl BlockScaledFormat for Mxfp8 {
 impl BlockSize32ScaledFormat for Mxfp8 {
     type QuantizedX2 = f8e4m3x2;
 
+    #[inline(always)]
     fn quantize_across_lanes_bf16_2blocks(
         blocks: bf16x2,
         quants: &mut Self::QuantizedX2,
@@ -100,6 +101,7 @@ impl BlockSize32ScaledFormat for Mxfp8 {
     }
 }
 
+#[inline(always)]
 fn max_bf16x2_f32(x: bf16x2) -> f32 {
     let [a, b] = x.to_f32x2();
     a.max(b)

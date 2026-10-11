@@ -24,10 +24,11 @@ use ptx_std::{
     warp_collectives::{Absolute, LaneMask, shuffle_xor},
 };
 
-#[cfg(not(target_feature = "sm_90"))]
-compile_error!("rust-kernels requires sm_90 or newer");
+#[cfg(not(target_feature = "sm_100"))]
+compile_error!("rust-kernels requires sm_100 or newer");
 
 pub mod norm;
+pub mod rmsnorm;
 pub mod sky_matmul;
 mod utils;
 
@@ -90,6 +91,25 @@ pub(crate) unsafe fn warp_reduce_sum_f32(mut val: f32) -> f32 {
         val += unsafe { shuffle_xor(LaneMask::FULL, val, 1 << i) };
     }
     val
+}
+
+/// Warp-wide reduction of bf16x2 values with f32 accumulation.
+#[inline(always)]
+pub(crate) unsafe fn warp_reduce_sum_bf16x2_f32x2(val: bf16x2) -> [f32; 2] {
+    // Micro-optimize by doing the first shuffle with bf16x2,
+    // but the rest need f32 to avoid intermediate rounding.
+    let peer_val = unsafe { shuffle_xor(LaneMask::FULL, val.to_bits(), 16) };
+    let peer_val = bf16x2::from_bits(peer_val).to_f32x2();
+    let val = val.to_f32x2();
+    let mut sum = [val[0] + peer_val[0], val[1] + peer_val[1]];
+
+    #[rustc_unroll(full)]
+    for i in (0..WARP_SIZE.ilog2() - 1).rev() {
+        sum[0] += unsafe { shuffle_xor(LaneMask::FULL, sum[0], 1 << i) };
+        sum[1] += unsafe { shuffle_xor(LaneMask::FULL, sum[1], 1 << i) };
+    }
+
+    sum
 }
 
 #[inline(always)]

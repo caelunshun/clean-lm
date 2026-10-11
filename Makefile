@@ -2,8 +2,8 @@ TILE_CU_FILES := $(wildcard cleandl/cutile-kernels/*.cu)
 CUDA_CU_FILES := $(wildcard cleandl/cuda-kernels/*.cu)
 CU_FILES := $(TILE_CU_FILES) $(CUDA_CU_FILES)
 ARCHS := sm89 sm90a sm100a sm103a sm120a sm121a
-# rust-kernels require TMA (sm_90+).
-RUST_ARCHS := $(filter-out sm89,$(ARCHS))
+# rust-kernels require sm_100+.
+RUST_ARCHS := $(filter-out sm90a,$(filter-out sm89,$(ARCHS)))
 
 RUST_KERNEL_DIR := cleandl/rust-kernels
 RUST_KERNEL_OUT := $(RUST_KERNEL_DIR)/target/kernels

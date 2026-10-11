@@ -6,16 +6,16 @@ use skycuda::module::Module;
 #[macro_export]
 macro_rules! include_cubins {
     ($base_path:literal) => {
-        $crate::include_cubins!(@build $base_path, Some(include_bytes!(concat!($base_path, ".sm89.cubin"))))
+        $crate::include_cubins!(@build $base_path, Some(include_bytes!(concat!($base_path, ".sm89.cubin"))), Some(include_bytes!(concat!($base_path, ".sm90a.cubin"))))
     };
-    // For modules that only support sm_90 and newer.
-    ($base_path:literal, sm90_plus) => {
-        $crate::include_cubins!(@build $base_path, None)
+    // For modules that only support sm_100 and newer.
+    ($base_path:literal, sm100_plus) => {
+        $crate::include_cubins!(@build $base_path, None, None)
     };
-    (@build $base_path:literal, $sm89:expr) => {
+    (@build $base_path:literal, $sm89:expr, $sm90a:expr) => {
         $crate::kernel::Cubins {
             sm89: $sm89,
-            sm90a: include_bytes!(concat!($base_path, ".sm90a.cubin")),
+            sm90a: $sm90a,
             sm100a: include_bytes!(concat!($base_path, ".sm100a.cubin")),
             sm103a: include_bytes!(concat!($base_path, ".sm103a.cubin")),
             sm120a: include_bytes!(concat!($base_path, ".sm120a.cubin")),
@@ -27,7 +27,7 @@ macro_rules! include_cubins {
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct Cubins<'a> {
     pub sm89: Option<&'a [u8]>,
-    pub sm90a: &'a [u8],
+    pub sm90a: Option<&'a [u8]>,
     pub sm100a: &'a [u8],
     pub sm103a: &'a [u8],
     pub sm120a: &'a [u8],
@@ -46,7 +46,11 @@ impl ResourceKey for Cubins<'static> {
                 Some(cubin) => cubin,
                 None => bail!("module does not support sm 8.9"),
             },
-            (9, 0) => self.sm90a,
+
+            (9, 0) => match self.sm90a {
+                Some(cubin) => cubin,
+                None => bail!("module does not support sm 9.0"),
+            },
             (10, 0) => self.sm100a,
             (10, 3) => self.sm103a,
             (12, 0) => self.sm120a,
@@ -68,7 +72,7 @@ impl ResourceKey for RustKernels {
     fn create(&self, cx: &Context) -> anyhow::Result<Self::Resource> {
         Ok((*cx.get_or_create_resource(include_cubins!(
             "../rust-kernels/target/kernels",
-            sm90_plus
+            sm100_plus
         ))?)
         .clone())
     }
