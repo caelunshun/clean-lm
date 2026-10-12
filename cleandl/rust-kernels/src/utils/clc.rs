@@ -4,7 +4,7 @@ use ptx_std::{
     block_rank_in_cluster,
     cluster::map_to_cta,
     cluster_size,
-    fence::{ProxyKind, fence_proxy, fence_proxy_async_generic_sync_restrict},
+    fence::{ProxyKind, fence_proxy},
     launch::{CancelDelivery, CancelResponse, try_cancel_launch},
     num_warps,
     warp_collectives::{LaneMask, elect, sync_warp, vote_any},

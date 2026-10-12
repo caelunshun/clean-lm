@@ -35,10 +35,10 @@ use crate::{
 };
 use core::{cell::UnsafeCell, ptr, simd::f32x8};
 use ptx_std::{
-    Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, WARP_SIZE,
+    Denormals, F32Ext, MBarrier, PhaseParity, WARP_SIZE,
     barrier::{BarrierAlignment, NamedBarrier, sync_threads},
     bf16, bf16x8, cluster, cluster_size, dynamic_smem_start, f8e4m3, f8e8m0,
-    fence::{ProxyKind, fence_proxy, fence_proxy_async_generic_sync_restrict},
+    fence::{ProxyKind, fence_proxy},
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
@@ -74,9 +74,9 @@ const NUM_WORKER_THREADS: usize = NUM_WORKER_WARPS * WARP_SIZE as usize;
 
 #[repr(C, align(1024))]
 struct SmemData<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK_SIZE: usize> {
-    load_slots: [[bf16x8; Self::BF16X8_PER_SLOT]; LOAD_SLOTS],
-    store_slot: [bf16x8; Self::BF16X8_PER_SLOT],
-    reduction_scratchpad: [[f32; MICROBLOCK_SIZE]; NUM_WORKER_WARPS],
+    load_slots: [[UnsafeCell<bf16x8>; Self::BF16X8_PER_SLOT]; LOAD_SLOTS],
+    store_slot: [UnsafeCell<bf16x8>; Self::BF16X8_PER_SLOT],
+    reduction_scratchpad: [[UnsafeCell<f32>; MICROBLOCK_SIZE]; NUM_WORKER_WARPS],
     load_slot_produced: [MBarrier; LOAD_SLOTS],
     load_slot_consumed: [MBarrier; LOAD_SLOTS],
     store_slot_produced: MBarrier,
@@ -119,7 +119,7 @@ struct RmsnormFwd<
     const WORKER_WARP_REGS: u32,
     const AUX_WARP_REGS: u32,
 > {
-    smem: &'a mut SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>,
+    smem: &'a SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>,
     cluster_reduction_scratch: *mut bf16,
     gamma: *const bf16,
     r_inv: *mut f32,
@@ -195,7 +195,7 @@ impl<
 
                 // zero out the SMEM
                 ptx_std::memory::zero_fill_shared(
-                    this.smem.load_slots.as_mut_ptr().cast(),
+                    this.smem.load_slots.as_ptr() as *mut u8,
                     size_of_val(&this.smem.load_slots),
                 );
                 fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
@@ -206,7 +206,7 @@ impl<
                 let bytes = size_of::<bf16>() as u32 * this.actual_row_size;
                 bar.arrive_expect_tx(bytes);
                 tma::bulk_load(
-                    this.smem.load_slots[0].as_mut_ptr().cast(),
+                    this.smem.load_slots[0].as_ptr() as *mut u8,
                     this.gamma.cast(),
                     bytes,
                     bar,
@@ -221,7 +221,10 @@ impl<
             if WarpRole::get() == WarpRole::Worker {
                 while !this.smem.gamma_loaded.try_wait(PhaseParity::Even) {}
                 copy_aligned16(
-                    this.smem.load_slots[0].as_ptr().add(thread_id().x as usize),
+                    this.smem.load_slots[0]
+                        .as_ptr()
+                        .add(thread_id().x as usize)
+                        .cast(),
                     thr_gamma.as_mut_ptr(),
                     Self::ELEMENTX8_PER_ROW_PER_THREAD,
                     NUM_WORKER_THREADS,
@@ -344,7 +347,7 @@ impl<
                         .as_ptr()
                         .add(row * ROW_SIZE / 8 + thread_id().x as usize);
                     copy_aligned16(
-                        smem_x,
+                        smem_x.cast(),
                         thr_x[row].as_mut_ptr(),
                         Self::ELEMENTX8_PER_ROW_PER_THREAD,
                         NUM_WORKER_THREADS,
@@ -375,9 +378,10 @@ impl<
                     #[rustc_unroll(full)]
                     for row in 0..MICROBLOCK_SIZE {
                         self.smem.reduction_scratchpad[warp_id() as usize]
-                            .as_mut_ptr()
+                            .as_ptr()
                             .add(row)
-                            .write(sum2[row]);
+                            .cast_mut()
+                            .write(UnsafeCell::new(sum2[row]));
                     }
                 }
 
@@ -391,9 +395,10 @@ impl<
                     #[rustc_unroll(full)]
                     for w in 0..NUM_WORKER_WARPS {
                         sum2[row] += self.smem.reduction_scratchpad[w]
-                            .as_mut_ptr()
+                            .as_ptr()
                             .add(row)
-                            .read();
+                            .read()
+                            .into_inner();
                     }
                 }
 
@@ -463,11 +468,11 @@ impl<
                 let smem_y = self
                     .smem
                     .store_slot
-                    .as_mut_ptr()
+                    .as_ptr()
                     .add(row * ROW_SIZE / 8 + thread_id().x as usize);
                 copy_aligned16(
                     thr_y[row].as_ptr(),
-                    smem_y,
+                    smem_y as *mut bf16x8,
                     Self::ELEMENTX8_PER_ROW_PER_THREAD,
                     1,
                     NUM_WORKER_THREADS,
@@ -553,9 +558,9 @@ impl<
                         if row < self.num_rows {
                             tma::bulk_load(
                                 self.smem.load_slots[slot_idx]
-                                    .as_mut_ptr()
+                                    .as_ptr()
                                     .add(ROW_SIZE / 8 * i)
-                                    .cast(),
+                                    as *mut u8,
                                 self.x
                                     .add(row as usize * self.actual_row_size as usize)
                                     .cast(),
