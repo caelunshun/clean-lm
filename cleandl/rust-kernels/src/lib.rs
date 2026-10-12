@@ -9,11 +9,10 @@
     gca_const_items,
     gca_adts,
     adt_const_params,
-    pointer_is_aligned_to,
-    iter_array_chunks,
     portable_simd,
     inherent_associated_types,
-    gca_macroless_args
+    gca_macroless_args,
+    asm_experimental_arch
 )]
 #![allow(
     incomplete_features,

@@ -29,6 +29,7 @@
 use crate::{
     utils::{
         clc::{ClcScheduler, ClcSmem},
+        compiler_magic::make_opaque,
         copy::copy_aligned16,
     },
     warp_reduce_sum_f32,
@@ -364,7 +365,7 @@ impl<
                 for row in 0..MICROBLOCK_SIZE {
                     #[rustc_unroll(full)]
                     for i in 0..Self::ELEMENTX8_PER_ROW_PER_THREAD {
-                        let xs = thr_x[row][i].to_f32();
+                        let xs = make_opaque(thr_x[row][i]).to_f32();
                         sum2[row] += (xs * xs).reduce_sum();
                     }
                     sum2[row] = warp_reduce_sum_f32(sum2[row]);
@@ -411,8 +412,8 @@ impl<
                     let rms = ms.rsqrt_approx::<{ Denormals::FlushToZero }>();
                     #[rustc_unroll(full)]
                     for i in 0..Self::ELEMENTX8_PER_ROW_PER_THREAD {
-                        let xs = thr_x[row][i].to_f32();
-                        let gammas = thr_gamma[i].to_f32();
+                        let xs = make_opaque(thr_x[row][i]).to_f32();
+                        let gammas = make_opaque(thr_gamma[i]).to_f32();
                         thr_x[row][i] = bf16x8::from_f32(xs * gammas * f32x8::splat(rms));
                     }
                     r_inv[row] = rms;
