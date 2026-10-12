@@ -4,7 +4,7 @@ use ptx_std::{
     block_rank_in_cluster,
     cluster::map_to_cta,
     cluster_size,
-    fence::fence_proxy_async_generic_sync_restrict,
+    fence::{ProxyKind, fence_proxy, fence_proxy_async_generic_sync_restrict},
     launch::{CancelDelivery, CancelResponse, try_cancel_launch},
     num_warps,
     warp_collectives::{LaneMask, elect, sync_warp, vote_any},
@@ -72,7 +72,7 @@ impl ClcScheduler {
                     let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
                     if elect(LaneMask::FULL).is_leader {
                         while !consumed
-                            .try_wait_scoped::<{ Scope::Cta }, { MemoryOrdering::Acquire }>(
+                            .try_wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Acquire }>(
                                 PhaseParity::of_phase(self.idx / STAGES as u32 - 1),
                             )
                         {}
@@ -134,7 +134,7 @@ impl ClcScheduler {
                 .assume_init()
                 .first_cta_id();
 
-            fence_proxy_async_generic_sync_restrict::<{ MemoryOrdering::Release }>();
+            fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
             if elect(LaneMask::FULL).is_leader {
                 let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
                 let consumed = &*map_to_cta(consumed as *const MBarrier as *mut MBarrier, 0);

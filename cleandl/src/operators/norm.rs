@@ -321,7 +321,7 @@ fn prefetch_stages(cx: &Context) -> usize {
 
 fn fwd_kernel_spec(inner_dim: usize, backend: Backend, cx: &Context) -> anyhow::Result<KernelSpec> {
     match (backend, inner_dim) {
-        (Backend::Rust, x) if x <= 2048 => Ok(KernelSpec {
+        (Backend::Rust, x) if x <= 2048 && x.is_multiple_of(16) => Ok(KernelSpec {
             name: "rmsnorm_fwd_bf16_in_bf16_out_row_size_2048",
             launch_config: Some(LaunchConfig {
                 cta_threads: 256,

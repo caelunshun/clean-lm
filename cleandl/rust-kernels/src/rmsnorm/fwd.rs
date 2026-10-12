@@ -38,12 +38,12 @@ use ptx_std::{
     Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, WARP_SIZE,
     barrier::{BarrierAlignment, NamedBarrier, sync_threads},
     bf16, bf16x8, cluster, cluster_size, dynamic_smem_start, f8e4m3, f8e8m0,
-    fence::fence_proxy_async_generic_sync_restrict,
+    fence::{ProxyKind, fence_proxy, fence_proxy_async_generic_sync_restrict},
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
     tma::{self, BulkWait},
-    warp_collectives::{LaneMask, elect},
+    warp_collectives::{LaneMask, elect, sync_warp},
     warp_id,
 };
 
@@ -76,7 +76,6 @@ const NUM_WORKER_THREADS: usize = NUM_WORKER_WARPS * WARP_SIZE as usize;
 struct SmemData<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK_SIZE: usize> {
     load_slots: [[bf16x8; Self::BF16X8_PER_SLOT]; LOAD_SLOTS],
     store_slot: [bf16x8; Self::BF16X8_PER_SLOT],
-    store_r_inv_slot: [f32; MICROBLOCK_SIZE],
     reduction_scratchpad: [[f32; MICROBLOCK_SIZE]; NUM_WORKER_WARPS],
     load_slot_produced: [MBarrier; LOAD_SLOTS],
     load_slot_consumed: [MBarrier; LOAD_SLOTS],
@@ -191,16 +190,15 @@ impl<
                 r_inv,
             };
 
-            if warp_id() == 0 {
-                // Zero out the SMEM slots.
-                #[rustc_unroll(full)]
-                for i in 0..LOAD_SLOTS {
-                    this.smem.load_slots[i].fill(bf16x8::ZERO);
-                }
-            }
-
             if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
                 this.init_barriers();
+
+                // zero out the SMEM
+                ptx_std::memory::zero_fill_shared(
+                    this.smem.load_slots.as_mut_ptr().cast(),
+                    size_of_val(&this.smem.load_slots),
+                );
+                fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
 
                 // load `gamma` into SMEM via TMA
                 let bar = &this.smem.gamma_loaded;
@@ -231,6 +229,7 @@ impl<
                 );
             }
 
+            sync_warp(LaneMask::FULL);
             sync_threads();
 
             let role = WarpRole::get();
@@ -385,7 +384,7 @@ impl<
                 NamedBarrier::new(0x03)
                     .sync_among::<{ BarrierAlignment::Unaligned }>(NUM_WORKER_THREADS as u32);
 
-                // Each warp aggregates the sums across warps
+                // Each warp aggregates the sums across lanes
                 #[rustc_unroll(full)]
                 for row in 0..MICROBLOCK_SIZE {
                     sum2[row] = 0.0;
@@ -398,6 +397,8 @@ impl<
                     }
                 }
 
+                let mut r_inv = [0.0f32; MICROBLOCK_SIZE];
+
                 // Apply normalization
                 #[rustc_unroll(full)]
                 for row in 0..MICROBLOCK_SIZE {
@@ -408,6 +409,18 @@ impl<
                         let xs = thr_x[row][i].to_f32();
                         let gammas = thr_gamma[i].to_f32();
                         thr_x[row][i] = bf16x8::from_f32(xs * gammas * f32x8::splat(rms));
+                    }
+                    r_inv[row] = rms;
+                }
+
+                // Store r_inv
+                if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
+                    #[rustc_unroll(full)]
+                    for i in 0..MICROBLOCK_SIZE {
+                        let row = i as u32 + self.current_microblock_first_row();
+                        if row < self.num_rows {
+                            self.r_inv.add(row as usize).write(r_inv[i]);
+                        }
                     }
                 }
 
@@ -461,7 +474,7 @@ impl<
                 );
             }
 
-            fence_proxy_async_generic_sync_restrict::<{ MemoryOrdering::Release }>();
+            fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
             self.arrive_on_store_slot();
         }
     }
@@ -567,34 +580,37 @@ impl<
                     break;
                 }
 
-                if elect(LaneMask::FULL).is_leader {
-                    match self.epilogue {
-                        Epilogue::StoreBf16 { y } => {
-                            self.wait_for_store_data_ready();
-                            self.tma_store_r_inv();
+                match self.epilogue {
+                    Epilogue::StoreBf16 { y } => {
+                        self.wait_for_store_data_ready();
+                        if elect(LaneMask::FULL).is_leader {
                             self.tma_store_bf16(y);
                             self.wait_for_and_notify_store_read_smem();
                         }
-                        Epilogue::StoreRowwiseMxfp8 {
-                            rowwise_y,
-                            rowwise_y_sf,
-                        } => {
-                            self.wait_for_store_data_ready();
-                            self.tma_store_r_inv();
+                    }
+                    Epilogue::StoreRowwiseMxfp8 {
+                        rowwise_y,
+                        rowwise_y_sf,
+                    } => {
+                        self.wait_for_store_data_ready();
+                        if elect(LaneMask::FULL).is_leader {
                             self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
                         }
-                        Epilogue::StoreRowwiseAndColwiseMxfp8 {
-                            rowwise_y,
-                            rowwise_y_sf,
-                            colwise_y,
-                            colwise_y_sf,
-                        } => {
-                            self.wait_for_store_data_ready();
-                            self.tma_store_r_inv();
+                    }
+                    Epilogue::StoreRowwiseAndColwiseMxfp8 {
+                        rowwise_y,
+                        rowwise_y_sf,
+                        colwise_y,
+                        colwise_y_sf,
+                    } => {
+                        self.wait_for_store_data_ready();
+                        if elect(LaneMask::FULL).is_leader {
                             self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
-                            self.wait_for_store_data_ready();
+                        }
+                        self.wait_for_store_data_ready();
+                        if elect(LaneMask::FULL).is_leader {
                             self.tma_store_mxfp8(colwise_y, colwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
                         }
@@ -622,29 +638,6 @@ impl<
             tma::bulk_commit_group();
             tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
             self.smem.store_slot_consumed.arrive();
-        }
-    }
-
-    #[inline(always)]
-    fn tma_store_r_inv(&self) {
-        unsafe {
-            let actual_rows =
-                if self.current_microblock_first_row() + MICROBLOCK_SIZE as u32 > self.num_rows {
-                    self.num_rows
-                        .saturating_sub(self.current_microblock_first_row())
-                } else {
-                    MICROBLOCK_SIZE as u32
-                };
-            let bytes = size_of::<f32>() as u32 * actual_rows;
-
-            tma::bulk_store(
-                self.r_inv
-                    .add(self.current_microblock_first_row() as usize)
-                    .cast(),
-                self.smem.store_r_inv_slot.as_ptr().cast(),
-                bytes,
-                None,
-            );
         }
     }
 
