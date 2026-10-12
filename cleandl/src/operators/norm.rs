@@ -86,7 +86,14 @@ impl NormExecutor {
         };
 
         let spec = fwd_kernel_spec(inner_dim, self.backend, &self.cx)?;
-        let (kernel, grid_size) = self.persistent_kernel(&spec, stream)?;
+        let (kernel, grid_size) = match self.backend {
+            Backend::Rust => {
+                let function = self.module.get_function(spec.name)?;
+                function.set_max_dynamic_smem(spec.launch_config.as_ref().unwrap().dynamic_smem)?;
+                (function, (batch_size as u32).div_ceil(spec.block_size))
+            }
+            Backend::CuTile => self.persistent_kernel(&spec, stream)?,
+        };
 
         {
             let x_memory = x.storage();
@@ -94,34 +101,15 @@ impl NormExecutor {
             let out_y_memory = out_y.storage_mut();
             let out_r_inv_memory = out_r_inv.storage_mut();
 
-            let tma_x;
-            let mut tma_y;
-
             let mut launch = stream.launch_builder(&kernel);
             match self.backend {
                 Backend::Rust => {
                     launch.arg(gamma_memory)?;
 
-                    tma_x = TensorMap::new(
-                        x_memory,
-                        TensorMapDesc::new(
-                            TensorMapDataType::BF16,
-                            &[inner_dim as u64, batch_size as u64],
-                            &[1, inner_dim as u64],
-                            &[spec.row_size, spec.microblock_size],
-                        ),
-                    );
-                    tma_y = TensorMapMut::new(
-                        out_y_memory,
-                        TensorMapDesc::new(
-                            TensorMapDataType::BF16,
-                            &[inner_dim as u64, batch_size as u64],
-                            &[1, inner_dim as u64],
-                            &[spec.row_size, spec.microblock_size],
-                        ),
-                    );
-
-                    launch.arg(&tma_x)?.arg(&mut tma_y)?.arg(out_r_inv_memory)?;
+                    launch
+                        .arg(x_memory)?
+                        .arg(out_y_memory)?
+                        .arg(out_r_inv_memory)?;
 
                     launch.arg(inner_dim as u32)?;
                     launch.arg((inner_dim as f64).recip() as f32)?;

@@ -72,10 +72,10 @@ pub(crate) unsafe fn copy_aligned4<T: Pod>(
         for i in 0..copy_blocks {
             let src = src
                 .add(i * src_stride * elements_per_u32::<T>() as usize)
-                .cast::<u32x4>();
+                .cast::<u32>();
             let dst = dst
                 .add(i * dst_stride * elements_per_u32::<T>() as usize)
-                .cast::<u32x4>();
+                .cast::<u32>();
             dst.write(src.read());
         }
     }

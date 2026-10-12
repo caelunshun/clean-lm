@@ -7,7 +7,7 @@ use ptx_std::{
     fence::fence_proxy_async_generic_sync_restrict,
     launch::{CancelDelivery, CancelResponse, try_cancel_launch},
     num_warps,
-    warp_collectives::{LaneMask, elect, sync_warp, vote_all},
+    warp_collectives::{LaneMask, elect, sync_warp, vote_any},
     warp_id,
 };
 
@@ -73,7 +73,7 @@ impl ClcScheduler {
                     if elect(LaneMask::FULL).is_leader {
                         while !consumed
                             .try_wait_scoped::<{ Scope::Cta }, { MemoryOrdering::Acquire }>(
-                                PhaseParity::of_phase(self.idx - STAGES as u32),
+                                PhaseParity::of_phase(self.idx / STAGES as u32 - 1),
                             )
                         {}
                     }
@@ -91,7 +91,7 @@ impl ClcScheduler {
                     try_cancel_launch::<{ CancelDelivery::Cluster }>(response_ptr.cast(), ready);
 
                     // Observe for ourselves whether we should continue the loop.
-                    while !ready.try_wait(PhaseParity::of_phase(self.idx)) {}
+                    while !ready.try_wait(PhaseParity::of_phase(self.idx / STAGES as u32)) {}
 
                     let response = response_ptr.read().assume_init();
                     if !response.is_canceled() {
@@ -99,7 +99,7 @@ impl ClcScheduler {
                     }
                 }
 
-                if vote_all(LaneMask::FULL, done) {
+                if vote_any(LaneMask::FULL, done) {
                     break;
                 }
 
@@ -119,7 +119,7 @@ impl ClcScheduler {
 
         unsafe {
             let ready = &(&*self.smem).produced[self.idx as usize % STAGES];
-            let parity = PhaseParity::of_phase(self.idx);
+            let parity = PhaseParity::of_phase(self.idx / STAGES as u32);
             if elect(LaneMask::FULL).is_leader {
                 while !ready
                     .try_wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Acquire }>(parity)

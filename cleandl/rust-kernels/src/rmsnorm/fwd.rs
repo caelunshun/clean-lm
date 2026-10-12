@@ -24,7 +24,7 @@
 //!
 //! The kernel is parametrized over a maximum row size. It can handle smaller
 //! row sizes with correct zero-padding and mean divisor. The effective row size
-//! must be a multiple of 2, else the behavior is undefined.
+//! must be a multiple of 16, else the behavior is undefined.
 
 use crate::{
     utils::{
@@ -37,12 +37,12 @@ use core::{cell::UnsafeCell, ptr, simd::f32x8};
 use ptx_std::{
     Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, WARP_SIZE,
     barrier::{BarrierAlignment, NamedBarrier, sync_threads},
-    bf16, bf16x8, cluster, cluster_size, dynamic_smem_start, f8e8m0,
+    bf16, bf16x8, cluster, cluster_size, dynamic_smem_start, f8e4m3, f8e8m0,
     fence::fence_proxy_async_generic_sync_restrict,
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
-    tma::{self, BulkWait, TmaDescriptor},
+    tma::{self, BulkWait},
     warp_collectives::{LaneMask, elect},
     warp_id,
 };
@@ -95,18 +95,18 @@ impl<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK_SIZE: usiz
 }
 
 #[derive(Debug)]
-enum Epilogue<'a> {
+enum Epilogue {
     StoreBf16 {
-        tma_y: &'a TmaDescriptor,
+        y: *mut bf16,
     },
     StoreRowwiseMxfp8 {
-        tma_rowwise_y: &'a TmaDescriptor,
+        rowwise_y: *mut f8e4m3,
         rowwise_y_sf: *mut f8e8m0,
     },
     StoreRowwiseAndColwiseMxfp8 {
-        tma_rowwise_y: &'a TmaDescriptor,
+        rowwise_y: *mut f8e4m3,
         rowwise_y_sf: *mut f8e8m0,
-        tma_colwise_y: &'a TmaDescriptor,
+        colwise_y: *mut f8e4m3,
         colwise_y_sf: *mut f8e8m0,
     },
 }
@@ -124,8 +124,8 @@ struct RmsnormFwd<
     cluster_reduction_scratch: *mut bf16,
     gamma: *const bf16,
     r_inv: *mut f32,
-    tma_x: &'a TmaDescriptor,
-    epilogue: Epilogue<'a>,
+    x: *const bf16,
+    epilogue: Epilogue,
     actual_row_size: u32,
     actual_row_size_recip: f32,
     num_rows: u32,
@@ -163,8 +163,8 @@ impl<
     #[inline(always)]
     pub fn run(
         gamma: *const bf16,
-        tma_x: &'a TmaDescriptor,
-        epilogue: Epilogue<'a>,
+        x: *const bf16,
+        epilogue: Epilogue,
         r_inv: *mut f32,
         actual_row_size: u32,
         actual_row_size_recip: f32,
@@ -179,17 +179,25 @@ impl<
                 smem,
                 cluster_reduction_scratch,
                 gamma,
-                tma_x,
+                x,
                 epilogue,
                 actual_row_size,
                 actual_row_size_recip,
                 current_block: 0,
                 // cause first call to next_microblock() to advance to the first block
-                current_microblock: (ROW_SIZE / MICROBLOCK_SIZE) as u32 - 1,
+                current_microblock: (BLOCK_SIZE / MICROBLOCK_SIZE) as u32 - 1,
                 store_idx: 0,
                 num_rows,
                 r_inv,
             };
+
+            if warp_id() == 0 {
+                // Zero out the SMEM slots.
+                #[rustc_unroll(full)]
+                for i in 0..LOAD_SLOTS {
+                    this.smem.load_slots[i].fill(bf16x8::ZERO);
+                }
+            }
 
             if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
                 this.init_barriers();
@@ -208,7 +216,7 @@ impl<
                 );
             }
 
-            cluster::barrier_sync::<{ BarrierAlignment::Aligned }>();
+            cluster::barrier_sync::<{ BarrierAlignment::Unaligned }>();
 
             let mut thr_gamma = [bf16x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD];
 
@@ -237,13 +245,17 @@ impl<
                         WarpRole::TmaLoad => this.run_tma_load_warp(),
                         WarpRole::TmaStore => this.run_tma_store_warp(),
                         WarpRole::Clc => this.clc.run_scheduler(),
-                        WarpRole::None => {}
+                        WarpRole::None => loop {
+                            if !this.next_microblock() {
+                                break;
+                            }
+                        },
                         WarpRole::Worker => unreachable!(),
                     }
                 }
             }
 
-            cluster::barrier_sync::<{ BarrierAlignment::Aligned }>();
+            cluster::barrier_sync::<{ BarrierAlignment::Unaligned }>();
         }
     }
 
@@ -263,18 +275,18 @@ impl<
             #[rustc_unroll(full)]
             for slot_idx in 0..LOAD_SLOTS {
                 self.smem.load_slot_produced[slot_idx].init(1);
-                self.smem.load_slot_consumed[slot_idx].init(WARP_SIZE * NUM_WORKER_WARPS as u32);
+                self.smem.load_slot_consumed[slot_idx].init(NUM_WORKER_THREADS as u32);
             }
             self.smem
                 .store_slot_produced
-                .init(WARP_SIZE * NUM_WORKER_WARPS as u32);
+                .init(NUM_WORKER_THREADS as u32);
             self.smem.store_slot_consumed.init(1);
             self.smem
                 .cluster_col_amax_produced
-                .init(cluster_size() * WARP_SIZE * NUM_WORKER_WARPS as u32);
+                .init(cluster_size() * NUM_WORKER_THREADS as u32);
             self.smem
                 .cluster_col_amax_consumed
-                .init(cluster_size() * WARP_SIZE * NUM_WORKER_WARPS as u32);
+                .init(cluster_size() * NUM_WORKER_THREADS as u32);
             self.smem.gamma_loaded.init(1);
 
             MBarrier::fence_init();
@@ -287,7 +299,7 @@ impl<
         unsafe {
             match self.clc.get_next_block() {
                 Some(block) => {
-                    self.current_block = block.x * BLOCK_SIZE as u32;
+                    self.current_block = block.x;
                     self.current_microblock = 0;
                     true
                 }
@@ -322,7 +334,7 @@ impl<
 
                 let slot_idx = microblock_idx as usize % LOAD_SLOTS;
                 let ready = &self.smem.load_slot_produced[slot_idx];
-                while !ready.try_wait(PhaseParity::of_phase(microblock_idx)) {}
+                while !ready.try_wait(PhaseParity::of_phase(microblock_idx / LOAD_SLOTS as u32)) {}
 
                 // Load `x`
                 let mut thr_x =
@@ -356,8 +368,8 @@ impl<
                     sum2[row] = warp_reduce_sum_f32(sum2[row]);
                 }
 
-                NamedBarrier::new(0x01)
-                    .sync_among::<{ BarrierAlignment::Aligned }>(NUM_WORKER_THREADS as u32);
+                NamedBarrier::new(0x02)
+                    .sync_among::<{ BarrierAlignment::Unaligned }>(NUM_WORKER_THREADS as u32);
 
                 // Publish our warp's sums to SMEM
                 if elect(LaneMask::FULL).is_leader {
@@ -370,8 +382,8 @@ impl<
                     }
                 }
 
-                NamedBarrier::new(0x01)
-                    .sync_among::<{ BarrierAlignment::Aligned }>(NUM_WORKER_THREADS as u32);
+                NamedBarrier::new(0x03)
+                    .sync_among::<{ BarrierAlignment::Unaligned }>(NUM_WORKER_THREADS as u32);
 
                 // Each warp aggregates the sums across warps
                 #[rustc_unroll(full)]
@@ -390,7 +402,7 @@ impl<
                 #[rustc_unroll(full)]
                 for row in 0..MICROBLOCK_SIZE {
                     let ms = self.actual_row_size_recip * sum2[row] + 1e-6;
-                    let rms = ms.sqrt_approx::<{ Denormals::FlushToZero }>();
+                    let rms = ms.rsqrt_approx::<{ Denormals::FlushToZero }>();
                     #[rustc_unroll(full)]
                     for i in 0..Self::ELEMENTX8_PER_ROW_PER_THREAD {
                         let xs = thr_x[row][i].to_f32();
@@ -501,19 +513,45 @@ impl<
 
                 if microblock_idx >= LOAD_SLOTS as u32 {
                     let bar = &self.smem.load_slot_consumed[slot_idx];
-                    while !bar.try_wait(PhaseParity::of_phase(microblock_idx).flip()) {}
+                    while !bar
+                        .try_wait(PhaseParity::of_phase(microblock_idx / LOAD_SLOTS as u32).flip())
+                    {
+                    }
                 }
 
                 let bar = &self.smem.load_slot_produced[slot_idx];
                 if elect(LaneMask::FULL).is_leader {
-                    bar.arrive_expect_tx((size_of::<bf16>() * MICROBLOCK_SIZE * ROW_SIZE) as u32);
-                    tma::tma_load_tile(
-                        self.smem.load_slots[slot_idx].as_mut_ptr().cast(),
-                        bar,
-                        self.tma_x,
-                        [0, self.current_microblock_first_row() as i32],
-                        Some(CachePolicy::new::<{ L2EvictionPriority::First }>()),
-                    );
+                    let actual_rows = if self.current_microblock_first_row()
+                        + MICROBLOCK_SIZE as u32
+                        > self.num_rows
+                    {
+                        self.num_rows
+                            .saturating_sub(self.current_microblock_first_row())
+                    } else {
+                        MICROBLOCK_SIZE as u32
+                    };
+                    let bytes = actual_rows * self.actual_row_size * size_of::<bf16>() as u32;
+
+                    bar.arrive_expect_tx(bytes);
+
+                    #[rustc_unroll(full)]
+                    for i in 0..MICROBLOCK_SIZE {
+                        let row = i as u32 + self.current_microblock_first_row();
+                        if row < self.num_rows {
+                            tma::bulk_load(
+                                self.smem.load_slots[slot_idx]
+                                    .as_mut_ptr()
+                                    .add(ROW_SIZE / 8 * i)
+                                    .cast(),
+                                self.x
+                                    .add(row as usize * self.actual_row_size as usize)
+                                    .cast(),
+                                size_of::<bf16>() as u32 * self.actual_row_size,
+                                bar,
+                                Some(CachePolicy::new::<{ L2EvictionPriority::First }>()),
+                            );
+                        }
+                    }
                 }
 
                 microblock_idx += 1;
@@ -531,33 +569,33 @@ impl<
 
                 if elect(LaneMask::FULL).is_leader {
                     match self.epilogue {
-                        Epilogue::StoreBf16 { tma_y } => {
+                        Epilogue::StoreBf16 { y } => {
                             self.wait_for_store_data_ready();
                             self.tma_store_r_inv();
-                            self.tma_store_bf16(tma_y);
+                            self.tma_store_bf16(y);
                             self.wait_for_and_notify_store_read_smem();
                         }
                         Epilogue::StoreRowwiseMxfp8 {
-                            tma_rowwise_y,
+                            rowwise_y,
                             rowwise_y_sf,
                         } => {
                             self.wait_for_store_data_ready();
                             self.tma_store_r_inv();
-                            self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
+                            self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
                         }
                         Epilogue::StoreRowwiseAndColwiseMxfp8 {
-                            tma_rowwise_y,
+                            rowwise_y,
                             rowwise_y_sf,
-                            tma_colwise_y,
+                            colwise_y,
                             colwise_y_sf,
                         } => {
                             self.wait_for_store_data_ready();
                             self.tma_store_r_inv();
-                            self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
+                            self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
                             self.wait_for_store_data_ready();
-                            self.tma_store_mxfp8(tma_colwise_y, colwise_y_sf);
+                            self.tma_store_mxfp8(colwise_y, colwise_y_sf);
                             self.wait_for_and_notify_store_read_smem();
                         }
                     }
@@ -592,7 +630,8 @@ impl<
         unsafe {
             let actual_rows =
                 if self.current_microblock_first_row() + MICROBLOCK_SIZE as u32 > self.num_rows {
-                    self.num_rows - self.current_block_first_row()
+                    self.num_rows
+                        .saturating_sub(self.current_microblock_first_row())
                 } else {
                     MICROBLOCK_SIZE as u32
                 };
@@ -610,19 +649,24 @@ impl<
     }
 
     #[inline(always)]
-    fn tma_store_bf16(&self, tma_y: &TmaDescriptor) {
+    fn tma_store_bf16(&self, y: *mut bf16) {
         unsafe {
-            tma::tma_store_tile(
-                self.smem.store_slot.as_ptr().cast(),
-                tma_y,
-                [0, self.current_microblock_first_row() as i32],
-                None,
-            );
+            for i in 0..MICROBLOCK_SIZE {
+                let row = i as u32 + self.current_microblock_first_row();
+                if row < self.num_rows {
+                    tma::bulk_store(
+                        y.add(self.actual_row_size as usize * row as usize).cast(),
+                        self.smem.store_slot.as_ptr().add(ROW_SIZE / 8 * i).cast(),
+                        size_of::<bf16>() as u32 * self.actual_row_size,
+                        None,
+                    );
+                }
+            }
         }
     }
 
     #[inline(always)]
-    fn tma_store_mxfp8(&self, tma_y: &TmaDescriptor, y_sf: *mut f8e8m0) -> u32 {
+    fn tma_store_mxfp8(&self, y: *mut f8e4m3, y_sf: *mut f8e8m0) -> u32 {
         todo!()
     }
 }
@@ -631,8 +675,8 @@ impl<
 #[nvptx(exact_threads_per_cta(256, 1, 1), max_registers(128))]
 pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_bf16_in_bf16_out_row_size_2048(
     gamma: *const bf16,
-    #[nvptx(grid_constant)] tma_x: &TmaDescriptor,
-    #[nvptx(grid_constant)] tma_y: &TmaDescriptor,
+    x: *const bf16,
+    y: *mut bf16,
     r_inv: *mut f32,
     actual_row_size: u32,
     actual_row_size_recip: f32,
@@ -640,8 +684,8 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_bf16_in_bf16_out_row_size_2048(
 ) {
     RmsnormFwd::<2048, 8, 64, 2, 224, 32>::run(
         gamma,
-        tma_x,
-        Epilogue::StoreBf16 { tma_y },
+        x,
+        Epilogue::StoreBf16 { y },
         r_inv,
         actual_row_size,
         actual_row_size_recip,
