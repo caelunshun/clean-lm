@@ -34,9 +34,9 @@ use ptx_std::{
 #[cfg(not(target_feature = "sm_100"))]
 compile_error!("rust-kernels requires sm_100 or newer");
 
-// pub mod norm;
+pub mod norm;
 pub mod rmsnorm;
-// pub mod sky_matmul;
+pub mod sky_matmul;
 mod utils;
 
 const WARP_SIZE: u32 = 32;

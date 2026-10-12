@@ -7,8 +7,12 @@ use crate::{
 use anyhow::bail;
 use half::bf16;
 use skycuda::{
-    device_memory_pool::DeviceMemoryPool, function::Function, launch::LaunchBuilder,
-    module::Module, stream::Stream,
+    device_memory_pool::DeviceMemoryPool,
+    function::Function,
+    launch::LaunchBuilder,
+    module::Module,
+    stream::Stream,
+    tensor_map::{TensorMap, TensorMapDataType, TensorMapDesc, TensorMapMut},
 };
 use skytens_core::{
     data_type::{ElementType, FloatType},
@@ -90,13 +94,48 @@ impl NormExecutor {
             let out_y_memory = out_y.storage_mut();
             let out_r_inv_memory = out_r_inv.storage_mut();
 
+            let tma_x;
+            let mut tma_y;
+
             let mut launch = stream.launch_builder(&kernel);
-            launch
-                .arg(x_memory)?
-                .arg(gamma_memory)?
-                .arg(out_y_memory)?
-                .arg(out_r_inv_memory)?
-                .arg(i32::try_from(batch_size)?)?;
+            match self.backend {
+                Backend::Rust => {
+                    launch.arg(gamma_memory)?;
+
+                    tma_x = TensorMap::new(
+                        x_memory,
+                        TensorMapDesc::new(
+                            TensorMapDataType::BF16,
+                            &[inner_dim as u64, batch_size as u64],
+                            &[1, inner_dim as u64],
+                            &[spec.row_size, spec.microblock_size],
+                        ),
+                    );
+                    tma_y = TensorMapMut::new(
+                        out_y_memory,
+                        TensorMapDesc::new(
+                            TensorMapDataType::BF16,
+                            &[inner_dim as u64, batch_size as u64],
+                            &[1, inner_dim as u64],
+                            &[spec.row_size, spec.microblock_size],
+                        ),
+                    );
+
+                    launch.arg(&tma_x)?.arg(&mut tma_y)?.arg(out_r_inv_memory)?;
+
+                    launch.arg(inner_dim as u32)?;
+                    launch.arg((inner_dim as f64).recip() as f32)?;
+                    launch.arg(batch_size as u32)?;
+                }
+                Backend::CuTile => {
+                    launch
+                        .arg(x_memory)?
+                        .arg(gamma_memory)?
+                        .arg(out_y_memory)?
+                        .arg(out_r_inv_memory)?
+                        .arg(i32::try_from(batch_size)?)?;
+                }
+            }
             spec.configure(&mut launch)?;
 
             unsafe {
@@ -253,10 +292,14 @@ impl NormExecutor {
 
 const NULL_POINTER: u64 = 0;
 
+#[derive(Default)]
 struct KernelSpec {
     name: &'static str,
     /// `None` for cuTile kernels, whose block dim and smem are set by TileIR.
     launch_config: Option<LaunchConfig>,
+    row_size: u32,
+    microblock_size: u32,
+    block_size: u32,
 }
 
 struct LaunchConfig {
@@ -290,16 +333,22 @@ fn prefetch_stages(cx: &Context) -> usize {
 
 fn fwd_kernel_spec(inner_dim: usize, backend: Backend, cx: &Context) -> anyhow::Result<KernelSpec> {
     match (backend, inner_dim) {
-        (Backend::Rust, 2048) => Ok(KernelSpec {
-            name: "rmsnorm_bf16_warp_persistent_inner2048",
+        (Backend::Rust, x) if x <= 2048 => Ok(KernelSpec {
+            name: "rmsnorm_fwd_bf16_in_bf16_out_row_size_2048",
             launch_config: Some(LaunchConfig {
-                cta_threads: 384,
-                dynamic_smem: fwd_required_smem(2048, prefetch_stages(cx), 12, cx),
+                cta_threads: 256,
+                dynamic_smem: cx.cuda().max_dynamic_smem_per_cta(),
             }),
+            block_size: 64,
+            microblock_size: 8,
+            row_size: 2048,
         }),
         (Backend::CuTile, 2048) => Ok(KernelSpec {
             name: "rmsnorm_fwd_inner2048_persistent",
             launch_config: None,
+            block_size: 1,
+            microblock_size: 1,
+            row_size: 2048,
         }),
         (_, dim) => bail!("unimplemented inner dimension {dim} for rms prenorm forward"),
     }
@@ -313,10 +362,12 @@ fn bwd_kernel_spec(inner_dim: usize, backend: Backend, cx: &Context) -> anyhow::
                 cta_threads: 256,
                 dynamic_smem: bwd_required_smem(2048, 4, prefetch_stages(cx), 8),
             }),
+            ..Default::default()
         }),
         (Backend::CuTile, 2048) => Ok(KernelSpec {
             name: "rmsnorm_bwd_inner2048_persistent",
             launch_config: None,
+            ..Default::default()
         }),
         (_, dim) => bail!("unimplemented inner dimension {dim} for rms prenorm backward"),
     }

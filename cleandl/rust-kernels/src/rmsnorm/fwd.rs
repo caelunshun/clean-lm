@@ -42,7 +42,7 @@ use ptx_std::{
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
-    tma::{self, TmaDescriptor},
+    tma::{self, BulkWait, TmaDescriptor},
     warp_collectives::{LaneMask, elect},
     warp_id,
 };
@@ -72,7 +72,12 @@ impl WarpRole {
 const NUM_WORKER_WARPS: usize = 4;
 const NUM_WORKER_THREADS: usize = NUM_WORKER_WARPS * WARP_SIZE as usize;
 
-struct SmemData<const LOAD_SLOTS: usize> {
+#[repr(C, align(1024))]
+struct SmemData<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK_SIZE: usize> {
+    load_slots: [[bf16x8; Self::BF16X8_PER_SLOT]; LOAD_SLOTS],
+    store_slot: [bf16x8; Self::BF16X8_PER_SLOT],
+    store_r_inv_slot: [f32; MICROBLOCK_SIZE],
+    reduction_scratchpad: [[f32; MICROBLOCK_SIZE]; NUM_WORKER_WARPS],
     load_slot_produced: [MBarrier; LOAD_SLOTS],
     load_slot_consumed: [MBarrier; LOAD_SLOTS],
     store_slot_produced: MBarrier,
@@ -83,58 +88,10 @@ struct SmemData<const LOAD_SLOTS: usize> {
     clc: UnsafeCell<ClcSmem>,
 }
 
-struct Smem<
-    const ROW_SIZE: usize,
-    const MICROBLOCK_SIZE: usize,
-    const LOAD_SLOTS: usize,
-    const STORE_BITS_PER_ELEMENT: usize,
-    const SF_BLOCK_SIZE: usize,
-> {
-    base: *mut u8,
-}
-
-impl<
-    const ROW_SIZE: usize,
-    const MICROBLOCK_SIZE: usize,
-    const LOAD_SLOTS: usize,
-    const STORE_BITS_PER_ELEMENT: usize,
-    const SF_BLOCK_SIZE: usize,
-> Smem<ROW_SIZE, MICROBLOCK_SIZE, LOAD_SLOTS, STORE_BITS_PER_ELEMENT, SF_BLOCK_SIZE>
+impl<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK_SIZE: usize>
+    SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>
 {
-    const LOAD_SLOT_BYTES: usize = size_of::<bf16>() * ROW_SIZE * MICROBLOCK_SIZE;
-    const STORE_SLOT_BYTES: usize = ROW_SIZE * MICROBLOCK_SIZE * STORE_BITS_PER_ELEMENT / 8;
-    const STORE_SLOT_SF_BYTES: usize = ROW_SIZE * MICROBLOCK_SIZE / SF_BLOCK_SIZE;
-    const REDUCTION_SCRATCH_BYTES: usize = size_of::<f32>() * NUM_WORKER_WARPS * MICROBLOCK_SIZE;
-
-    #[inline(always)]
-    pub unsafe fn get_load_slot(&self, slot_idx: usize) -> *mut u8 {
-        unsafe { self.base.add(slot_idx * LOAD_SLOTS) }
-    }
-
-    #[inline(always)]
-    pub unsafe fn get_store_slot(&self) -> *mut u8 {
-        unsafe { self.get_load_slot(LOAD_SLOTS) }
-    }
-
-    #[inline(always)]
-    pub unsafe fn get_store_slot_sf(&self) -> *mut u8 {
-        unsafe { self.get_store_slot().add(Self::STORE_SLOT_BYTES) }
-    }
-
-    #[inline(always)]
-    pub unsafe fn get_reduction_scratch(&self) -> *mut u8 {
-        unsafe { self.get_store_slot_sf().add(Self::STORE_SLOT_SF_BYTES) }
-    }
-
-    #[inline(always)]
-    pub unsafe fn data(&self) -> &SmemData<LOAD_SLOTS> {
-        unsafe {
-            &*self
-                .get_reduction_scratch()
-                .add(Self::REDUCTION_SCRATCH_BYTES)
-                .cast()
-        }
-    }
+    const BF16X8_PER_SLOT: usize = MICROBLOCK_SIZE * ROW_SIZE / 8;
 }
 
 #[derive(Debug)]
@@ -160,18 +117,18 @@ struct RmsnormFwd<
     const MICROBLOCK_SIZE: usize,
     const BLOCK_SIZE: usize,
     const LOAD_SLOTS: usize,
-    const STORE_BITS_PER_ELEMENT: usize,
-    const SF_BLOCK_SIZE: usize,
     const WORKER_WARP_REGS: u32,
     const AUX_WARP_REGS: u32,
 > {
-    smem: Smem<ROW_SIZE, MICROBLOCK_SIZE, LOAD_SLOTS, STORE_BITS_PER_ELEMENT, SF_BLOCK_SIZE>,
+    smem: &'a mut SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>,
     cluster_reduction_scratch: *mut bf16,
     gamma: *const bf16,
+    r_inv: *mut f32,
     tma_x: &'a TmaDescriptor,
     epilogue: Epilogue<'a>,
     actual_row_size: u32,
     actual_row_size_recip: f32,
+    num_rows: u32,
 
     current_block: u32,
     current_microblock: u32,
@@ -187,8 +144,6 @@ impl<
     const MICROBLOCK_SIZE: usize,
     const BLOCK_SIZE: usize,
     const LOAD_SLOTS: usize,
-    const STORE_BITS_PER_ELEMENT: usize,
-    const SF_BLOCK_SIZE: usize,
     const WORKER_WARP_REGS: u32,
     const AUX_WARP_REGS: u32,
 >
@@ -198,8 +153,6 @@ impl<
         MICROBLOCK_SIZE,
         BLOCK_SIZE,
         LOAD_SLOTS,
-        STORE_BITS_PER_ELEMENT,
-        SF_BLOCK_SIZE,
         WORKER_WARP_REGS,
         AUX_WARP_REGS,
     >
@@ -212,22 +165,17 @@ impl<
         gamma: *const bf16,
         tma_x: &'a TmaDescriptor,
         epilogue: Epilogue<'a>,
+        r_inv: *mut f32,
         actual_row_size: u32,
         actual_row_size_recip: f32,
+        num_rows: u32,
         cluster_reduction_scratch: *mut bf16,
     ) {
         unsafe {
-            let smem = Smem::<
-                ROW_SIZE,
-                MICROBLOCK_SIZE,
-                LOAD_SLOTS,
-                STORE_BITS_PER_ELEMENT,
-                SF_BLOCK_SIZE,
-            > {
-                base: dynamic_smem_start(),
-            };
+            let smem = &mut *dynamic_smem_start()
+                .cast::<SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>>();
             let mut this = Self {
-                clc: ClcScheduler::new(smem.data().clc.get()),
+                clc: ClcScheduler::new(smem.clc.get()),
                 smem,
                 cluster_reduction_scratch,
                 gamma,
@@ -239,19 +187,25 @@ impl<
                 // cause first call to next_microblock() to advance to the first block
                 current_microblock: (ROW_SIZE / MICROBLOCK_SIZE) as u32 - 1,
                 store_idx: 0,
+                num_rows,
+                r_inv,
             };
-
-            let smem_gamma = this.smem.get_load_slot(0);
 
             if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
                 this.init_barriers();
 
                 // load `gamma` into SMEM via TMA
-                let bar = &this.smem.data().gamma_loaded;
+                let bar = &this.smem.gamma_loaded;
 
                 let bytes = size_of::<bf16>() as u32 * this.actual_row_size;
                 bar.arrive_expect_tx(bytes);
-                tma::bulk_load(smem_gamma, this.gamma.cast(), bytes, bar, None);
+                tma::bulk_load(
+                    this.smem.load_slots[0].as_mut_ptr().cast(),
+                    this.gamma.cast(),
+                    bytes,
+                    bar,
+                    None,
+                );
             }
 
             cluster::barrier_sync::<{ BarrierAlignment::Aligned }>();
@@ -259,9 +213,9 @@ impl<
             let mut thr_gamma = [bf16x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD];
 
             if WarpRole::get() == WarpRole::Worker {
-                while !this.smem.data().gamma_loaded.try_wait(PhaseParity::Even) {}
+                while !this.smem.gamma_loaded.try_wait(PhaseParity::Even) {}
                 copy_aligned16(
-                    smem_gamma.cast::<bf16x8>().add(thread_id().x as usize),
+                    this.smem.load_slots[0].as_ptr().add(thread_id().x as usize),
                     thr_gamma.as_mut_ptr(),
                     Self::ELEMENTX8_PER_ROW_PER_THREAD,
                     NUM_WORKER_THREADS,
@@ -308,24 +262,20 @@ impl<
         unsafe {
             #[rustc_unroll(full)]
             for slot_idx in 0..LOAD_SLOTS {
-                self.smem.data().load_slot_produced[slot_idx].init(1);
-                self.smem.data().load_slot_consumed[slot_idx]
-                    .init(WARP_SIZE * NUM_WORKER_WARPS as u32);
+                self.smem.load_slot_produced[slot_idx].init(1);
+                self.smem.load_slot_consumed[slot_idx].init(WARP_SIZE * NUM_WORKER_WARPS as u32);
             }
             self.smem
-                .data()
                 .store_slot_produced
                 .init(WARP_SIZE * NUM_WORKER_WARPS as u32);
-            self.smem.data().store_slot_consumed.init(1);
+            self.smem.store_slot_consumed.init(1);
             self.smem
-                .data()
                 .cluster_col_amax_produced
                 .init(cluster_size() * WARP_SIZE * NUM_WORKER_WARPS as u32);
             self.smem
-                .data()
                 .cluster_col_amax_consumed
                 .init(cluster_size() * WARP_SIZE * NUM_WORKER_WARPS as u32);
-            self.smem.data().gamma_loaded.init(1);
+            self.smem.gamma_loaded.init(1);
 
             MBarrier::fence_init();
         }
@@ -371,7 +321,7 @@ impl<
                 }
 
                 let slot_idx = microblock_idx as usize % LOAD_SLOTS;
-                let ready = &self.smem.data().load_slot_produced[slot_idx];
+                let ready = &self.smem.load_slot_produced[slot_idx];
                 while !ready.try_wait(PhaseParity::of_phase(microblock_idx)) {}
 
                 // Load `x`
@@ -379,10 +329,8 @@ impl<
                     [[bf16x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD]; MICROBLOCK_SIZE];
                 #[rustc_unroll(full)]
                 for row in 0..MICROBLOCK_SIZE {
-                    let smem_x = self
-                        .smem
-                        .get_load_slot(slot_idx)
-                        .cast::<bf16x8>()
+                    let smem_x = self.smem.load_slots[slot_idx]
+                        .as_ptr()
                         .add(row * ROW_SIZE / 8 + thread_id().x as usize);
                     copy_aligned16(
                         smem_x,
@@ -394,7 +342,7 @@ impl<
                 }
 
                 // Load has finished
-                self.smem.data().load_slot_consumed[slot_idx].arrive();
+                self.smem.load_slot_consumed[slot_idx].arrive();
 
                 // Compute sum of squares per row per warp
                 let mut sum2 = [0.0f32; MICROBLOCK_SIZE];
@@ -415,10 +363,9 @@ impl<
                 if elect(LaneMask::FULL).is_leader {
                     #[rustc_unroll(full)]
                     for row in 0..MICROBLOCK_SIZE {
-                        self.smem
-                            .get_reduction_scratch()
-                            .cast::<f32>()
-                            .add(warp_id() as usize * MICROBLOCK_SIZE + row)
+                        self.smem.reduction_scratchpad[warp_id() as usize]
+                            .as_mut_ptr()
+                            .add(row)
                             .write(sum2[row]);
                     }
                 }
@@ -432,11 +379,9 @@ impl<
                     sum2[row] = 0.0;
                     #[rustc_unroll(full)]
                     for w in 0..NUM_WORKER_WARPS {
-                        sum2[row] += self
-                            .smem
-                            .get_reduction_scratch()
-                            .cast::<f32>()
-                            .add(w as usize * MICROBLOCK_SIZE + row)
+                        sum2[row] += self.smem.reduction_scratchpad[w]
+                            .as_mut_ptr()
+                            .add(row)
                             .read();
                     }
                 }
@@ -492,8 +437,8 @@ impl<
             for row in 0..MICROBLOCK_SIZE {
                 let smem_y = self
                     .smem
-                    .get_store_slot()
-                    .cast::<bf16x8>()
+                    .store_slot
+                    .as_mut_ptr()
                     .add(row * ROW_SIZE / 8 + thread_id().x as usize);
                 copy_aligned16(
                     thr_y[row].as_ptr(),
@@ -529,7 +474,7 @@ impl<
     fn wait_for_store_slot(&mut self) {
         if self.store_idx > 0 {
             unsafe {
-                let bar = &self.smem.data().store_slot_consumed;
+                let bar = &self.smem.store_slot_consumed;
                 while !bar.try_wait(PhaseParity::of_phase(self.store_idx).flip()) {}
             }
         }
@@ -539,7 +484,7 @@ impl<
     #[inline(always)]
     fn arrive_on_store_slot(&mut self) {
         unsafe {
-            self.smem.data().store_slot_produced.arrive();
+            self.smem.store_slot_produced.arrive();
         }
     }
 
@@ -555,15 +500,15 @@ impl<
                 let slot_idx = microblock_idx as usize % LOAD_SLOTS;
 
                 if microblock_idx >= LOAD_SLOTS as u32 {
-                    let bar = &self.smem.data().load_slot_consumed[slot_idx];
+                    let bar = &self.smem.load_slot_consumed[slot_idx];
                     while !bar.try_wait(PhaseParity::of_phase(microblock_idx).flip()) {}
                 }
 
-                let bar = &self.smem.data().load_slot_produced[slot_idx];
+                let bar = &self.smem.load_slot_produced[slot_idx];
                 if elect(LaneMask::FULL).is_leader {
                     bar.arrive_expect_tx((size_of::<bf16>() * MICROBLOCK_SIZE * ROW_SIZE) as u32);
                     tma::tma_load_tile(
-                        self.smem.get_load_slot(slot_idx),
+                        self.smem.load_slots[slot_idx].as_mut_ptr().cast(),
                         bar,
                         self.tma_x,
                         [0, self.current_microblock_first_row() as i32],
@@ -584,28 +529,37 @@ impl<
                     break;
                 }
 
-                match self.epilogue {
-                    Epilogue::StoreBf16 { tma_y } => {
-                        self.wait_for_store_data_ready();
-                        self.tma_store_bf16(tma_y);
-                    }
-                    Epilogue::StoreRowwiseMxfp8 {
-                        tma_rowwise_y,
-                        rowwise_y_sf,
-                    } => {
-                        self.wait_for_store_data_ready();
-                        self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
-                    }
-                    Epilogue::StoreRowwiseAndColwiseMxfp8 {
-                        tma_rowwise_y,
-                        rowwise_y_sf,
-                        tma_colwise_y,
-                        colwise_y_sf,
-                    } => {
-                        self.wait_for_store_data_ready();
-                        self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
-                        self.wait_for_store_data_ready();
-                        self.tma_store_mxfp8(tma_colwise_y, colwise_y_sf);
+                if elect(LaneMask::FULL).is_leader {
+                    match self.epilogue {
+                        Epilogue::StoreBf16 { tma_y } => {
+                            self.wait_for_store_data_ready();
+                            self.tma_store_r_inv();
+                            self.tma_store_bf16(tma_y);
+                            self.wait_for_and_notify_store_read_smem();
+                        }
+                        Epilogue::StoreRowwiseMxfp8 {
+                            tma_rowwise_y,
+                            rowwise_y_sf,
+                        } => {
+                            self.wait_for_store_data_ready();
+                            self.tma_store_r_inv();
+                            self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
+                            self.wait_for_and_notify_store_read_smem();
+                        }
+                        Epilogue::StoreRowwiseAndColwiseMxfp8 {
+                            tma_rowwise_y,
+                            rowwise_y_sf,
+                            tma_colwise_y,
+                            colwise_y_sf,
+                        } => {
+                            self.wait_for_store_data_ready();
+                            self.tma_store_r_inv();
+                            self.tma_store_mxfp8(tma_rowwise_y, rowwise_y_sf);
+                            self.wait_for_and_notify_store_read_smem();
+                            self.wait_for_store_data_ready();
+                            self.tma_store_mxfp8(tma_colwise_y, colwise_y_sf);
+                            self.wait_for_and_notify_store_read_smem();
+                        }
                     }
                 }
             }
@@ -617,7 +571,6 @@ impl<
         unsafe {
             while !self
                 .smem
-                .data()
                 .store_slot_produced
                 .try_wait(PhaseParity::of_phase(self.store_idx))
             {}
@@ -626,21 +579,50 @@ impl<
     }
 
     #[inline(always)]
-    fn tma_store_bf16(&self, tma_y: &TmaDescriptor) {
+    fn wait_for_and_notify_store_read_smem(&mut self) {
         unsafe {
-            if elect(LaneMask::FULL).is_leader {
-                tma::tma_store_tile(
-                    self.smem.get_store_slot(),
-                    tma_y,
-                    [0, self.current_microblock_first_row() as i32],
-                    None,
-                );
-            }
+            tma::bulk_commit_group();
+            tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
+            self.smem.store_slot_consumed.arrive();
         }
     }
 
     #[inline(always)]
-    fn tma_store_mxfp8(&self, tma_y: &TmaDescriptor, y_sf: *mut f8e8m0) {
+    fn tma_store_r_inv(&self) {
+        unsafe {
+            let actual_rows =
+                if self.current_microblock_first_row() + MICROBLOCK_SIZE as u32 > self.num_rows {
+                    self.num_rows - self.current_block_first_row()
+                } else {
+                    MICROBLOCK_SIZE as u32
+                };
+            let bytes = size_of::<f32>() as u32 * actual_rows;
+
+            tma::bulk_store(
+                self.r_inv
+                    .add(self.current_microblock_first_row() as usize)
+                    .cast(),
+                self.smem.store_r_inv_slot.as_ptr().cast(),
+                bytes,
+                None,
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn tma_store_bf16(&self, tma_y: &TmaDescriptor) {
+        unsafe {
+            tma::tma_store_tile(
+                self.smem.store_slot.as_ptr().cast(),
+                tma_y,
+                [0, self.current_microblock_first_row() as i32],
+                None,
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn tma_store_mxfp8(&self, tma_y: &TmaDescriptor, y_sf: *mut f8e8m0) -> u32 {
         todo!()
     }
 }
@@ -651,15 +633,19 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_bf16_in_bf16_out_row_size_2048(
     gamma: *const bf16,
     #[nvptx(grid_constant)] tma_x: &TmaDescriptor,
     #[nvptx(grid_constant)] tma_y: &TmaDescriptor,
+    r_inv: *mut f32,
     actual_row_size: u32,
     actual_row_size_recip: f32,
+    num_rows: u32,
 ) {
-    RmsnormFwd::<2048, 8, 64, 2, 16, 1, 224, 32>::run(
+    RmsnormFwd::<2048, 8, 64, 2, 224, 32>::run(
         gamma,
         tma_x,
         Epilogue::StoreBf16 { tma_y },
+        r_inv,
         actual_row_size,
         actual_row_size_recip,
+        num_rows,
         ptr::null_mut(),
     );
 }
