@@ -17,7 +17,7 @@ use skytens_core::{
     shape::Shape,
 };
 
-const BATCH_SIZE: usize = 32769;
+const BATCH_SIZE: usize = 131003;
 const INNER_DIMS: &[usize] = &[2048];
 const EPSILON: f32 = 1e-6;
 

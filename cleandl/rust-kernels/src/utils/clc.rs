@@ -86,8 +86,9 @@ impl ClcScheduler {
                     let ready = &(&*self.smem).produced[self.idx as usize % STAGES];
                     ready
                         .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
-                            size_of::<CancelDelivery>() as u32,
+                            size_of::<CancelResponse>() as u32,
                         );
+                    fence_proxy::<{ ProxyKind::AsyncSharedCluster }>();
                     try_cancel_launch::<{ CancelDelivery::Cluster }>(response_ptr.cast(), ready);
 
                     // Observe for ourselves whether we should continue the loop.
