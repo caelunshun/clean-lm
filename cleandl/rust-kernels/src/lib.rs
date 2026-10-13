@@ -47,6 +47,13 @@ pub fn elements_per_u32<T>() -> u32 {
     (size_of::<u32>() / size_of::<T>()) as u32
 }
 
+pub fn elements_per_u64<T>() -> u32 {
+    const {
+        assert!(size_of::<u64>().is_multiple_of(size_of::<T>()));
+    }
+    (size_of::<u64>() / size_of::<T>()) as u32
+}
+
 pub fn elements_per_u128<T>() -> u32 {
     const {
         assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));

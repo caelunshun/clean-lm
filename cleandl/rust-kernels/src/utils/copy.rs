@@ -1,4 +1,4 @@
-use crate::{elements_per_u32, elements_per_u128, elements_per_u256};
+use crate::{elements_per_u32, elements_per_u64, elements_per_u128, elements_per_u256};
 use bytemuck::Pod;
 use core::simd::{u32x4, u32x8};
 
@@ -51,6 +51,31 @@ pub(crate) unsafe fn copy_aligned16<T: Pod>(
             let dst = dst
                 .add(i * dst_stride * elements_per_u128::<T>() as usize)
                 .cast::<u32x4>();
+            dst.write(src.read());
+        }
+    }
+}
+
+/// Copies with 8-byte alignment between two arrays.
+#[inline(always)]
+pub(crate) unsafe fn copy_aligned8<T: Pod>(
+    src: *const T,
+    dst: *mut T,
+    // Number of 8-byte blocks to copy.
+    copy_blocks: usize,
+    // Stride in T-elements between 8-byte blocks in `src` to copy.
+    src_stride: usize,
+    dst_stride: usize,
+) {
+    unsafe {
+        #[rustc_unroll(full)]
+        for i in 0..copy_blocks {
+            let src = src
+                .add(i * src_stride * elements_per_u64::<T>() as usize)
+                .cast::<u64>();
+            let dst = dst
+                .add(i * dst_stride * elements_per_u64::<T>() as usize)
+                .cast::<u64>();
             dst.write(src.read());
         }
     }

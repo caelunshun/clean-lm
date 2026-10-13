@@ -28,9 +28,10 @@
 
 use crate::{
     utils::{
+        block_scale::{self, BlockScaledFormat, Mxfp8, SF_TILE_NCOLS},
         clc::{ClcScheduler, ClcSmem},
         compiler_magic::make_opaque,
-        copy::copy_aligned16,
+        copy::{copy_aligned8, copy_aligned16},
     },
     warp_reduce_sum_f32,
 };
@@ -38,13 +39,15 @@ use core::{cell::UnsafeCell, ptr, simd::f32x8};
 use ptx_std::{
     Denormals, F32Ext, MBarrier, PhaseParity, WARP_SIZE,
     barrier::{BarrierAlignment, NamedBarrier, sync_threads},
-    bf16, bf16x8, cluster, cluster_size, dynamic_smem_start, f8e4m3, f8e8m0,
+    bf16, bf16x8, cluster, cluster_size, dynamic_smem_size, dynamic_smem_start, f8e4m3, f8e4m3x8,
+    f8e8m0, f8e8m0x8,
     fence::{ProxyKind, fence_proxy},
+    lane_id,
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
     tma::{self, BulkWait},
-    warp_collectives::{LaneMask, elect, sync_warp},
+    warp_collectives::{LaneMask, elect, shuffle_xor, sync_warp},
     warp_id,
 };
 
@@ -446,11 +449,11 @@ impl<
             Epilogue::StoreBf16 { .. } => {
                 self.do_epilogue_store_bf16(thr_y);
             }
-            Epilogue::StoreRowwiseMxfp8 { .. } => {
-                self.do_epilogue_store_rowwise_mxfp8(thr_y);
+            Epilogue::StoreRowwiseMxfp8 { rowwise_y_sf, .. } => {
+                self.do_epilogue_store_rowwise_mxfp8(thr_y, rowwise_y_sf);
             }
-            Epilogue::StoreRowwiseAndColwiseMxfp8 { .. } => {
-                self.do_epilogue_store_rowwise_mxfp8(thr_y);
+            Epilogue::StoreRowwiseAndColwiseMxfp8 { rowwise_y_sf, .. } => {
+                self.do_epilogue_store_rowwise_mxfp8(thr_y, rowwise_y_sf);
                 self.do_epilogue_store_colwise_mxfp8(thr_y);
             }
         }
@@ -485,12 +488,106 @@ impl<
         }
     }
 
+    const MXFP8_SF_PER_THREAD: usize = Self::ELEMENTX8_PER_ROW_PER_THREAD.div_ceil(4);
+
     #[inline(always)]
     fn do_epilogue_store_rowwise_mxfp8(
         &mut self,
         thr_y: &[[bf16x8; Self::ELEMENTX8_PER_ROW_PER_THREAD]; MICROBLOCK_SIZE],
+        y_sf: *mut f8e8m0,
     ) {
-        todo!()
+        unsafe {
+            const {
+                assert!(Self::ELEMENTX8_PER_ROW_PER_THREAD.is_power_of_two());
+                assert!(MICROBLOCK_SIZE.is_multiple_of(2));
+            }
+
+            // Compute rowwise amax. Two cases:
+            // - Each lane assigned a multiple of 32 elements => amax calculated within a lane.
+            // - Each lane assigned fewer than 32 elements (8 or 16) => amax calculated using a couple intra-warp reductions.
+            let mut scales = [[f8e8m0::ONE; Self::MXFP8_SF_PER_THREAD]; MICROBLOCK_SIZE];
+            #[rustc_unroll(full)]
+            for row in 0..MICROBLOCK_SIZE {
+                let should_write = if Self::ELEMENTX8_PER_ROW_PER_THREAD >= 4 {
+                    #[rustc_unroll(full)]
+                    for (i, chunk) in thr_y[row].chunks_exact(4).enumerate() {
+                        let mut amax = bf16::ZERO;
+                        #[rustc_unroll(full)]
+                        for &val in chunk {
+                            amax = amax.max(val.abs().reduce_max());
+                        }
+                        scales[row][i] = Mxfp8::compute_scale_factor(amax.to_f32());
+                    }
+                    true
+                } else {
+                    let mut lane_amax = bf16::ZERO;
+                    for val in &thr_y[row] {
+                        lane_amax = lane_amax.max(val.abs().reduce_max());
+                    }
+                    let lanes_sharing_scale = 32 / Self::ELEMENTX8_PER_ROW_PER_THREAD;
+                    #[rustc_unroll(full)]
+                    for bit in 1..=lanes_sharing_scale.ilog2() {
+                        lane_amax = lane_amax.max(shuffle_xor(LaneMask::FULL, lane_amax, bit));
+                    }
+
+                    scales[row][0] = Mxfp8::compute_scale_factor(lane_amax.to_f32());
+
+                    lane_id().is_multiple_of(lanes_sharing_scale as u32)
+                };
+
+                if should_write {
+                    #[rustc_unroll(full)]
+                    for i in 0..Self::MXFP8_SF_PER_THREAD {
+                        let col = i as u32
+                            + thread_id().x * (Self::ELEMENTS_PER_ROW_PER_THREAD as u32 / 32);
+                        let r = self.current_microblock_first_row() + row as u32;
+                        let ncols = self
+                            .actual_row_size
+                            .div_ceil(32)
+                            .next_multiple_of(SF_TILE_NCOLS);
+                        if r < self.num_rows && col < ncols {
+                            let idx = block_scale::scale_factor_pos(r, col, 32, ncols);
+                            y_sf.add(idx).write(scales[row][i]);
+                        }
+                    }
+                }
+            }
+
+            // Apply scales and emit to SMEM.
+            let mut thr_y_scaled =
+                [[f8e4m3x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD]; MICROBLOCK_SIZE];
+            #[rustc_unroll(full)]
+            for row in 0..MICROBLOCK_SIZE {
+                #[rustc_unroll(full)]
+                for (i, &vals) in thr_y[row].iter().enumerate() {
+                    let vals_quantized =
+                        Mxfp8::quantize_bf16x8(vals, f8e8m0x8::splat(scales[row][i / 4]));
+                    thr_y_scaled[row][i] = vals_quantized;
+                }
+            }
+
+            #[rustc_unroll(full)]
+            for row in 0..MICROBLOCK_SIZE {
+                copy_aligned8(
+                    thr_y_scaled[row].as_ptr(),
+                    self.smem
+                        .store_slot
+                        .as_ptr()
+                        .cast::<f8e4m3x8>()
+                        .add(
+                            row * ROW_SIZE / 8
+                                + thread_id().x as usize * Self::ELEMENTX8_PER_ROW_PER_THREAD,
+                        )
+                        .cast_mut(),
+                    Self::ELEMENTX8_PER_ROW_PER_THREAD,
+                    1,
+                    NUM_WORKER_THREADS,
+                );
+            }
+
+            fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
+            self.arrive_on_store_slot();
+        }
     }
 
     #[inline(always)]
@@ -594,30 +691,27 @@ impl<
                             self.wait_for_and_notify_store_read_smem();
                         }
                     }
-                    Epilogue::StoreRowwiseMxfp8 {
-                        rowwise_y,
-                        rowwise_y_sf,
-                    } => {
+                    Epilogue::StoreRowwiseMxfp8 { rowwise_y, .. } => {
                         self.wait_for_store_data_ready();
                         if elect(LaneMask::FULL).is_leader {
-                            self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
+                            self.tma_store_mxfp8(rowwise_y);
                             self.wait_for_and_notify_store_read_smem();
                         }
                     }
                     Epilogue::StoreRowwiseAndColwiseMxfp8 {
                         rowwise_y,
-                        rowwise_y_sf,
+
                         colwise_y,
-                        colwise_y_sf,
+                        ..
                     } => {
                         self.wait_for_store_data_ready();
                         if elect(LaneMask::FULL).is_leader {
-                            self.tma_store_mxfp8(rowwise_y, rowwise_y_sf);
+                            self.tma_store_mxfp8(rowwise_y);
                             self.wait_for_and_notify_store_read_smem();
                         }
                         self.wait_for_store_data_ready();
                         if elect(LaneMask::FULL).is_leader {
-                            self.tma_store_mxfp8(colwise_y, colwise_y_sf);
+                            self.tma_store_mxfp8(colwise_y);
                             self.wait_for_and_notify_store_read_smem();
                         }
                     }
@@ -665,14 +759,31 @@ impl<
     }
 
     #[inline(always)]
-    fn tma_store_mxfp8(&self, y: *mut f8e4m3, y_sf: *mut f8e8m0) -> u32 {
-        todo!()
+    fn tma_store_mxfp8(&self, y: *mut f8e4m3) {
+        unsafe {
+            for i in 0..MICROBLOCK_SIZE {
+                let row = i as u32 + self.current_microblock_first_row();
+                if row < self.num_rows {
+                    tma::bulk_store(
+                        y.add(self.actual_row_size as usize * row as usize).cast(),
+                        self.smem
+                            .store_slot
+                            .as_ptr()
+                            .cast::<f8e4m3x8>()
+                            .add(ROW_SIZE / 8 * i)
+                            .cast::<u8>(),
+                        size_of::<f8e4m3>() as u32 * self.actual_row_size,
+                        None,
+                    );
+                }
+            }
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 #[nvptx(exact_threads_per_cta(256, 1, 1), max_registers(128))]
-pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_bf16_in_bf16_out_row_size_2048(
+pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_B256_MB8(
     gamma: *const bf16,
     x: *const bf16,
     y: *mut bf16,
@@ -681,10 +792,54 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_bf16_in_bf16_out_row_size_2048(
     actual_row_size_recip: f32,
     num_rows: u32,
 ) {
-    RmsnormFwd::<2048, 8, 64, 2, 224, 32>::run(
+    const ROW_SIZE: usize = 2048;
+    const MICROBLOCK_SIZE: usize = 8;
+    const BLOCK_SIZE: usize = 256;
+    const LOAD_SLOTS: usize = 2;
+    const WORKER_WARP_REGS: u32 = 224;
+    const AUX_WARP_REGS: u32 = 32;
+
+    const SZ: usize = size_of::<SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>>();
+    assert_eq!(dynamic_smem_size() as usize, SZ);
+
+    RmsnormFwd::<ROW_SIZE, MICROBLOCK_SIZE, BLOCK_SIZE, LOAD_SLOTS, WORKER_WARP_REGS, AUX_WARP_REGS >::run(
         gamma,
         x,
         Epilogue::StoreBf16 { y },
+        r_inv,
+        actual_row_size,
+        actual_row_size_recip,
+        num_rows,
+        ptr::null_mut(),
+    );
+}
+
+#[unsafe(no_mangle)]
+#[nvptx(exact_threads_per_cta(256, 1, 1), max_registers(128))]
+pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymx8r_RS2048_B256_MB8(
+    gamma: *const bf16,
+    x: *const bf16,
+    rowwise_y: *mut f8e4m3,
+    rowwise_y_sf: *mut f8e8m0,
+    r_inv: *mut f32,
+    actual_row_size: u32,
+    actual_row_size_recip: f32,
+    num_rows: u32,
+) {
+    const ROW_SIZE: usize = 2048;
+    const MICROBLOCK_SIZE: usize = 8;
+    const BLOCK_SIZE: usize = 256;
+    const LOAD_SLOTS: usize = 2;
+    const WORKER_WARP_REGS: u32 = 224;
+    const AUX_WARP_REGS: u32 = 32;
+
+    const SZ: usize = size_of::<SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>>();
+    assert_eq!(dynamic_smem_size() as usize, SZ);
+
+    RmsnormFwd::<ROW_SIZE, MICROBLOCK_SIZE, BLOCK_SIZE, LOAD_SLOTS, WORKER_WARP_REGS, AUX_WARP_REGS >::run(
+        gamma,
+        x,
+        Epilogue::StoreRowwiseMxfp8 { rowwise_y, rowwise_y_sf },
         r_inv,
         actual_row_size,
         actual_row_size_recip,
