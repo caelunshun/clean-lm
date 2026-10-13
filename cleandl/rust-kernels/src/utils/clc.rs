@@ -1,12 +1,11 @@
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 use ptx_std::{
-    Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope, block_id, block_id_in_cluster,
-    block_rank_in_cluster,
+    Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope, WARP_SIZE, block_id, block_id_in_cluster,
+    block_rank_in_cluster, block_size,
     cluster::map_to_cta,
     cluster_size,
-    fence::{ProxyKind, fence_proxy},
+    fence::{ProxyKind, fence_proxy, fence_sync_restrict},
     launch::{CancelDelivery, CancelResponse, try_cancel_launch},
-    num_warps,
     warp_collectives::{LaneMask, elect, sync_warp, vote_any},
     warp_id,
 };
@@ -17,7 +16,7 @@ use ptx_std::{
 /// All other warps in the cluster must call `get_next_block()` to get the current block index
 /// in a loop, until it returns `None`.
 #[derive(Debug)]
-pub struct ClcScheduler {
+pub struct ClcScheduler<const CLUSTER_ENABLED: bool> {
     has_returned_initial_block: bool,
     smem: *mut ClcSmem,
     idx: u32,
@@ -34,19 +33,31 @@ pub struct ClcSmem {
     responses: [UnsafeCell<MaybeUninit<CancelResponse>>; STAGES],
 }
 
-impl ClcScheduler {
+impl<const CLUSTER_ENABLED: bool> ClcScheduler<CLUSTER_ENABLED> {
+    const SCOPE: Scope = if CLUSTER_ENABLED {
+        Scope::Cluster
+    } else {
+        Scope::Cta
+    };
+    const DELIVERY: CancelDelivery = if CLUSTER_ENABLED {
+        CancelDelivery::Cluster
+    } else {
+        CancelDelivery::Block
+    };
+
     /// # Safety
     /// Must be called by all threads in every CTA.
-    /// Additionally, threads in the cluster must synchronize
+    /// Additionally, threads in the cluster (if CLUSTER_ENABLED) or CTA (if not CLUSTER_ENABLED) must synchronize
     /// before calling any methods on this object.
     #[inline(always)]
     pub unsafe fn new(smem: *mut ClcSmem) -> Self {
         unsafe {
+            let num_ctas = if CLUSTER_ENABLED { cluster_size() } else { 1 };
             if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
                 #[rustc_unroll(full)]
                 for i in 0..STAGES {
                     (&*smem).produced[i].init(1);
-                    (&*smem).consumed[i].init((num_warps() - 1) * cluster_size()); // scheduler warps don't arrive on this barrier
+                    (&*smem).consumed[i].init((block_size() - WARP_SIZE) * num_ctas); // scheduler warps don't arrive on this barrier
                 }
 
                 MBarrier::fence_init();
@@ -62,20 +73,21 @@ impl ClcScheduler {
 
     #[inline(always)]
     pub unsafe fn run_scheduler(&mut self) {
-        if block_rank_in_cluster() != 0 {
-            return;
-        }
+        let is_leader_cta = block_rank_in_cluster() == 0;
         unsafe {
             loop {
-                // Wait for slot to be consumed
-                if self.idx as usize >= STAGES {
-                    let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
-                    if elect(LaneMask::FULL).is_leader {
-                        while !consumed
-                            .try_wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Acquire }>(
-                                PhaseParity::of_phase(self.idx / STAGES as u32 - 1),
-                            )
-                        {}
+                if is_leader_cta {
+                    // Wait for slot to be consumed
+                    if self.idx as usize >= STAGES {
+                        let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
+                        if elect(LaneMask::FULL).is_leader {
+                            while !consumed
+                                .try_wait_scoped::<{ Self::SCOPE }, { MemoryOrdering::Relaxed }>(
+                                    PhaseParity::of_phase(self.idx / STAGES as u32 - 1),
+                                )
+                            {}
+                            fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
+                        }
                     }
                 }
 
@@ -84,12 +96,13 @@ impl ClcScheduler {
                 let mut done = false;
                 if elect(LaneMask::FULL).is_leader {
                     let ready = &(&*self.smem).produced[self.idx as usize % STAGES];
-                    ready
-                        .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
-                            size_of::<CancelResponse>() as u32,
-                        );
+                    ready.arrive_expect_tx_scoped::<{ Self::SCOPE }, { MemoryOrdering::Relaxed }>(
+                        size_of::<CancelResponse>() as u32,
+                    );
                     fence_proxy::<{ ProxyKind::AsyncSharedCluster }>();
-                    try_cancel_launch::<{ CancelDelivery::Cluster }>(response_ptr.cast(), ready);
+                    if is_leader_cta {
+                        try_cancel_launch::<{ Self::DELIVERY }>(response_ptr.cast(), ready);
+                    }
 
                     // Observe for ourselves whether we should continue the loop.
                     while !ready.try_wait(PhaseParity::of_phase(self.idx / STAGES as u32)) {}
@@ -121,12 +134,10 @@ impl ClcScheduler {
         unsafe {
             let ready = &(&*self.smem).produced[self.idx as usize % STAGES];
             let parity = PhaseParity::of_phase(self.idx / STAGES as u32);
-            if elect(LaneMask::FULL).is_leader {
-                while !ready
-                    .try_wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Acquire }>(parity)
-                {
-                }
-            }
+
+            while !ready.try_wait_scoped::<{ Self::SCOPE }, { MemoryOrdering::Relaxed }>(parity) {}
+            fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
+
             sync_warp(LaneMask::FULL);
 
             let canceled_first_cta_id = (&*self.smem).responses[self.idx as usize % STAGES]
@@ -136,11 +147,12 @@ impl ClcScheduler {
                 .first_cta_id();
 
             fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
-            if elect(LaneMask::FULL).is_leader {
-                let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
-                let consumed = &*map_to_cta(consumed as *const MBarrier as *mut MBarrier, 0);
-                consumed.arrive_scoped::<{ Scope::Cluster }, { MemoryOrdering::Release }>(1);
-            }
+
+            let consumed = &(&*self.smem).consumed[self.idx as usize % STAGES];
+            let consumed = &*map_to_cta(consumed as *const MBarrier as *mut MBarrier, 0);
+
+            fence_sync_restrict::<{ MemoryOrdering::Release }>();
+            consumed.arrive_scoped::<{ Self::SCOPE }, { MemoryOrdering::Relaxed }>(1);
 
             self.idx += 1;
             canceled_first_cta_id.map(|d3| Dim3 {

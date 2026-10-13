@@ -2,9 +2,7 @@
 //! Input is bf16. Output is either bf16 or MXFP8. In MXFP8 mode,
 //! a rowwise block scaled output is always written; an optional additional columnwise
 //! block scaled output can also be selected. The latter requires a cluster
-//! size such that microblock_size * cluster_size == 32. If cluster_size > 1
-//! then a global workspace of (num_clusters * cluster_size * row_size) bf16 elements
-//! is required.
+//! size such that microblock_size * cluster_size == 32.
 //!
 //! CLC is used to form a persistent kernel.
 //!
@@ -35,18 +33,23 @@ use crate::{
     },
     warp_reduce_sum_f32,
 };
-use core::{cell::UnsafeCell, ptr, simd::f32x8};
+use core::{
+    cell::UnsafeCell,
+    hint::assert_unchecked,
+    simd::{f32x4, f32x8},
+};
 use ptx_std::{
-    Denormals, F32Ext, MBarrier, PhaseParity, WARP_SIZE,
+    Denormals, F32Ext, MBarrier, MemoryOrdering, PhaseParity, Scope, WARP_SIZE,
     barrier::{BarrierAlignment, NamedBarrier, sync_threads},
-    bf16, bf16x8, cluster, cluster_size, dynamic_smem_size, dynamic_smem_start, f8e4m3, f8e4m3x8,
-    f8e8m0, f8e8m0x8,
-    fence::{ProxyKind, fence_proxy},
+    bf16, bf16x8, block_rank_in_cluster,
+    cluster::{self, map_to_cta},
+    cluster_size, dynamic_smem_size, dynamic_smem_start, f8e4m3, f8e4m3x8, f8e8m0, f8e8m0x8,
+    fence::{ProxyKind, fence_proxy, fence_sync_restrict},
     lane_id,
     launch::{decrease_max_registers, increase_max_registers},
     memory::{CachePolicy, L2EvictionPriority},
     thread_id,
-    tma::{self, BulkWait},
+    tma::{self, BulkWait, TmaReduceOp},
     warp_collectives::{LaneMask, elect, shuffle_xor, sync_warp},
     warp_id,
 };
@@ -85,8 +88,8 @@ struct SmemData<const LOAD_SLOTS: usize, const ROW_SIZE: usize, const MICROBLOCK
     load_slot_consumed: [MBarrier; LOAD_SLOTS],
     store_slot_produced: MBarrier,
     store_slot_consumed: MBarrier,
-    cluster_col_amax_produced: MBarrier,
-    cluster_col_amax_consumed: MBarrier,
+    cluster_col_amax_sync: MBarrier,
+    cluster_reduction_barrier: MBarrier,
     gamma_loaded: MBarrier,
     clc: UnsafeCell<ClcSmem>,
 }
@@ -122,9 +125,9 @@ struct RmsnormFwd<
     const LOAD_SLOTS: usize,
     const WORKER_WARP_REGS: u32,
     const AUX_WARP_REGS: u32,
+    const CLUSTER_ENABLED: bool,
 > {
     smem: &'a SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>,
-    cluster_reduction_scratch: *mut bf16,
     gamma: *const bf16,
     r_inv: *mut f32,
     x: *const bf16,
@@ -138,7 +141,9 @@ struct RmsnormFwd<
 
     store_idx: u32,
 
-    clc: ClcScheduler,
+    cluster_sync_parity: PhaseParity,
+
+    clc: ClcScheduler<CLUSTER_ENABLED>,
 }
 
 impl<
@@ -149,6 +154,7 @@ impl<
     const LOAD_SLOTS: usize,
     const WORKER_WARP_REGS: u32,
     const AUX_WARP_REGS: u32,
+    const CLUSTER_ENABLED: bool,
 >
     RmsnormFwd<
         'a,
@@ -158,10 +164,12 @@ impl<
         LOAD_SLOTS,
         WORKER_WARP_REGS,
         AUX_WARP_REGS,
+        CLUSTER_ENABLED,
     >
 {
     const ELEMENTS_PER_ROW_PER_THREAD: usize = ROW_SIZE / NUM_WORKER_WARPS / WARP_SIZE as usize;
     const ELEMENTX8_PER_ROW_PER_THREAD: usize = Self::ELEMENTS_PER_ROW_PER_THREAD / 8;
+    const ELEMENTX4_PER_ROW_PER_THREAD: usize = Self::ELEMENTS_PER_ROW_PER_THREAD / 4;
 
     #[inline(always)]
     pub fn run(
@@ -172,7 +180,6 @@ impl<
         actual_row_size: u32,
         actual_row_size_recip: f32,
         num_rows: u32,
-        cluster_reduction_scratch: *mut bf16,
     ) {
         unsafe {
             let smem = &mut *dynamic_smem_start()
@@ -180,7 +187,6 @@ impl<
             let mut this = Self {
                 clc: ClcScheduler::new(smem.clc.get()),
                 smem,
-                cluster_reduction_scratch,
                 gamma,
                 x,
                 epilogue,
@@ -189,6 +195,7 @@ impl<
                 current_block: 0,
                 // cause first call to next_microblock() to advance to the first block
                 current_microblock: (BLOCK_SIZE / MICROBLOCK_SIZE) as u32 - 1,
+                cluster_sync_parity: PhaseParity::Even,
                 store_idx: 0,
                 num_rows,
                 r_inv,
@@ -218,7 +225,11 @@ impl<
                 );
             }
 
-            cluster::barrier_sync::<{ BarrierAlignment::Unaligned }>();
+            if CLUSTER_ENABLED {
+                cluster::barrier_sync::<{ BarrierAlignment::Aligned }>();
+            } else {
+                sync_threads();
+            }
 
             let mut thr_gamma = [bf16x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD];
 
@@ -261,7 +272,9 @@ impl<
                 }
             }
 
-            cluster::barrier_sync::<{ BarrierAlignment::Unaligned }>();
+            if CLUSTER_ENABLED {
+                cluster::barrier_sync::<{ BarrierAlignment::Aligned }>();
+            }
         }
     }
 
@@ -288,11 +301,11 @@ impl<
                 .init(NUM_WORKER_THREADS as u32);
             self.smem.store_slot_consumed.init(1);
             self.smem
-                .cluster_col_amax_produced
+                .cluster_col_amax_sync
                 .init(cluster_size() * NUM_WORKER_THREADS as u32);
             self.smem
-                .cluster_col_amax_consumed
-                .init(cluster_size() * NUM_WORKER_THREADS as u32);
+                .cluster_reduction_barrier
+                .init((cluster_size() - 1).max(1));
             self.smem.gamma_loaded.init(1);
 
             MBarrier::fence_init();
@@ -566,6 +579,8 @@ impl<
                 }
             }
 
+            self.wait_for_store_slot();
+
             #[rustc_unroll(full)]
             for row in 0..MICROBLOCK_SIZE {
                 copy_aligned8(
@@ -574,10 +589,7 @@ impl<
                         .store_slot
                         .as_ptr()
                         .cast::<f8e4m3x8>()
-                        .add(
-                            row * ROW_SIZE / 8
-                                + thread_id().x as usize * Self::ELEMENTX8_PER_ROW_PER_THREAD,
-                        )
+                        .add(row * ROW_SIZE / 8 + thread_id().x as usize)
                         .cast_mut(),
                     Self::ELEMENTX8_PER_ROW_PER_THREAD,
                     1,
@@ -595,6 +607,153 @@ impl<
         &mut self,
         thr_y: &[[bf16x8; Self::ELEMENTX8_PER_ROW_PER_THREAD]; MICROBLOCK_SIZE],
     ) {
+        // This one is more challenging: we need to compute amax among 32 elements in the same column.
+        // When MICROBLOCK_SIZE < 32 this means doing an inter-CTA reduction.
+        // We use thread block clusters such that the MICROBLOCK_SIZE * cluster_size = 32.
+        // We repurpose the store_slot SMEM to hold a per-column f32 amax.
+        // Each thread computes its local amax and reduces it onto all peer CTAs' amax
+        // buffers via distributed shared memory atomics.
+        // Then we apply the scale factors and transpose the quantized elements within warps before staging to SMEM.
+
+        const {
+            assert!(MICROBLOCK_SIZE.is_power_of_two());
+            assert!(MICROBLOCK_SIZE < 32); // this faster path is currently unimplemented
+            assert!(MICROBLOCK_SIZE >= 4); // required for store_slot to be big enough to hold two f32s per column
+        }
+
+        unsafe {
+            assert_unchecked(cluster_size() == 32 / MICROBLOCK_SIZE as u32);
+
+            let mut thr_amax = [bf16x8::ZERO; Self::ELEMENTX8_PER_ROW_PER_THREAD];
+            #[rustc_unroll(full)]
+            for row in 1..MICROBLOCK_SIZE {
+                #[rustc_unroll(full)]
+                for (dst, src) in thr_amax.iter_mut().zip(thr_y[row][1..].iter()) {
+                    *dst = dst.max(src.abs());
+                }
+            }
+
+            self.wait_for_store_slot();
+
+            // Convert to f32. We rely on u32::max atomic reductions, as f32
+            // or bf16 are not supported. u32 max gives correct results for non-negative f32
+            // values, and since we are computing amax, they are guaranteed non-negative.
+            // Note that the vector size is reduced to 4 so we keep 128-bit loads/stores
+            // (256-bit doesn't exist for SMEM).
+            let mut thr_amax_f32 = [f32x4::splat(0.0); Self::ELEMENTX4_PER_ROW_PER_THREAD];
+            #[rustc_unroll(full)]
+            for ([v0, v1], src) in thr_amax_f32
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(thr_amax.iter())
+            {
+                let src = src.to_f32();
+                *v0 = src.extract::<0, 4>();
+                *v1 = src.extract::<4, 4>();
+            }
+
+            // Store to SMEM (layout differs from our bf16 stores; this is ok because both sides of the reduction
+            // use this layout).
+            // Note that we store two copies: one is the source for the reductions initiated by this CTA,
+            // and the other is the destination for peers' copies. Duplicating the data in this way lets us
+            // avoid extra cluster-sync roundtrips that would be needed to elimiante WAR races.
+            #[rustc_unroll(full)]
+            for offs in [0, ROW_SIZE / 4] {
+                copy_aligned16(
+                    thr_amax_f32.as_ptr(),
+                    self.smem
+                        .store_slot
+                        .as_ptr()
+                        .cast::<f32x4>()
+                        .add(offs)
+                        .add(thread_id().x as usize)
+                        .cast_mut(),
+                    Self::ELEMENTX4_PER_ROW_PER_THREAD,
+                    1,
+                    NUM_WORKER_THREADS,
+                );
+            }
+
+            fence_proxy::<{ ProxyKind::AsyncSharedCluster }>();
+
+            // Arrive on all peers' barriers (including ourselves)
+            #[rustc_unroll(full)]
+            for cta in 0..cluster_size() {
+                let bar = map_to_cta(
+                    &self.smem.cluster_col_amax_sync as *const MBarrier as *mut MBarrier,
+                    cta,
+                );
+                fence_sync_restrict::<{ MemoryOrdering::Release }>();
+                (&*bar).arrive_scoped::<{ Scope::Cta }, { MemoryOrdering::Relaxed }>(1);
+            }
+
+            // Wait for peers
+            while !self
+                .smem
+                .cluster_col_amax_sync
+                .try_wait_scoped::<{ Scope::Cta }, { MemoryOrdering::Relaxed }>(
+                    self.cluster_sync_parity,
+                )
+            {}
+            fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
+
+            // Issue reduction onto each pair (except ourselves)
+            if warp_id() == 0 && elect(LaneMask::FULL).is_leader {
+                #[rustc_unroll(full)]
+                for cta in 0..cluster_size() {
+                    if cta != block_rank_in_cluster() {
+                        let src = self
+                            .smem
+                            .store_slot
+                            .as_ptr()
+                            .cast::<f32x4>()
+                            .add(ROW_SIZE / 4);
+                        let dst = self.smem.store_slot.as_ptr().cast::<f32x4>().cast_mut();
+                        let bar = &*map_to_cta(
+                            &self.smem.cluster_col_amax_sync as *const MBarrier as *mut MBarrier,
+                            cta,
+                        );
+                        let bytes = (ROW_SIZE * size_of::<f32>()) as u32;
+                        bar.arrive_expect_tx_scoped::<{Scope::Cluster}, {MemoryOrdering::Relaxed}>(bytes);
+                        tma::bulk_reduce_to_cluster::<_, { TmaReduceOp::Max }, { Scope::Cluster }>(
+                            dst.cast::<u32>(),
+                            src.cast::<u32>(),
+                            bytes,
+                            bar,
+                        );
+                    }
+                }
+            }
+
+            // Wait for peer reductions to complete
+            while !self
+                .smem
+                .cluster_reduction_barrier
+                .try_wait_scoped::<{ Scope::Cta }, { MemoryOrdering::Relaxed }>(
+                    self.cluster_sync_parity,
+                )
+            {}
+            fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
+
+            // Notify peers we've received all their reduction data (tells peers they can overwrite
+            // their smem contents for the store staging)
+            #[rustc_unroll(full)]
+            for cta in 0..cluster_size() {
+                let bar = map_to_cta(
+                    &self.smem.cluster_col_amax_sync as *const MBarrier as *mut MBarrier,
+                    cta,
+                );
+                fence_sync_restrict::<{ MemoryOrdering::Release }>();
+                (&*bar).arrive_scoped::<{ Scope::Cta }, { MemoryOrdering::Relaxed }>(1);
+            }
+
+            // Fetch fully reduced amaxes, compute scale factors, quantize
+            // TODO
+
+            self.cluster_sync_parity = self.cluster_sync_parity.flip();
+        }
+
         todo!()
     }
 
@@ -798,11 +957,20 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_B256_MB8(
     const LOAD_SLOTS: usize = 2;
     const WORKER_WARP_REGS: u32 = 224;
     const AUX_WARP_REGS: u32 = 32;
+    const CLUSTER_ENABLED: bool = false;
 
     const SZ: usize = size_of::<SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>>();
     assert_eq!(dynamic_smem_size() as usize, SZ);
 
-    RmsnormFwd::<ROW_SIZE, MICROBLOCK_SIZE, BLOCK_SIZE, LOAD_SLOTS, WORKER_WARP_REGS, AUX_WARP_REGS >::run(
+    RmsnormFwd::<
+        ROW_SIZE,
+        MICROBLOCK_SIZE,
+        BLOCK_SIZE,
+        LOAD_SLOTS,
+        WORKER_WARP_REGS,
+        AUX_WARP_REGS,
+        CLUSTER_ENABLED,
+    >::run(
         gamma,
         x,
         Epilogue::StoreBf16 { y },
@@ -810,7 +978,6 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_B256_MB8(
         actual_row_size,
         actual_row_size_recip,
         num_rows,
-        ptr::null_mut(),
     );
 }
 
@@ -832,18 +999,29 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymx8r_RS2048_B256_MB8(
     const LOAD_SLOTS: usize = 2;
     const WORKER_WARP_REGS: u32 = 224;
     const AUX_WARP_REGS: u32 = 32;
+    const CLUSTER_ENABLED: bool = false;
 
     const SZ: usize = size_of::<SmemData<LOAD_SLOTS, ROW_SIZE, MICROBLOCK_SIZE>>();
     assert_eq!(dynamic_smem_size() as usize, SZ);
 
-    RmsnormFwd::<ROW_SIZE, MICROBLOCK_SIZE, BLOCK_SIZE, LOAD_SLOTS, WORKER_WARP_REGS, AUX_WARP_REGS >::run(
+    RmsnormFwd::<
+        ROW_SIZE,
+        MICROBLOCK_SIZE,
+        BLOCK_SIZE,
+        LOAD_SLOTS,
+        WORKER_WARP_REGS,
+        AUX_WARP_REGS,
+        CLUSTER_ENABLED,
+    >::run(
         gamma,
         x,
-        Epilogue::StoreRowwiseMxfp8 { rowwise_y, rowwise_y_sf },
+        Epilogue::StoreRowwiseMxfp8 {
+            rowwise_y,
+            rowwise_y_sf,
+        },
         r_inv,
         actual_row_size,
         actual_row_size_recip,
         num_rows,
-        ptr::null_mut(),
     );
 }
