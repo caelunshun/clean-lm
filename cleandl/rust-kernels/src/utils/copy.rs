@@ -1,6 +1,37 @@
-use crate::{elements_per_u32, elements_per_u64, elements_per_u128, elements_per_u256};
 use bytemuck::Pod;
 use core::simd::{u32x4, u32x8};
+
+#[inline(always)]
+pub fn elements_per_u32<T>() -> u32 {
+    const {
+        assert!(size_of::<u32>().is_multiple_of(size_of::<T>()));
+    }
+    (size_of::<u32>() / size_of::<T>()) as u32
+}
+
+#[inline(always)]
+pub fn elements_per_u64<T>() -> u32 {
+    const {
+        assert!(size_of::<u64>().is_multiple_of(size_of::<T>()));
+    }
+    (size_of::<u64>() / size_of::<T>()) as u32
+}
+
+#[inline(always)]
+pub fn elements_per_u128<T>() -> u32 {
+    const {
+        assert!(size_of::<u128>().is_multiple_of(size_of::<T>()));
+    }
+    (size_of::<u128>() / size_of::<T>()) as u32
+}
+
+#[inline(always)]
+pub fn elements_per_u256<T>() -> u32 {
+    const {
+        assert!(32usize.is_multiple_of(size_of::<T>()));
+    }
+    (32 / size_of::<T>()) as u32
+}
 
 /// Copies with 32-byte alignment between two arrays.
 ///
