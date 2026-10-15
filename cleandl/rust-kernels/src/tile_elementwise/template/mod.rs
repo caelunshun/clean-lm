@@ -45,13 +45,13 @@
 //! Note that the partitioning of tile columns among worker threads is unspecified,
 //! and may vary with tile size. Rowwise reductions should use KernelVisitor::rowwise_reduce.
 
-use crate::utils::{
-    clc::{ClcScheduler, ClcSmem},
-    copy::copy_aligned16,
+use crate::{
+    tile_elementwise::template::layouts::{CopyDir, Layouts},
+    utils::clc::{ClcScheduler, ClcSmem},
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 use ptx_std::{
-    Dim3, MBarrier, PhaseParity, Scope, bf16, bf16x8, dynamic_smem_size, dynamic_smem_start, f32x4,
+    Dim3, MBarrier, PhaseParity, Scope, bf16, dynamic_smem_size, dynamic_smem_start,
     fence::{ProxyKind, fence_proxy},
     launch::{decrease_max_registers, increase_max_registers},
     memory::CachePolicy,
@@ -118,11 +118,14 @@ pub trait KernelVisitor<K: TileElementwiseKernel<Params = P>, P: Params> {
         M: LoadStoreMode<P>;
 }
 
+/// Required swizzle mode:
+/// Mx1 ops : no swizzle
+/// MxN and 1xN ops :
+/// - bf16: no swizzle
+/// - f32: 32B swizzle
 pub struct LoadDescriptor<'a, M> {
     pub mode: M,
-    /// Required swizzle mode:
-    /// - bf16: no swizzle
-    /// - f32: 32B swizzle
+
     pub tma_desc: &'a TmaDescriptor,
     /// Note that for 1xN and Mx1 load modes,
     /// the "1" dimension's coordinate is ignored.
@@ -191,100 +194,65 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
     #[inline(always)]
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
         unsafe {
-            if P::THREAD_N.is_multiple_of(8) {
-                // Use vectorized 128-bit loads
-                let mut thr_vals_bf16 = [[bf16x8::ZERO; P::THREAD_N_DIV_8]; P::THREAD_M];
-
-                #[rustc_unroll(full)]
-                for i in 0..P::THREAD_M {
-                    copy_aligned16(
-                        smem.cast::<bf16x8>(),
-                        thr_vals_bf16[i].as_mut_ptr(),
-                        P::THREAD_N_DIV_8,
-                        NUM_WORKER_THREADS,
-                        1,
-                    );
-                }
-
-                // Convert to f32 (vectorized)
-                let mut thr_vals = [[0.0f32; P::THREAD_N]; P::THREAD_M];
-                #[rustc_unroll(full)]
-                for i in 0..P::THREAD_M {
-                    #[rustc_unroll(full)]
-                    for j in 0..P::THREAD_N_DIV_8 {
-                        #[rustc_unroll(full)]
-                        for (k, x) in thr_vals_bf16[i][j].to_f32().to_array().iter().enumerate() {
-                            thr_vals[i][j * 8 + k] = *x;
-                        }
-                    }
-                }
-
-                thr_vals
-            } else {
-                // Fall back to scalar 16-bit loads
-                let mut thr_vals = [[0.0f32; P::THREAD_N]; P::THREAD_M];
-                let smem = smem.cast::<bf16>();
-
-                #[rustc_unroll(full)]
-                for i in 0..P::THREAD_M {
-                    #[rustc_unroll(full)]
-                    for j in 0..P::THREAD_N {
-                        let j_mapped = thread_id().x as usize + j * NUM_WORKER_THREADS;
-                        thr_vals[i][j] = smem.add(i * P::TN + j_mapped).read().to_f32();
-                    }
-                }
-
-                thr_vals
+            let mut thr_vals = [[0.0; P::THREAD_N]; P::THREAD_M];
+            #[rustc_unroll(full)]
+            for row in 0..P::THREAD_M {
+                Layouts::<P>::new().copy_bf16_row(
+                    &mut thr_vals[row] as *mut f32,
+                    smem.cast::<bf16>().add(row * P::TN).cast_mut(),
+                    thread_id().x,
+                    CopyDir::SmemToReg,
+                );
             }
+            thr_vals
         }
     }
 
     #[inline(always)]
     unsafe fn worker_load_from_smem_f32(&self, smem: *const u8) -> Self::LaneVals {
         unsafe {
-            if P::THREAD_N.is_multiple_of(8) {
-                // Use 128-bit loads of 4 f32 at a time. Note we have a 32B swizzle pattern
-                // in SMEM to make loading into the same layout as the narrower bf16 bank-conflict-free.
-                let mut thr_vals = [[0.0f32; P::THREAD_N]; P::THREAD_M];
+            let mut thr_vals = [[0.0; P::THREAD_N]; P::THREAD_M];
+            #[rustc_unroll(full)]
+            for row in 0..P::THREAD_M {
+                Layouts::<P>::new().copy_f32_row(
+                    &mut thr_vals[row] as *mut f32,
+                    smem.cast::<f32>().add(row * P::TN).cast_mut(),
+                    thread_id().x,
+                    CopyDir::SmemToReg,
+                );
+            }
+            thr_vals
+        }
+    }
 
-                #[rustc_unroll(full)]
-                for i in 0..P::THREAD_M {
-                    let smem_row = smem.cast::<f32x4>().add(i * P::THREAD_N / 4);
-                    #[rustc_unroll(full)]
-                    for j in 0..P::THREAD_N / 8 {
-                        let j0_mapped = thread_id().x as usize + 2 * j * NUM_WORKER_THREADS;
-                        let j1_mapped = j0_mapped + 1;
-
-                        let j0_swizzle = ((j0_mapped % 16) / 8) ^ j0_mapped;
-                        let j1_swizzle = ((j1_mapped % 16) / 8) ^ j1_mapped;
-
-                        let v0 = smem_row.add(j0_swizzle).read().to_array();
-                        let v1 = smem_row.add(j1_swizzle).read().to_array();
-
-                        #[rustc_unroll(full)]
-                        for k in 0..4 {
-                            thr_vals[i][j * 8 + k] = v0[k];
-                            thr_vals[i][j * 8 + k + 4] = v1[k];
-                        }
-                    }
-                }
-
-                thr_vals
-            } else {
-                // Use scalar loads (but from the swizzled pattern).
-                todo!()
+    #[inline(always)]
+    unsafe fn worker_store_to_smem_bf16(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            #[rustc_unroll(full)]
+            for row in 0..P::THREAD_M {
+                Layouts::<P>::new().copy_bf16_row(
+                    &thr_vals[row] as *const f32 as *mut f32,
+                    smem.cast::<bf16>().add(row * P::TN),
+                    thread_id().x,
+                    CopyDir::RegToSmem,
+                );
             }
         }
     }
 
     #[inline(always)]
-    unsafe fn worker_store_to_smem_bf16(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
-    }
-
-    #[inline(always)]
-    unsafe fn worker_store_to_smem_f32(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
+    unsafe fn worker_store_to_smem_f32(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            #[rustc_unroll(full)]
+            for row in 0..P::THREAD_M {
+                Layouts::<P>::new().copy_f32_row(
+                    &thr_vals[row] as *const f32 as *mut f32,
+                    smem.cast::<f32>().add(row * P::TN),
+                    thread_id().x,
+                    CopyDir::RegToSmem,
+                );
+            }
+        }
     }
 }
 
@@ -307,59 +275,57 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
     #[inline(always)]
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
         unsafe {
-            if P::THREAD_N.is_multiple_of(8) {
-                // Use vectorized 128-bit loads
-                let mut thr_vals_bf16 = [bf16x8::ZERO; P::THREAD_N_DIV_8];
+            let mut thr_vals = [0.0; P::THREAD_N];
 
-                copy_aligned16(
-                    smem.cast::<bf16x8>(),
-                    thr_vals_bf16.as_mut_ptr(),
-                    P::THREAD_N_DIV_8,
-                    NUM_WORKER_THREADS,
-                    1,
-                );
+            Layouts::<P>::new().copy_bf16_row(
+                &mut thr_vals as *mut f32,
+                smem.cast::<bf16>().cast_mut(),
+                thread_id().x,
+                CopyDir::SmemToReg,
+            );
 
-                // Convert to f32 (vectorized)
-                let mut thr_vals = [0.0f32; P::THREAD_N];
-
-                #[rustc_unroll(full)]
-                for j in 0..P::THREAD_N_DIV_8 {
-                    #[rustc_unroll(full)]
-                    for (k, x) in thr_vals_bf16[j].to_f32().to_array().iter().enumerate() {
-                        thr_vals[j * 8 + k] = *x;
-                    }
-                }
-
-                thr_vals
-            } else {
-                // Fall back to scalar 16-bit loads
-                let mut thr_vals = [0.0f32; P::THREAD_N];
-                let smem = smem.cast::<bf16>();
-
-                #[rustc_unroll(full)]
-                for j in 0..P::THREAD_N {
-                    let j_mapped = thread_id().x as usize + j * NUM_WORKER_THREADS;
-                    thr_vals[j] = smem.add(j_mapped).read().to_f32();
-                }
-
-                thr_vals
-            }
+            thr_vals
         }
     }
 
     #[inline(always)]
-    unsafe fn worker_load_from_smem_f32(&self, _smem: *const u8) -> Self::LaneVals {
-        todo!()
+    unsafe fn worker_load_from_smem_f32(&self, smem: *const u8) -> Self::LaneVals {
+        unsafe {
+            let mut thr_vals = [0.0; P::THREAD_N];
+
+            Layouts::<P>::new().copy_f32_row(
+                &mut thr_vals as *mut f32,
+                smem.cast::<f32>().cast_mut(),
+                thread_id().x,
+                CopyDir::SmemToReg,
+            );
+
+            thr_vals
+        }
     }
 
     #[inline(always)]
-    unsafe fn worker_store_to_smem_bf16(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
+    unsafe fn worker_store_to_smem_bf16(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            Layouts::<P>::new().copy_bf16_row(
+                thr_vals as *const f32 as *mut f32,
+                smem.cast::<bf16>(),
+                thread_id().x,
+                CopyDir::RegToSmem,
+            );
+        }
     }
 
     #[inline(always)]
-    unsafe fn worker_store_to_smem_f32(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
+    unsafe fn worker_store_to_smem_f32(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            Layouts::<P>::new().copy_f32_row(
+                thr_vals as *const f32 as *mut f32,
+                smem.cast::<f32>(),
+                thread_id().x,
+                CopyDir::RegToSmem,
+            );
+        }
     }
 }
 
