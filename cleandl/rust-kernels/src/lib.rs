@@ -12,7 +12,8 @@
     portable_simd,
     inherent_associated_types,
     gca_macroless_args,
-    asm_experimental_arch
+    asm_experimental_arch,
+    generic_const_items
 )]
 #![allow(
     incomplete_features,
