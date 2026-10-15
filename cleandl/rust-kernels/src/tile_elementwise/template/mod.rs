@@ -63,6 +63,8 @@ use ptx_std::{
     warp_id,
 };
 
+mod layouts;
+
 /// Specifies kernel description used to instantiate the kernel template.
 ///
 /// Soundness: every thread must do the same calls on the KernelVisitor in the same order.
