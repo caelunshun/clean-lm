@@ -28,7 +28,6 @@
 #[cfg(not(target_feature = "sm_100"))]
 compile_error!("rust-kernels requires sm_100 or newer");
 
-pub mod sky_matmul;
+// pub mod sky_matmul;
 pub mod tile_elementwise;
 mod utils;
-

@@ -6,7 +6,7 @@
 //! - Thread partitioning layout: assignment of columns within the tile to worker threads. Determined based on TN.
 //! - SMEM layout: placement of elements for loads/stores in SMEM. Depends on element type size in memory.
 //!
-//! Currently, the kernel statically selects one of two layout classes based on the value of TM:
+//! Currently, the kernel statically selects one of two layout classes based on the value of TN:
 //!
 //! # Vectorized layout
 //! Selected when `TN.div_ceil(NUM_WORKER_THREADS)` is a multiple of 8. This allows elements
@@ -19,30 +19,27 @@
 //! N      | 0..8 | 8..16 | 16..24 | ... | 1016..1024 | 1024..1032 | 1032..1040 | etc.
 //! Thread | 0    | 1     | 2      | ... | 127        | 0          | 1          | etc.
 //! ```
-//! For bf16x8 loads and stores in SMEM, the SMEM layout is unswizzled and row-major;
+//! For bf16x8 loads and stores in SMEM, the SMEM layout is unswizzled and row-major,
+//! tiled using Mx256 tiles to align with the TMA box size
 //! this access pattern has zero bank conflicts. By contrast,
 //! the naive partitioning (where thread `i` gets a contiguous range of elements `i*(N/128)..(i+1)*(N/128)`)
-//! would produce bank conflicts when N>1024.
+//! would produce bank conflicts when N>1024. Note that currently, the last tile in SMEM is always padded to 256 columns.
 //!
 //! For 8-bit elements, we use the same SMEM layout as bf16, accessing it with 64-bit loads/stores.
 //!
 //! For f32, we cannot use f32x8 as the load/store type, because 256-bit SMEM operations do not exist.
 //! We must use two back-to-back f32x4 operations instead.
-//! However, doing such f32x4 loads/stores on the unswizzled SMEM layout would
-//! cause a two-way bank conflict on every access, due to the stride across lanes.
-//! The solution is to use the 32B TMA swizzling pattern in SMEM:
+//! However, doing such f32x4 loads/stores naively would create a 2-way bank conflict on every access,
+//! due to the stride between threads. Our solution is to alternate which f32x4 component is accessed
+//! by each lane:
 //!
 //! ```
-//! Logical N-index   | 0..4 | 4..8 | 8..12  | 12..16 | 16..20 | 20..24 | 24..28 | 28..32 | 32..36 | 36..40 | 40..44 | 44..48 | 48..52 | 52..56 | 56..60 | 60..64 | etc.
-//! SMEM N-index      | 0..4 | 4..8 | 8..12  | 12..16 | 16..20 | 20..24 | 24..28 | 28..32 | 36..40 | 32..36 | 44..48 | 40..44 | 52..56 | 48..52 | 60..64 | 56..60 | etc.
-//! f32x4-in-pair     | 0    | 1    | 0      | 1      | 0      | 1      | 0      | 1      | 0      | 1      | 0      | 1      | 0      | 1      | 0      | 1      | etc.
-//! Accessing lane    | 0    | 0    | 1      | 1      | 2      | 2      | 3      | 3      | 4      | 4      | 5      | 5      | 6      | 6      | 7      | 7      | etc.
+//! tid % 8                     | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7
+//! First accessed f32x4-index  | 0 | 0 | 0 | 0 | 1 | 1 | 1 | 1
+//! Second accessed f32x4-index | 1 | 1 | 1 | 1 | 0 | 0 | 0 | 0
 //! ```
 //!
-//! Each warp issues two operations: one for each lane's f32x4-in-pair-0, then one for each lane's f32x4-in-pair-1.
-//! The hardware splits our 32x128-bit memory operation for each of the two f32x4s
-//! into four 8x128-bit SMEM wavefronts.
-//! The swizzle pattern ensures that each wavefront accesses all 32 banks.
+//! We accomplish this through a register select, making it relatively cheap.
 //!
 //! # Fallback layout
 //! For when the vectorized layout cannot be used.
@@ -54,15 +51,14 @@
 //! ```
 //!
 //! For SMEM layouts, we use the same layouts as the vectorized variants,
-//! so that host-side TMA encoding code is unaffected. Rows are padded to 16 bytes for TMA compatability.
+//! so that host-side TMA encoding code is unaffected
 //! bf16 operations are done
 //! using 16-bit accesses, f32 with 32-bit accesses, and f8 with 8-bit accesses,
-//! i.e. all SMEM operations are unvectorized. For consistency, f32 keeps 32B swizzling as in the vectorized
-//! layout, although the swizzle is not technically necessary.
+//! i.e. all SMEM operations are unvectorized.
 
 use crate::tile_elementwise::template::{NUM_WORKER_THREADS, Params};
-use core::marker::PhantomData;
-use ptx_std::{bf16, bf16x8, f32x4, f32x8};
+use core::{hint::select_unpredictable, marker::PhantomData};
+use ptx_std::{bf16, bf16x8, f32x4, f32x8, lane_id};
 
 pub struct Layouts<P: Params> {
     _marker: PhantomData<P>,
@@ -101,13 +97,12 @@ impl<P: Params> Layouts<P> {
 
     /// Copies one row-slice of elements between SMEM and this thread's registers,
     /// with SMEM in bf16 format and registers in f32.
-    /// `smem` and `regs` point to the start of the row in the corresponding
-    /// address spaces.
     #[inline(always)]
     pub unsafe fn copy_bf16_row(
         &mut self,
         regs: *mut f32,
         smem: *mut bf16,
+        row: usize,
         thread_id: u32,
         dir: CopyDir,
     ) {
@@ -115,11 +110,18 @@ impl<P: Params> Layouts<P> {
             if self.is_8x_vectorized() {
                 #[rustc_unroll(full)]
                 for i in 0..P::THREAD_N_DIV_8 {
+                    let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
+
+                    let smem_tile = smem.add((n / P::TMA_PANEL_COLS) * P::TM);
+                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
+
+                    let offset = (n % P::TMA_PANEL_COLS) / 8;
+
                     match dir {
                         CopyDir::SmemToReg => {
-                            let val = smem
+                            let val = smem_row
                                 .cast::<bf16x8>()
-                                .add(thread_id as usize + i * NUM_WORKER_THREADS)
+                                .add(offset)
                                 .read()
                                 .to_f32()
                                 .to_array();
@@ -131,27 +133,28 @@ impl<P: Params> Layouts<P> {
                         CopyDir::RegToSmem => {
                             let val = regs.cast::<f32x8>().add(i).read_unaligned();
                             let val = bf16x8::from_f32(val);
-                            smem.cast::<bf16x8>()
-                                .add(thread_id as usize + i * NUM_WORKER_THREADS)
-                                .write(val);
+                            smem_row.cast::<bf16x8>().add(offset).write(val);
                         }
                     }
                 }
             } else {
                 #[rustc_unroll(full)]
                 for i in 0..P::THREAD_N {
+                    let n = thread_id as usize + i * NUM_WORKER_THREADS;
+
+                    let smem_tile = smem.add((n / P::TMA_PANEL_COLS) * P::TM);
+                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
+
+                    let offset = n % P::TMA_PANEL_COLS;
+
                     match dir {
                         CopyDir::SmemToReg => {
-                            let val = smem
-                                .add(thread_id as usize + i * NUM_WORKER_THREADS)
-                                .read()
-                                .to_f32();
+                            let val = smem_row.add(offset).read().to_f32();
                             regs.add(i).write(val);
                         }
                         CopyDir::RegToSmem => {
                             let val = bf16::from_f32(regs.add(i).read());
-                            smem.add(thread_id as usize + i * NUM_WORKER_THREADS)
-                                .write(val);
+                            smem_row.add(offset).write(val);
                         }
                     }
                 }
@@ -168,6 +171,7 @@ impl<P: Params> Layouts<P> {
         &mut self,
         regs: *mut f32,
         smem: *mut f32,
+        row: usize,
         thread_id: u32,
         dir: CopyDir,
     ) {
@@ -175,23 +179,40 @@ impl<P: Params> Layouts<P> {
             if self.is_8x_vectorized() {
                 #[rustc_unroll(full)]
                 for i in 0..P::THREAD_N_DIV_8 {
-                    #[rustc_unroll(full)]
-                    for part in 0..2 {
-                        let offset = thread_id as usize * 2 + i * 2 * NUM_WORKER_THREADS + part;
-                        let offset_swizzled = offset ^ ((offset % 16) / 8);
-                        let smem_addr = smem.cast::<f32x4>().add(offset_swizzled);
-                        match dir {
-                            CopyDir::SmemToReg => {
-                                let val = smem_addr.read().to_array();
-                                #[rustc_unroll(full)]
-                                for j in 0..4 {
-                                    regs.add(i * 8 + part * 4 + j).write(val[j]);
-                                }
-                            }
-                            CopyDir::RegToSmem => {
-                                let val = regs.cast::<f32x4>().add(i * 2).read_unaligned();
-                                smem_addr.write(val);
-                            }
+                    let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
+
+                    let smem_tile = smem.add((n / 256) * P::TM);
+                    let smem_row = smem_tile.add(256 * row);
+
+                    let offset = (n % 256) / 4;
+
+                    let smem0 = smem_row.cast::<f32x4>().add(offset);
+                    let smem1 = smem_row.cast::<f32x4>().add(offset + 1);
+
+                    let lane_parity = ((lane_id() % 8) / 4) == 1;
+                    let (first_smem, second_smem) =
+                        select_unpredictable(lane_parity, (smem1, smem0), (smem0, smem1));
+
+                    match dir {
+                        CopyDir::SmemToReg => {
+                            let first = first_smem.read();
+                            let second = second_smem.read();
+
+                            let (val0, val1) =
+                                select_unpredictable(lane_parity, (second, first), (first, second));
+
+                            regs.cast::<f32x4>().add(i * 2).write_unaligned(val0);
+                            regs.cast::<f32x4>().add(i * 2 + 1).write_unaligned(val1);
+                        }
+                        CopyDir::RegToSmem => {
+                            let val0 = regs.cast::<f32x4>().add(i * 2).read_unaligned();
+                            let val1 = regs.cast::<f32x4>().add(i * 2 + 1).read_unaligned();
+
+                            let (first, second) =
+                                select_unpredictable(lane_parity, (val1, val0), (val0, val1));
+
+                            first_smem.write(first);
+                            second_smem.write(second);
                         }
                     }
                 }
@@ -206,4 +227,11 @@ impl<P: Params> Layouts<P> {
 pub enum CopyDir {
     SmemToReg,
     RegToSmem,
+}
+
+/// Iterates over each TMA panel, its offset along the N dimension,
+/// and its offset (in elements) within an SMEM slot.
+#[inline(always)]
+pub fn iter_tma_panels<P: Params>() -> impl Iterator<Item = (usize, usize)> {
+    (0..P::NUM_TMA_PANELS).map(|idx| (idx * P::TMA_PANEL_COLS, idx * P::TMA_PANEL_COLS * P::TM))
 }

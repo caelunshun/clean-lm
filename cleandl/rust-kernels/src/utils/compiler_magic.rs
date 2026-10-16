@@ -1,3 +1,8 @@
+use ptx_std::{
+    warp_collectives::{LaneMask, shuffle},
+    warp_id,
+};
+
 /// Attempts to prevent LLVM from applying LICM to the provided value,
 /// by passing it through an empty inline assembly block labeled as having side-effects.
 /// Unlike `core::hint::black_box`, this will not result in local memory usage from
@@ -5,6 +10,15 @@
 #[inline(always)]
 pub fn make_opaque<T: MakeOpaque>(val: T) -> T {
     val.make_opaque()
+}
+
+/// Returns a warp ID known by ptxas to be uniform across the warp.
+/// See similar trick in CUTLASS (canonical_warp_idx_sync)
+///
+/// Warp must be fully converged upon calling this.
+#[inline(always)]
+pub unsafe fn uniform_warp_id() -> u32 {
+    unsafe { shuffle(LaneMask::FULL, warp_id(), 0) }
 }
 
 pub trait MakeOpaque: sealed::MakeOpaqueSealed {}

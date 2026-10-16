@@ -99,7 +99,7 @@ impl<const CLUSTER_ENABLED: bool> ClcScheduler<CLUSTER_ENABLED> {
                     ready.arrive_expect_tx_scoped::<{ Self::SCOPE }, { MemoryOrdering::Relaxed }>(
                         size_of::<CancelResponse>() as u32,
                     );
-                    fence_proxy::<{ ProxyKind::AsyncSharedCluster }>();
+                    fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
                     if is_leader_cta {
                         try_cancel_launch::<{ Self::DELIVERY }>(response_ptr.cast(), ready);
                     }
