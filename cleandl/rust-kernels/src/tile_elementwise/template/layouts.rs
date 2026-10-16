@@ -23,7 +23,8 @@
 //! tiled using Mx256 tiles to align with the TMA box size
 //! this access pattern has zero bank conflicts. By contrast,
 //! the naive partitioning (where thread `i` gets a contiguous range of elements `i*(N/128)..(i+1)*(N/128)`)
-//! would produce bank conflicts when N>1024. Note that currently, the last tile in SMEM is always padded to 256 columns.
+//! would produce bank conflicts when N>1024. Note that currently, the last tile in SMEM is always padded to 256 columns
+//! except when TN<256.
 //!
 //! For 8-bit elements, we use the same SMEM layout as bf16, accessing it with 64-bit loads/stores.
 //!
@@ -67,12 +68,6 @@ pub struct Layouts<P: Params> {
 impl<P: Params> Layouts<P> {
     #[inline(always)]
     pub const fn new() -> Self {
-        const {
-            assert!(P::TN >= 128);
-            assert!(P::TN.is_power_of_two());
-            assert!(P::TM.is_power_of_two());
-        }
-
         Self {
             _marker: PhantomData,
         }
@@ -97,6 +92,7 @@ impl<P: Params> Layouts<P> {
 
     /// Copies one row-slice of elements between SMEM and this thread's registers,
     /// with SMEM in bf16 format and registers in f32.
+    /// `smem` points to the slot base; `regs` points to the row in registers.
     #[inline(always)]
     pub unsafe fn copy_bf16_row(
         &mut self,
@@ -112,7 +108,8 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N_DIV_8 {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
-                    let smem_tile = smem.add((n / P::TMA_PANEL_COLS) * P::TM);
+                    let smem_tile =
+                        smem.add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
                     let offset = (n % P::TMA_PANEL_COLS) / 8;
@@ -142,7 +139,8 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N {
                     let n = thread_id as usize + i * NUM_WORKER_THREADS;
 
-                    let smem_tile = smem.add((n / P::TMA_PANEL_COLS) * P::TM);
+                    let smem_tile =
+                        smem.add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
                     let offset = n % P::TMA_PANEL_COLS;
@@ -164,8 +162,7 @@ impl<P: Params> Layouts<P> {
 
     /// Copies one row-slice of elements between SMEM and this thread's registers,
     /// with SMEM and registers in f32.
-    /// `smem` and `regs` point to the start of the row in the corresponding
-    /// address spaces.
+    /// `smem` points to the slot base; `regs` points to the row in registers.
     #[inline(always)]
     pub unsafe fn copy_f32_row(
         &mut self,
@@ -181,10 +178,11 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N_DIV_8 {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
-                    let smem_tile = smem.add((n / 256) * P::TM);
-                    let smem_row = smem_tile.add(256 * row);
+                    let smem_tile = smem
+                        .add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::CTA_TM * P::TMA_PANEL_COLS);
+                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
-                    let offset = (n % 256) / 4;
+                    let offset = (n % P::TMA_PANEL_COLS) / 4;
 
                     let smem0 = smem_row.cast::<f32x4>().add(offset);
                     let smem1 = smem_row.cast::<f32x4>().add(offset + 1);
@@ -233,5 +231,5 @@ pub enum CopyDir {
 /// and its offset (in elements) within an SMEM slot.
 #[inline(always)]
 pub fn iter_tma_panels<P: Params>() -> impl Iterator<Item = (usize, usize)> {
-    (0..P::NUM_TMA_PANELS).map(|idx| (idx * P::TMA_PANEL_COLS, idx * P::TMA_PANEL_COLS * P::TM))
+    (0..P::NUM_TMA_PANELS).map(|idx| (idx * P::TMA_PANEL_COLS, idx * P::TMA_PANEL_COLS * P::CTA_TM))
 }

@@ -22,10 +22,11 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
     struct P;
 
     impl Params for P {
-        const TM: usize = 8;
-        const TN: usize = 2048;
+        const CGA_TM: usize = 8;
+        const CGA_TN: usize = 2048;
+        const CLUSTER_SIZE_M: usize = 1;
+        const CLUSTER_SIZE_N: usize = 1;
 
-        const CLUSTER_SIZE: usize = 1;
         const MACROBLOCK_SIZE: usize = 16;
         const NUM_LOAD_SLOTS: usize = 2;
         const LARGEST_LOAD_BITS_PER_ELEMENT: usize = 16;
@@ -48,8 +49,9 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
 
         #[inline(always)]
         fn map_coord(&self, macroblock: u32, idx_in_macroblock: u32) -> Dim3 {
-            let row = macroblock * Self::Params::MACROBLOCK_SIZE as u32 * Self::Params::TM as u32
-                + idx_in_macroblock * Self::Params::TM as u32;
+            let row =
+                macroblock * Self::Params::MACROBLOCK_SIZE as u32 * Self::Params::CGA_TM as u32
+                    + idx_in_macroblock * Self::Params::CGA_TM as u32;
             Dim3 { x: row, y: 0, z: 0 }
         }
 
