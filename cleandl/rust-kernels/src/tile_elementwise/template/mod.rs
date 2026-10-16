@@ -179,11 +179,6 @@ pub trait KernelVisitor<K: TileElementwiseKernel<Params = P>, P: Params> {
 
 // --- Load/StoreDescriptor --- //
 
-/// Required swizzle mode:
-/// Mx1 ops : no swizzle
-/// MxN and 1xN ops :
-/// - bf16: no swizzle
-/// - f32: 32B swizzle
 pub struct LoadDescriptor<'a, M> {
     pub mode: M,
     pub ty: LoadTy,
