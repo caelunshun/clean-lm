@@ -13,7 +13,9 @@
     inherent_associated_types,
     gca_macroless_args,
     asm_experimental_arch,
-    generic_const_items
+    generic_const_items,
+    const_cmp,
+    const_trait_impl
 )]
 #![allow(
     incomplete_features,

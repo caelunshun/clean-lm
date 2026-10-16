@@ -1,19 +1,22 @@
-use crate::tile_elementwise::template::{
-    self, KernelVisitor, LoadDescriptor, LoadTy, Mode1xN, ModeMxN, Params, StoreDescriptor,
-    StoreTy, TileElementwiseKernel,
+use crate::{
+    tile_elementwise::template::{
+        self, KernelVisitor, LoadDescriptor, LoadTy, Mode1xN, ModeMx1, ModeMxN, Params,
+        StoreDescriptor, StoreTy, TileElementwiseKernel,
+    },
+    utils::tma::CompoundTmaDescriptor,
 };
 use ptx_std::{
     Denormals, Dim3, F32Ext, f32xN,
     memory::{CachePolicy, L2EvictionPriority},
-    tma::TmaDescriptor,
 };
 
 #[unsafe(no_mangle)]
 #[nvptx(max_registers(128), exact_threads_per_cta(256, 1, 1))]
 pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
-    #[nvptx(grid_constant)] x: &TmaDescriptor,
-    #[nvptx(grid_constant)] gamma: &TmaDescriptor,
-    #[nvptx(grid_constant)] y: &TmaDescriptor,
+    #[nvptx(grid_constant)] x: &CompoundTmaDescriptor,
+    #[nvptx(grid_constant)] gamma: &CompoundTmaDescriptor,
+    #[nvptx(grid_constant)] y: &CompoundTmaDescriptor,
+    #[nvptx(grid_constant)] r_inv: &CompoundTmaDescriptor,
     actual_row_size: u32,
     rcp_actual_row_size: f32,
 ) {
@@ -29,16 +32,24 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
 
         const MACROBLOCK_SIZE: usize = 16;
         const NUM_LOAD_SLOTS: usize = 2;
-        const LARGEST_LOAD_BITS_PER_ELEMENT: usize = 16;
-        const LARGEST_STORE_BITS_PER_ELEMENT: usize = 16;
+
+        const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;
+        const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize = 16;
+        const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize = 0;
+
+        const LARGEST_MXN_STORE_BITS_PER_NON_SF_ELEMENT: usize = 16;
+        const LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT: usize = 0;
+        const LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT: usize = 32;
+
         const DOES_STORE_ROWWISE_BLOCK_SCALES: bool = false;
         const DOES_STORE_COLWISE_BLOCK_SCALES: bool = false;
     }
 
     struct K<'a> {
-        x: &'a TmaDescriptor,
-        gamma: &'a TmaDescriptor,
-        y: &'a TmaDescriptor,
+        x: &'a CompoundTmaDescriptor,
+        gamma: &'a CompoundTmaDescriptor,
+        y: &'a CompoundTmaDescriptor,
+        r_inv: &'a CompoundTmaDescriptor,
         actual_row_size: u32,
         rcp_actual_row_size: f32,
     }
@@ -60,6 +71,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
             Worker {
                 gamma: f32xN::ZERO,
                 x: [f32xN::ZERO; _],
+                r_inv: [0.0; _],
             }
         }
 
@@ -119,6 +131,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
                     for i in 0..<P as Params>::THREAD_M {
                         state.x[i] = state.x[i] * state.gamma * r_inv[i];
                     }
+                    state.r_inv = r_inv;
                 },
             );
 
@@ -134,6 +147,19 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
                 #[inline(always)]
                 |state| bytemuck::must_cast(state.x),
             );
+
+            v.store(
+                StoreDescriptor {
+                    mode: ModeMx1,
+                    ty: StoreTy::F32,
+                    tma_desc: self.r_inv,
+                    coord_mn: [coord.x, 0],
+                    reduction: None,
+                    cache_policy: None,
+                },
+                #[inline(always)]
+                |state| state.r_inv,
+            );
         }
 
         #[inline(always)]
@@ -143,6 +169,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
     struct Worker {
         gamma: f32xN<{ <P as Params>::THREAD_N }>,
         x: [f32xN<{ <P as Params>::THREAD_N }>; <P as Params>::THREAD_M],
+        r_inv: [f32; <P as Params>::THREAD_M],
     }
 
     unsafe {
@@ -150,6 +177,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
             x,
             gamma,
             y,
+            r_inv,
             actual_row_size,
             rcp_actual_row_size,
         })

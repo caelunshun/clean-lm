@@ -49,22 +49,27 @@ use crate::{
     utils::{
         clc::{ClcScheduler, ClcSmem},
         compiler_magic::uniform_warp_id,
-        tma::tma_store_tile_with_reduction,
+        tma::{
+            CompoundTmaDescriptor, GMEM_TMA_ALIGNMENT, SMEM_TMA_ALIGNMENT_NO_SWIZZLE,
+            tma_store_tile_with_reduction,
+        },
     },
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 use ptx_std::{
     Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope,
     barrier::{BarrierAlignment, sync_threads},
-    bf16, block_id_in_cluster, block_size,
+    bf16, bf16x2, block_id_in_cluster, block_size,
     cluster::{self, map_to_cta, st_async},
-    cluster_dim, cluster_size, dynamic_smem_size, dynamic_smem_start,
+    cluster_dim, cluster_size,
+    cp_async::{self, CacheOperator},
+    dynamic_smem_size, dynamic_smem_start, f32x2,
     fence::{ProxyKind, fence_proxy, fence_sync_restrict},
     lane_id,
     launch::{decrease_max_registers, increase_max_registers},
     memory::CachePolicy,
     thread_id,
-    tma::{self, BulkWait, TmaDescriptor, TmaReduceOp},
+    tma::{self, BulkWait, TmaReduceOp},
     warp_collectives::{LaneMask, elect, shuffle_xor},
     warp_id,
 };
@@ -91,8 +96,13 @@ pub trait Params {
     /// still consume a full slot.
     const NUM_LOAD_SLOTS: usize;
 
-    const LARGEST_LOAD_BITS_PER_ELEMENT: usize;
-    const LARGEST_STORE_BITS_PER_ELEMENT: usize;
+    const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize;
+    const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize;
+    const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize;
+
+    const LARGEST_MXN_STORE_BITS_PER_NON_SF_ELEMENT: usize;
+    const LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT: usize;
+    const LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT: usize;
 
     const DOES_STORE_ROWWISE_BLOCK_SCALES: bool;
     const DOES_STORE_COLWISE_BLOCK_SCALES: bool;
@@ -117,18 +127,36 @@ pub trait Params {
     const THREAD_N_DIV_8: usize = Self::THREAD_N / 8;
     const THREAD_M: usize = Self::CTA_TM;
 
-    const LOAD_SLOT_BYTES: usize = (Self::LARGEST_LOAD_BITS_PER_ELEMENT
+    const MXN_LOAD_SLOT_BYTES: usize = Self::LARGEST_MXN_LOAD_BITS_PER_ELEMENT
         * Self::CTA_TM
         * Self::TMA_PANEL_COLS
         * Self::NUM_TMA_PANELS
-        / 8)
-    .next_multiple_of(256);
-    const STORE_SLOT_BYTES: usize = (Self::LARGEST_STORE_BITS_PER_ELEMENT
+        / 8;
+    const MX1_LOAD_SLOT_BYTES: usize = Self::LARGEST_MX1_LOAD_BITS_PER_ELEMENT * Self::CTA_TM / 8;
+    const _1XN_LOAD_SLOT_BYTES: usize =
+        Self::LARGEST_1XN_LOAD_BITS_PER_ELEMENT * Self::TMA_PANEL_COLS * Self::NUM_TMA_PANELS / 8;
+
+    const MXN_STORE_SLOT_BYTES: usize = Self::LARGEST_MXN_STORE_BITS_PER_NON_SF_ELEMENT
         * Self::CTA_TM
         * Self::TMA_PANEL_COLS
         * Self::NUM_TMA_PANELS
-        / 8)
-    .next_multiple_of(256);
+        / 8;
+    const MX1_STORE_SLOT_BYTES: usize =
+        Self::LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT * Self::CTA_TM / 8;
+    const _1XN_STORE_SLOT_BYTES: usize = Self::LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT
+        * Self::TMA_PANEL_COLS
+        * Self::NUM_TMA_PANELS
+        / 8;
+
+    const LOAD_SLOT_BYTES: usize = Self::MXN_LOAD_SLOT_BYTES
+        .max(Self::MX1_LOAD_SLOT_BYTES)
+        .max(Self::_1XN_LOAD_SLOT_BYTES)
+        .next_multiple_of(SMEM_TMA_ALIGNMENT_NO_SWIZZLE);
+
+    const STORE_SLOT_BYTES: usize = Self::MXN_STORE_SLOT_BYTES
+        .max(Self::MX1_STORE_SLOT_BYTES)
+        .max(Self::_1XN_STORE_SLOT_BYTES)
+        .next_multiple_of(SMEM_TMA_ALIGNMENT_NO_SWIZZLE);
 
     const CLUSTER_ENABLED: bool = Self::CLUSTER_SIZE > 1;
     const CLUSTER_SCOPE: Scope = const {
@@ -198,7 +226,7 @@ pub trait KernelVisitor<K: TileElementwiseKernel<Params = P>, P: Params> {
 pub struct LoadDescriptor<'a, M> {
     pub mode: M,
     pub ty: LoadTy,
-    pub tma_desc: &'a TmaDescriptor,
+    pub tma_desc: &'a CompoundTmaDescriptor,
     /// Coordinates of the top-left of the tile.
     /// Note this must be the same across all threads
     /// in a CTA and all CTAs in a CGA.
@@ -212,7 +240,7 @@ pub struct LoadDescriptor<'a, M> {
 pub struct StoreDescriptor<'a, M> {
     pub mode: M,
     pub ty: StoreTy,
-    pub tma_desc: &'a TmaDescriptor,
+    pub tma_desc: &'a CompoundTmaDescriptor,
     /// Coordinates of the top-left of the tile.
     /// Note this must be the same across all threads
     /// in a CTA and all CTAs in a CGA.
@@ -441,23 +469,69 @@ impl<P: Params> LoadStoreMode<P> for ModeMx1 {
     }
 
     #[inline(always)]
-    unsafe fn worker_load_from_smem_bf16(&self, _smem: *const u8) -> Self::LaneVals {
-        todo!()
+    unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
+        let smem = smem.cast::<bf16>();
+        let mut regs = [0.0; P::THREAD_M];
+
+        unsafe {
+            if P::THREAD_M.is_multiple_of(2) {
+                // Vectorized conversions
+                #[rustc_unroll(full)]
+                for i in 0..P::THREAD_M / 2 {
+                    let slice = smem.cast::<bf16x2>().add(i).read().to_f32().to_array();
+                    #[rustc_unroll(full)]
+                    for j in 0..2 {
+                        regs[i * 2 + j] = slice[j];
+                    }
+                }
+            } else {
+                // Unvectorized
+                #[rustc_unroll(full)]
+                for i in 0..P::THREAD_M {
+                    regs[i] = smem.add(i).read().to_f32();
+                }
+            }
+        }
+
+        regs
     }
 
     #[inline(always)]
-    unsafe fn worker_load_from_smem_f32(&self, _smem: *const u8) -> Self::LaneVals {
-        todo!()
+    unsafe fn worker_load_from_smem_f32(&self, smem: *const u8) -> Self::LaneVals {
+        unsafe { smem.cast::<Self::LaneVals>().read() }
     }
 
     #[inline(always)]
-    unsafe fn worker_store_to_smem_bf16(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
+    unsafe fn worker_store_to_smem_bf16(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            if uniform_warp_id() == 0 && elect(LaneMask::FULL).is_leader {
+                let smem = smem.cast::<bf16>();
+
+                if P::THREAD_M.is_multiple_of(2) {
+                    // Vectorized conversions
+                    #[rustc_unroll(full)]
+                    for i in 0..P::THREAD_M / 2 {
+                        let slice = f32x2::new(thr_vals[i * 2], thr_vals[i * 2 + 1]);
+                        smem.cast::<bf16x2>().add(i).write(bf16x2::from_f32(slice));
+                    }
+                } else {
+                    // Unvectorized
+                    #[rustc_unroll(full)]
+                    for i in 0..P::THREAD_M {
+                        smem.add(i).write(bf16::from_f32(thr_vals[i]));
+                    }
+                }
+            }
+        }
     }
 
     #[inline(always)]
-    unsafe fn worker_store_to_smem_f32(&self, _thr_vals: &Self::LaneVals, _smem: *mut u8) {
-        todo!()
+    unsafe fn worker_store_to_smem_f32(&self, thr_vals: &Self::LaneVals, smem: *mut u8) {
+        unsafe {
+            if uniform_warp_id() == 0 && elect(LaneMask::FULL).is_leader {
+                smem.cast::<Self::LaneVals>().write(*thr_vals);
+            }
+        }
     }
 }
 
@@ -577,6 +651,8 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
             if elect(LaneMask::FULL).is_leader {
                 match desc.mode.mode_enum() {
                     LoadStoreModeEnum::ModeMxN => {
+                        assert!(P::LARGEST_MXN_LOAD_BITS_PER_ELEMENT >= desc.ty.bits_per_element());
+
                         let num_bytes = desc.ty.bits_per_element()
                             * P::CTA_TM
                             * P::TMA_PANEL_COLS
@@ -595,7 +671,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             tma::tma_load_tile(
                                 dst,
                                 &self.smem.bars.load_slot_produced[slot_idx],
-                                desc.tma_desc,
+                                &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
                                         + panel_coord_offset
@@ -608,6 +684,8 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                         }
                     }
                     LoadStoreModeEnum::Mode1xN => {
+                        assert!(P::LARGEST_1XN_LOAD_BITS_PER_ELEMENT >= desc.ty.bits_per_element());
+
                         let num_bytes =
                             desc.ty.bits_per_element() * P::TMA_PANEL_COLS * P::NUM_TMA_PANELS / 8;
                         self.smem.bars.load_slot_produced[slot_idx]
@@ -623,7 +701,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             tma::tma_load_tile(
                                 dst,
                                 &self.smem.bars.load_slot_produced[slot_idx],
-                                desc.tma_desc,
+                                &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
                                         + panel_coord_offset
@@ -634,7 +712,63 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             );
                         }
                     }
-                    LoadStoreModeEnum::ModeMx1 => todo!(),
+                    LoadStoreModeEnum::ModeMx1 => {
+                        assert!(P::LARGEST_MX1_LOAD_BITS_PER_ELEMENT >= desc.ty.bits_per_element());
+
+                        let num_bytes = P::CTA_TM * desc.ty.bits_per_element() / 8;
+
+                        if num_bytes.is_multiple_of(GMEM_TMA_ALIGNMENT) {
+                            // (1) Access is TMA-aligned => use TMA directly.
+                            self.smem.bars.load_slot_produced[slot_idx]
+                                .arrive_expect_tx(num_bytes as u32);
+                            tma::tma_load_tile(
+                                self.smem.load_slots[slot_idx]
+                                    .as_ptr()
+                                    .cast::<u8>()
+                                    .cast_mut(),
+                                &self.smem.bars.load_slot_produced[slot_idx],
+                                &desc.tma_desc.tma,
+                                [(desc.coord_mn[0] as usize + cta_offset_mn[0]) as i32],
+                                desc.cache_policy,
+                            );
+                        } else if num_bytes.is_multiple_of(4) {
+                            // (2) Aligned to 4 bytes => use cp.async/LDGSTS.
+                            #[rustc_unroll(full)]
+                            for i in 0..num_bytes / 4 {
+                                let dst = self.smem.load_slots[slot_idx]
+                                    .as_ptr()
+                                    .cast::<u32>()
+                                    .cast_mut()
+                                    .add(i);
+
+                                let coord = desc.coord_mn[0] as usize + cta_offset_mn[0];
+
+                                // Technically this is UB when out-of-bounds, but copy_zfill
+                                // needs a pointer even when out-of-bounds...
+                                let src = desc
+                                    .tma_desc
+                                    .global_address
+                                    .add(coord * desc.ty.bits_per_element() / 8);
+                                let num_bytes = ((desc.tma_desc.global_size[0]
+                                    * desc.ty.bits_per_element() as u32
+                                    / 8)
+                                .saturating_sub((coord * desc.ty.bits_per_element() / 8) as u32))
+                                .min(4);
+
+                                cp_async::copy_zfill::<u32, { CacheOperator::AllLevels }>(
+                                    dst,
+                                    src.cast(),
+                                    num_bytes,
+                                );
+                            }
+
+                            self.smem.bars.load_slot_produced[slot_idx].cp_async_arrive_no_inc();
+                        } else {
+                            // <4 byte alignemnt is unsupported for now. Could technically be supported
+                            // with some bitshifting tricks on the worker warps.
+                            unimplemented!()
+                        }
+                    }
                 }
             }
 
@@ -741,6 +875,10 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
                 match desc.mode.mode_enum() {
                     LoadStoreModeEnum::ModeMxN => {
+                        assert!(
+                            P::LARGEST_MXN_STORE_BITS_PER_NON_SF_ELEMENT
+                                >= desc.ty.bits_per_non_sf_element()
+                        );
                         #[rustc_unroll(full)]
                         for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
                             let src = self
@@ -751,7 +889,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                 .add(panel_smem_offset * desc.ty.bits_per_non_sf_element() / 8);
                             tma_store_tile_with_reduction(
                                 src,
-                                desc.tma_desc,
+                                &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
                                         + panel_coord_offset
@@ -763,8 +901,18 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                 desc.reduction,
                             );
                         }
+
+                        tma::bulk_commit_group();
+                        tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
                     }
                     LoadStoreModeEnum::Mode1xN => {
+                        assert!(
+                            P::LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT
+                                >= desc.ty.bits_per_non_sf_element()
+                        );
+                        assert_ne!(desc.ty, StoreTy::Mxfp8Colwise);
+                        assert_ne!(desc.ty, StoreTy::Mxfp8Rowwise);
+
                         #[rustc_unroll(full)]
                         for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
                             let src = self
@@ -775,7 +923,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                 .add(panel_smem_offset * desc.ty.bits_per_non_sf_element() / 8);
                             tma_store_tile_with_reduction(
                                 src,
-                                desc.tma_desc,
+                                &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
                                         + panel_coord_offset
@@ -786,12 +934,59 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                 desc.reduction,
                             );
                         }
+
+                        tma::bulk_commit_group();
+                        tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
                     }
-                    LoadStoreModeEnum::ModeMx1 => todo!(),
+                    LoadStoreModeEnum::ModeMx1 => {
+                        assert_ne!(desc.ty, StoreTy::Mxfp8Colwise);
+                        assert_ne!(desc.ty, StoreTy::Mxfp8Rowwise);
+
+                        assert!(
+                            P::LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT
+                                >= desc.ty.bits_per_non_sf_element()
+                        );
+
+                        let num_bytes = P::CTA_TM * desc.ty.bits_per_non_sf_element() / 8;
+
+                        if num_bytes.is_multiple_of(GMEM_TMA_ALIGNMENT) {
+                            // (1) TMA-aligned => use TMA directly.
+                            let src = self.smem.store_slot.as_ptr().cast();
+                            tma_store_tile_with_reduction(
+                                src,
+                                &desc.tma_desc.tma,
+                                [(desc.coord_mn[0] as usize + cta_offset_mn[0]) as i32],
+                                desc.cache_policy,
+                                desc.reduction,
+                            );
+
+                            tma::bulk_commit_group();
+                            tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
+                        } else if desc.ty.bits_per_non_sf_element() == 32 {
+                            // (2) 32-bit elements for bounds-check granularity => go through registers.
+                            assert!(
+                                desc.reduction.is_none(),
+                                "reduction not supported for <16 byte aligned Mx1 stores"
+                            );
+                            #[rustc_unroll(full)]
+                            for i in 0..num_bytes / 4 {
+                                let val = self.smem.store_slot.as_ptr().cast::<u32>().add(i).read();
+                                let coord = i + desc.coord_mn[0] as usize + cta_offset_mn[0];
+                                if coord < desc.tma_desc.global_size[0] as usize {
+                                    desc.tma_desc
+                                        .global_address
+                                        .cast::<u32>()
+                                        .add(coord)
+                                        .write(val);
+                                }
+                            }
+                        } else {
+                            // <4 alignment unsupported for now.
+                            unimplemented!()
+                        }
+                    }
                 }
 
-                tma::bulk_commit_group();
-                tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
                 self.smem.bars.store_slot_consumed.arrive();
             }
 
@@ -950,7 +1145,9 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                 // Re-arm the barrier for when this slot is reused (two reductions in the future).
                 if uniform_warp_id() == 0 && elect(LaneMask::FULL).is_leader {
                     self.smem.bars.cluster_reduction_produced[slot_idx]
-                        .expect_tx((size_of::<f32>() * P::CLUSTER_SIZE_N * P::CTA_TM) as u32);
+                        .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
+                            (size_of::<f32>() * P::CLUSTER_SIZE_N * P::CTA_TM) as u32,
+                        );
                 }
 
                 // Now every lane computes the final reduced value.
@@ -1061,7 +1258,9 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
             smem.bars.cta_reduction_produced[slot_idx].init(NUM_WORKER_THREADS as u32);
             smem.bars.cluster_reduction_produced[slot_idx].init(1);
             smem.bars.cluster_reduction_produced[slot_idx]
-                .expect_tx((size_of::<f32>() * P::CLUSTER_SIZE_N * P::CTA_TM) as u32);
+                .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
+                    (size_of::<f32>() * P::CLUSTER_SIZE_N * P::CTA_TM) as u32,
+                );
         }
 
         smem.bars

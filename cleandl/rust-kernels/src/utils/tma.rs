@@ -3,6 +3,21 @@ use ptx_std::{
     tma::{TmaDescriptor, TmaReduceOp, tma_reduce_tile, tma_store_tile},
 };
 
+pub const GMEM_TMA_ALIGNMENT: usize = 16;
+
+pub const SMEM_TMA_ALIGNMENT_NO_SWIZZLE: usize = 128;
+
+/// Combines a TMA descriptor in the opaque device format with readable
+/// fields for direct accesses that don't go through TMA.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct CompoundTmaDescriptor {
+    pub tma: TmaDescriptor,
+    pub global_address: *mut u8,
+    pub global_size: [u32; 5],
+    pub global_strides: [u32; 4],
+}
+
 /// TMA store with non-const-generic reduction type
 #[inline(always)]
 pub unsafe fn tma_store_tile_with_reduction<const N: usize>(
