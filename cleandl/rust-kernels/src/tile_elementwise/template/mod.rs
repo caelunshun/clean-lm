@@ -41,14 +41,19 @@
 //! kernel. Each logical CGA processes a "macroblock" of tiles. Larger macroblock sizes reduce scheduling overhead
 //! but increase risk of wave quantization effects.
 //!
+//! The grid must be launched with dimensions `(num_macroblocks * CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`
+//! and cluster dimensions `(CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`. The macroblock index of a CGA
+//! is then `block_id().x / CLUSTER_SIZE_M`.
+//!
 //! Note that the partitioning of tile columns among worker threads is unspecified,
 //! and may vary with tile size. Rowwise reductions should use KernelVisitor::rowwise_reduce.
 
 use crate::{
     tile_elementwise::template::layouts::{CopyDir, Layouts, iter_tma_panels},
     utils::{
+        block_scale::{BlockScaledFormat, Mxfp8},
         clc::{ClcScheduler, ClcSmem},
-        compiler_magic::uniform_warp_id,
+        compiler_magic::{array_map_unrolled, array_zip_unrolled, uniform_warp_id},
         tma::{
             CompoundTmaDescriptor, GMEM_TMA_ALIGNMENT, SMEM_TMA_ALIGNMENT_NO_SWIZZLE,
             tma_store_tile_with_reduction,
@@ -57,15 +62,15 @@ use crate::{
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 use ptx_std::{
-    Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope,
+    Denormals, Dim3, F32Ext, MBarrier, MemoryOrdering, NanHandling, PhaseParity, Scope, Vector,
     barrier::{BarrierAlignment, sync_threads},
     bf16, bf16x2, block_id_in_cluster, block_size,
     cluster::{self, map_to_cta, st_async},
     cluster_dim, cluster_size,
     cp_async::{self, CacheOperator},
-    dynamic_smem_size, dynamic_smem_start, f32x2,
+    dynamic_smem_size, dynamic_smem_start, f32x2, f32x8, f32xN,
     fence::{ProxyKind, fence_proxy, fence_sync_restrict},
-    lane_id,
+    grid_dim, lane_id,
     launch::{decrease_max_registers, increase_max_registers},
     memory::CachePolicy,
     thread_id,
@@ -92,8 +97,8 @@ pub trait Params {
     const CLUSTER_SIZE_N: usize;
     const MACROBLOCK_SIZE: usize;
 
-    /// A load slot holds M x N elements of LARGEST_LOAD_BITS_PER_ELEMENT. 1 x N or M x 1 loads
-    /// still consume a full slot.
+    /// A load slot is sized for the largest of the M x N, 1 x N, and M x 1 loads
+    /// (see the LARGEST_*_LOAD_BITS_PER_ELEMENT constants). Every load consumes a full slot.
     const NUM_LOAD_SLOTS: usize;
 
     const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize;
@@ -104,8 +109,7 @@ pub trait Params {
     const LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT: usize;
     const LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT: usize;
 
-    const DOES_STORE_ROWWISE_BLOCK_SCALES: bool;
-    const DOES_STORE_COLWISE_BLOCK_SCALES: bool;
+    const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool;
 
     // --- Derived constants --- //
 
@@ -115,7 +119,6 @@ pub trait Params {
     const CTA_TN: usize = Self::CGA_TN / Self::CLUSTER_SIZE_N;
 
     /// Width of each TMA panel in SMEM, set by TMA box size constraints (at most 256).
-    /// Note that for CTA_TN > 256, we pad to a multiple of 256.
     const TMA_PANEL_COLS: usize = if Self::CTA_TN < 256 {
         Self::CTA_TN
     } else {
@@ -166,6 +169,16 @@ pub trait Params {
             Scope::Cta
         }
     };
+
+    /// Cluster-wide colwise reduction currently only used for writing colwise block-scaled
+    /// data.
+    const CLUSTER_COL_REDUCTION_SCRATCHPAD_BYTES: usize = const {
+        if Self::DOES_STORE_COLWISE_BLOCK_SCALED_DATA && Self::CLUSTER_SIZE_M > 1 {
+            size_of::<f32>() * Self::CTA_TN
+        } else {
+            0
+        }
+    };
 }
 
 /// Specifies kernel description used to instantiate the kernel template.
@@ -177,6 +190,9 @@ pub unsafe trait TileElementwiseKernel: Sized {
 
     /// Maps logical CGA ID (1D) and index within that macroblock
     /// to the Dim3 coord passed to Self::process_tile.
+    ///
+    /// The CGA ID is `block_id().x / CLUSTER_SIZE_M` of the CGA's CTAs; see the module docs
+    /// for the required grid layout.
     fn map_coord(&self, macroblock: u32, idx_in_macroblock: u32) -> Dim3;
 
     fn init_worker_state(&self) -> Self::WorkerState;
@@ -219,6 +235,17 @@ pub trait KernelVisitor<K: TileElementwiseKernel<Params = P>, P: Params> {
         get_vals: impl FnOnce(&mut K::WorkerState) -> M::LaneVals,
     ) where
         M: LoadStoreMode<P>;
+
+    /// Stores an MxN tile with block scaling, either in rowwise or columnwise
+    /// format.
+    fn store_block_scaled<BS: BlockScaledFormat>(
+        &mut self,
+        desc: BlockScaledStoreDescriptor,
+        get_vals: impl FnOnce(
+            &mut K::WorkerState,
+        ) -> [[f32; <K::Params as Params>::THREAD_N];
+            <K::Params as Params>::THREAD_M],
+    );
 }
 
 // --- Load/StoreDescriptor --- //
@@ -252,6 +279,14 @@ pub struct StoreDescriptor<'a, M> {
     pub cache_policy: Option<CachePolicy>,
 }
 
+pub struct BlockScaledStoreDescriptor<'a> {
+    pub sf_dim: BlockScaleDim,
+    pub tma_desc: &'a CompoundTmaDescriptor,
+    pub sf_ptr: *mut u8,
+    pub coord_mn: [u32; 2],
+    pub cache_policy: Option<CachePolicy>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LoadTy {
     F32,
@@ -272,19 +307,27 @@ impl LoadTy {
 pub enum StoreTy {
     F32,
     Bf16,
-    Mxfp8Rowwise,
-    Mxfp8Colwise,
 }
 
 impl StoreTy {
     #[inline(always)]
-    pub fn bits_per_non_sf_element(self) -> usize {
+    pub fn bits_per_element(self) -> usize {
         match self {
             StoreTy::F32 => 32,
             StoreTy::Bf16 => 16,
-            StoreTy::Mxfp8Rowwise | StoreTy::Mxfp8Colwise => 8,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockScaledStoreTy {
+    Mxfp8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockScaleDim {
+    Rowwise,
+    Colwise,
 }
 
 // --- Load/StoreMode --- //
@@ -329,6 +372,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
                     smem.cast::<bf16>().cast_mut(),
                     row,
                     thread_id().x,
+                    P::CTA_TM,
                     CopyDir::SmemToReg,
                 );
             }
@@ -347,6 +391,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
                     smem.cast::<f32>().cast_mut(),
                     row,
                     thread_id().x,
+                    P::CTA_TM,
                     CopyDir::SmemToReg,
                 );
             }
@@ -364,6 +409,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
                     smem.cast::<bf16>(),
                     row,
                     thread_id().x,
+                    P::CTA_TM,
                     CopyDir::RegToSmem,
                 );
             }
@@ -380,6 +426,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
                     smem.cast::<f32>(),
                     row,
                     thread_id().x,
+                    P::CTA_TM,
                     CopyDir::RegToSmem,
                 );
             }
@@ -407,6 +454,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
                 smem.cast::<bf16>().cast_mut(),
                 0,
                 thread_id().x,
+                1,
                 CopyDir::SmemToReg,
             );
 
@@ -424,6 +472,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
                 smem.cast::<f32>().cast_mut(),
                 0,
                 thread_id().x,
+                1,
                 CopyDir::SmemToReg,
             );
 
@@ -439,6 +488,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
                 smem.cast::<bf16>(),
                 0,
                 thread_id().x,
+                1,
                 CopyDir::RegToSmem,
             );
         }
@@ -452,12 +502,16 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
                 smem.cast::<f32>(),
                 0,
                 thread_id().x,
+                1,
                 CopyDir::RegToSmem,
             );
         }
     }
 }
 
+/// For stores, the values must be identical across all worker threads of all CTAs
+/// sharing an M-coordinate (e.g. the output of `KernelVisitor::rowwise_reduce`),
+/// as only one thread's values are stored.
 pub struct ModeMx1;
 
 impl<P: Params> LoadStoreMode<P> for ModeMx1 {
@@ -542,6 +596,9 @@ struct Smem<P: Params> {
     load_slots: [[UnsafeCell<MaybeUninit<u8>>; P::LOAD_SLOT_BYTES]; P::NUM_LOAD_SLOTS],
     store_slot: [UnsafeCell<MaybeUninit<u8>>; P::STORE_SLOT_BYTES],
 
+    cluster_col_reduction_scratchpads:
+        [[UnsafeCell<MaybeUninit<u8>>; P::CLUSTER_COL_REDUCTION_SCRATCHPAD_BYTES]; 2],
+
     /// These slots are double-buffered to reduce needed barrier waits.
     cta_reduction_scratchpads: [[[UnsafeCell<MaybeUninit<f32>>; P::CTA_TM]; NUM_WORKER_WARPS]; 2],
     cluster_row_reduction_scratchpads:
@@ -572,6 +629,12 @@ struct TileScheduler<K: TileElementwiseKernel> {
 }
 
 impl<K: TileElementwiseKernel> TileScheduler<K> {
+    /// Maps a CTA block ID to the macroblock index of its CGA.
+    #[inline(always)]
+    fn block_to_macroblock(block: Dim3) -> u32 {
+        block.x / <K::Params as Params>::CLUSTER_SIZE_M as u32
+    }
+
     #[inline(always)]
     pub unsafe fn next_coord(&mut self, kernel: &K) -> Option<Dim3> {
         unsafe {
@@ -580,16 +643,17 @@ impl<K: TileElementwiseKernel> TileScheduler<K> {
                     if self.current_idx_in_macroblock
                         == <K::Params as Params>::MACROBLOCK_SIZE as u32
                     {
-                        let next = self.clc.get_next_block()?;
+                        let next = Self::block_to_macroblock(self.clc.get_next_block()?);
                         self.current_idx_in_macroblock = 0;
-                        self.current_macroblock = Some(next.x);
-                        next.x
+                        self.current_macroblock = Some(next);
+                        next
                     } else {
                         mb
                     }
                 }
                 None => {
-                    self.current_macroblock = self.clc.get_next_block().map(|d| d.x);
+                    self.current_macroblock =
+                        self.clc.get_next_block().map(Self::block_to_macroblock);
                     self.current_macroblock?
                 }
             };
@@ -662,7 +726,9 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             .arrive_expect_tx(num_bytes as u32);
 
                         #[rustc_unroll(full)]
-                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
+                        for (panel_coord_offset, panel_smem_offset) in
+                            iter_tma_panels::<P>(P::CTA_TM)
+                        {
                             let dst = self.smem.load_slots[slot_idx]
                                 .as_ptr()
                                 .cast::<u8>()
@@ -692,7 +758,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             .arrive_expect_tx(num_bytes as u32);
 
                         #[rustc_unroll(full)]
-                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
+                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>(1) {
                             let dst = self.smem.load_slots[slot_idx]
                                 .as_ptr()
                                 .cast::<u8>()
@@ -733,6 +799,12 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             );
                         } else if num_bytes.is_multiple_of(4) {
                             // (2) Aligned to 4 bytes => use cp.async/LDGSTS.
+                            let coord = desc.coord_mn[0] as usize + cta_offset_mn[0];
+                            let tile_byte_offset = coord * desc.ty.bits_per_element() / 8;
+                            let global_bytes = desc.tma_desc.global_size[0] as usize
+                                * desc.ty.bits_per_element()
+                                / 8;
+
                             #[rustc_unroll(full)]
                             for i in 0..num_bytes / 4 {
                                 let dst = self.smem.load_slots[slot_idx]
@@ -741,30 +813,23 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                     .cast_mut()
                                     .add(i);
 
-                                let coord = desc.coord_mn[0] as usize + cta_offset_mn[0];
+                                let byte_offset = tile_byte_offset + i * 4;
 
                                 // Technically this is UB when out-of-bounds, but copy_zfill
                                 // needs a pointer even when out-of-bounds...
-                                let src = desc
-                                    .tma_desc
-                                    .global_address
-                                    .add(coord * desc.ty.bits_per_element() / 8);
-                                let num_bytes = ((desc.tma_desc.global_size[0]
-                                    * desc.ty.bits_per_element() as u32
-                                    / 8)
-                                .saturating_sub((coord * desc.ty.bits_per_element() / 8) as u32))
-                                .min(4);
+                                let src = desc.tma_desc.global_address.add(byte_offset);
+                                let src_bytes = global_bytes.saturating_sub(byte_offset).min(4);
 
                                 cp_async::copy_zfill::<u32, { CacheOperator::AllLevels }>(
                                     dst,
                                     src.cast(),
-                                    num_bytes,
+                                    src_bytes as u32,
                                 );
                             }
 
                             self.smem.bars.load_slot_produced[slot_idx].cp_async_arrive_no_inc();
                         } else {
-                            // <4 byte alignemnt is unsupported for now. Could technically be supported
+                            // <4 byte alignment is unsupported for now. Could technically be supported
                             // with some bitshifting tricks on the worker warps.
                             unimplemented!()
                         }
@@ -799,6 +864,19 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
     ) where
         M: LoadStoreMode<P>,
     {
+        // No-op
+    }
+
+    #[inline(always)]
+    fn store_block_scaled<BS: BlockScaledFormat>(
+        &mut self,
+        _desc: BlockScaledStoreDescriptor,
+        _get_vals: impl FnOnce(
+            &mut <K as TileElementwiseKernel>::WorkerState,
+        )
+            -> [[f32; <<K as TileElementwiseKernel>::Params as Params>::THREAD_N];
+            <<K as TileElementwiseKernel>::Params as Params>::THREAD_M],
+    ) {
         // No-op
     }
 }
@@ -877,16 +955,18 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                     LoadStoreModeEnum::ModeMxN => {
                         assert!(
                             P::LARGEST_MXN_STORE_BITS_PER_NON_SF_ELEMENT
-                                >= desc.ty.bits_per_non_sf_element()
+                                >= desc.ty.bits_per_element()
                         );
                         #[rustc_unroll(full)]
-                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
+                        for (panel_coord_offset, panel_smem_offset) in
+                            iter_tma_panels::<P>(P::CTA_TM)
+                        {
                             let src = self
                                 .smem
                                 .store_slot
                                 .as_ptr()
                                 .cast::<u8>()
-                                .add(panel_smem_offset * desc.ty.bits_per_non_sf_element() / 8);
+                                .add(panel_smem_offset * desc.ty.bits_per_element() / 8);
                             tma_store_tile_with_reduction(
                                 src,
                                 &desc.tma_desc.tma,
@@ -908,19 +988,17 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                     LoadStoreModeEnum::Mode1xN => {
                         assert!(
                             P::LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT
-                                >= desc.ty.bits_per_non_sf_element()
+                                >= desc.ty.bits_per_element()
                         );
-                        assert_ne!(desc.ty, StoreTy::Mxfp8Colwise);
-                        assert_ne!(desc.ty, StoreTy::Mxfp8Rowwise);
 
                         #[rustc_unroll(full)]
-                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>() {
+                        for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>(1) {
                             let src = self
                                 .smem
                                 .store_slot
                                 .as_ptr()
                                 .cast::<u8>()
-                                .add(panel_smem_offset * desc.ty.bits_per_non_sf_element() / 8);
+                                .add(panel_smem_offset * desc.ty.bits_per_element() / 8);
                             tma_store_tile_with_reduction(
                                 src,
                                 &desc.tma_desc.tma,
@@ -939,50 +1017,52 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                         tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
                     }
                     LoadStoreModeEnum::ModeMx1 => {
-                        assert_ne!(desc.ty, StoreTy::Mxfp8Colwise);
-                        assert_ne!(desc.ty, StoreTy::Mxfp8Rowwise);
-
                         assert!(
                             P::LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT
-                                >= desc.ty.bits_per_non_sf_element()
+                                >= desc.ty.bits_per_element()
                         );
 
-                        let num_bytes = P::CTA_TM * desc.ty.bits_per_non_sf_element() / 8;
+                        let num_bytes = P::CTA_TM * desc.ty.bits_per_element() / 8;
 
-                        if num_bytes.is_multiple_of(GMEM_TMA_ALIGNMENT) {
-                            // (1) TMA-aligned => use TMA directly.
-                            let src = self.smem.store_slot.as_ptr().cast();
-                            tma_store_tile_with_reduction(
-                                src,
-                                &desc.tma_desc.tma,
-                                [(desc.coord_mn[0] as usize + cta_offset_mn[0]) as i32],
-                                desc.cache_policy,
-                                desc.reduction,
-                            );
+                        // Mx1 values are identical across CTAs sharing an M-coordinate,
+                        // so only the first CTA in each cluster row stores them.
+                        if block_id_in_cluster().y == 0 {
+                            if num_bytes.is_multiple_of(GMEM_TMA_ALIGNMENT) {
+                                // (1) TMA-aligned => use TMA directly.
+                                let src = self.smem.store_slot.as_ptr().cast();
+                                tma_store_tile_with_reduction(
+                                    src,
+                                    &desc.tma_desc.tma,
+                                    [(desc.coord_mn[0] as usize + cta_offset_mn[0]) as i32],
+                                    desc.cache_policy,
+                                    desc.reduction,
+                                );
 
-                            tma::bulk_commit_group();
-                            tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
-                        } else if desc.ty.bits_per_non_sf_element() == 32 {
-                            // (2) 32-bit elements for bounds-check granularity => go through registers.
-                            assert!(
-                                desc.reduction.is_none(),
-                                "reduction not supported for <16 byte aligned Mx1 stores"
-                            );
-                            #[rustc_unroll(full)]
-                            for i in 0..num_bytes / 4 {
-                                let val = self.smem.store_slot.as_ptr().cast::<u32>().add(i).read();
-                                let coord = i + desc.coord_mn[0] as usize + cta_offset_mn[0];
-                                if coord < desc.tma_desc.global_size[0] as usize {
-                                    desc.tma_desc
-                                        .global_address
-                                        .cast::<u32>()
-                                        .add(coord)
-                                        .write(val);
+                                tma::bulk_commit_group();
+                                tma::bulk_wait_group::<0, { BulkWait::SourceRead }>();
+                            } else if desc.ty.bits_per_element() == 32 {
+                                // (2) 32-bit elements for bounds-check granularity => go through registers.
+                                assert!(
+                                    desc.reduction.is_none(),
+                                    "reduction not supported for <16 byte aligned Mx1 stores"
+                                );
+                                #[rustc_unroll(full)]
+                                for i in 0..num_bytes / 4 {
+                                    let val =
+                                        self.smem.store_slot.as_ptr().cast::<u32>().add(i).read();
+                                    let coord = i + desc.coord_mn[0] as usize + cta_offset_mn[0];
+                                    if coord < desc.tma_desc.global_size[0] as usize {
+                                        desc.tma_desc
+                                            .global_address
+                                            .cast::<u32>()
+                                            .add(coord)
+                                            .write(val);
+                                    }
                                 }
+                            } else {
+                                // <4 alignment unsupported for now.
+                                unimplemented!()
                             }
-                        } else {
-                            // <4 alignment unsupported for now.
-                            unimplemented!()
                         }
                     }
                 }
@@ -992,6 +1072,19 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
             self.store_idx += 1;
         }
+    }
+
+    #[inline(always)]
+    fn store_block_scaled<BS: BlockScaledFormat>(
+        &mut self,
+        desc: BlockScaledStoreDescriptor,
+        _get_vals: impl FnOnce(
+            &mut <K as TileElementwiseKernel>::WorkerState,
+        )
+            -> [[f32; <<K as TileElementwiseKernel>::Params as Params>::THREAD_N];
+            <<K as TileElementwiseKernel>::Params as Params>::THREAD_M],
+    ) {
+        todo!()
     }
 }
 
@@ -1111,31 +1204,33 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
             if P::CLUSTER_SIZE_N > 1 {
                 // Perform intra-CGA reduction through DSMEM.
                 // Each CTA sends its reduced column to every CTA
-                // having the same N-coordinate.
+                // having the same M-coordinate.
                 if uniform_warp_id() == 0 && (lane_id() as usize) < P::CLUSTER_SIZE_N {
-                    let cta_n = lane_id() as usize;
+                    let dst_cta_n = lane_id();
 
-                    let cta_rank = cta_n as u32 * P::CLUSTER_SIZE_M as u32;
+                    let dst_cta_rank =
+                        block_id_in_cluster().x + dst_cta_n * P::CLUSTER_SIZE_M as u32;
                     let dst = map_to_cta(
                         self.smem.cluster_row_reduction_scratchpads[slot_idx]
-                            .get_unchecked(cta_n)
+                            .get_unchecked(block_id_in_cluster().y as usize)
                             .as_ptr()
                             .cast_mut()
                             .cast::<f32>(),
-                        cta_rank,
+                        dst_cta_rank,
                     );
                     let bar = map_to_cta(
                         &self.smem.bars.cluster_reduction_produced[slot_idx] as *const MBarrier
                             as *mut MBarrier,
-                        cta_rank,
+                        dst_cta_rank,
                     );
 
+                    #[rustc_unroll(full)]
                     for row in 0..P::THREAD_M {
                         st_async(dst.add(row), thr_vals[row], bar);
                     }
                 }
 
-                // Wait on data to arrive from peer clusters.
+                // Wait on data to arrive from peer CTAs.
                 self.smem.bars.cluster_reduction_produced[slot_idx]
                     .wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
                         PhaseParity::of_phase(self.reduction_idx / 2),
@@ -1204,14 +1299,59 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                     &vals,
                     self.smem.store_slot.as_ptr().cast::<u8>().cast_mut(),
                 ),
-                StoreTy::Mxfp8Rowwise => todo!(),
-                StoreTy::Mxfp8Colwise => todo!(),
             }
 
             fence_proxy::<{ ProxyKind::AsyncSharedCta }>();
             self.smem.bars.store_slot_produced.arrive();
 
             self.store_idx += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn store_block_scaled<BS: BlockScaledFormat>(
+        &mut self,
+        desc: BlockScaledStoreDescriptor,
+        get_vals: impl FnOnce(
+            &mut <K as TileElementwiseKernel>::WorkerState,
+        )
+            -> [[f32; <<K as TileElementwiseKernel>::Params as Params>::THREAD_N];
+            <<K as TileElementwiseKernel>::Params as Params>::THREAD_M],
+    ) {
+        unsafe {
+            let thr_vals = get_vals(&mut self.state);
+
+            match desc.sf_dim {
+                BlockScaleDim::Rowwise => {
+                    let thr_amaxs = Layouts::<P>::new().compute_rowwise_thr_amaxs::<BS>(&thr_vals);
+
+                    let thr_sfs = array_map_unrolled(
+                        thr_amaxs,
+                        #[inline(always)]
+                        |row| {
+                            let row = f32xN::from_array(row);
+                            BS::compute_scale_factor(row)
+                        },
+                    );
+
+                    let thr_quantized_vals = array_zip_unrolled(
+                        thr_vals,
+                        thr_sfs,
+                        #[inline(always)]
+                        |row, sf| {
+                            let row = f32xN::from_array(row);
+                            BS::quantize_f32(row, sf)
+                        },
+                    );
+
+                    todo!()
+                }
+                BlockScaleDim::Colwise => {
+                    assert!(P::DOES_STORE_COLWISE_BLOCK_SCALED_DATA);
+                }
+            }
+
+            todo!()
         }
     }
 }
@@ -1246,6 +1386,7 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
         assert_eq!(cluster_size() as usize, P::CLUSTER_SIZE);
         assert_eq!(cluster_dim().x as usize, P::CLUSTER_SIZE_M);
         assert_eq!(cluster_dim().y as usize, P::CLUSTER_SIZE_N);
+        assert_eq!(grid_dim().y as usize, P::CLUSTER_SIZE_N);
 
         #[rustc_unroll(full)]
         for slot_idx in 0..P::NUM_LOAD_SLOTS {
@@ -1276,6 +1417,17 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
 pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K) {
     unsafe {
         const {
+            assert!(P::CLUSTER_SIZE_M > 0);
+            assert!(P::CLUSTER_SIZE_N > 0);
+            // Cluster row reductions use one lane of warp 0 per peer CTA.
+            // Note that clusters >16 are not possible on hardware as of this writing.
+            assert!(P::CLUSTER_SIZE_N <= 32);
+            assert!(P::CGA_TM.is_multiple_of(P::CLUSTER_SIZE_M));
+            assert!(P::CGA_TN.is_multiple_of(P::CLUSTER_SIZE_N));
+
+            assert!(P::NUM_LOAD_SLOTS > 0);
+            assert!(P::MACROBLOCK_SIZE > 0);
+
             #[cfg(has_227kb_smem)]
             assert!(
                 size_of::<Smem<P>>() <= 227 * 1024,
@@ -1292,9 +1444,6 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
 
             assert!(P::CTA_TM <= 256);
             assert!(P::CTA_TM.is_power_of_two());
-
-            assert!(P::CLUSTER_SIZE_M > 0);
-            assert!(P::CLUSTER_SIZE_N > 0);
         }
 
         let smem = &*dynamic_smem_start().cast::<Smem<P>>();

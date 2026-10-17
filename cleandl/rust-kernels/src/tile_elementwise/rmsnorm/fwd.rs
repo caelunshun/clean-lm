@@ -41,8 +41,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
         const LARGEST_1XN_STORE_BITS_PER_NON_SF_ELEMENT: usize = 0;
         const LARGEST_MX1_STORE_BITS_PER_NON_SF_ELEMENT: usize = 32;
 
-        const DOES_STORE_ROWWISE_BLOCK_SCALES: bool = false;
-        const DOES_STORE_COLWISE_BLOCK_SCALES: bool = false;
+        const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool = false;
     }
 
     struct K<'a> {

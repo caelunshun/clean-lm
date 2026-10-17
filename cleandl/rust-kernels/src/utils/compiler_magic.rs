@@ -1,3 +1,4 @@
+use core::mem::MaybeUninit;
 use ptx_std::{
     warp_collectives::{LaneMask, shuffle},
     warp_id,
@@ -19,6 +20,43 @@ pub fn make_opaque<T: MakeOpaque>(val: T) -> T {
 #[inline(always)]
 pub unsafe fn uniform_warp_id() -> u32 {
     unsafe { shuffle(LaneMask::FULL, warp_id(), 0) }
+}
+
+#[inline(always)]
+pub fn array_map_unrolled<const N: usize, T, U>(arr: [T; N], mut map: impl FnMut(T) -> U) -> [U; N]
+where
+    T: Copy,
+    U: Copy,
+{
+    unsafe {
+        let mut res = [MaybeUninit::<U>::uninit(); N];
+        #[rustc_unroll(full)]
+        for i in 0..N {
+            res[i] = MaybeUninit::new(map(arr[i]));
+        }
+        MaybeUninit::array_assume_init(res)
+    }
+}
+
+#[inline(always)]
+pub fn array_zip_unrolled<const N: usize, T1, T2, U>(
+    arr1: [T1; N],
+    arr2: [T2; N],
+    mut map: impl FnMut(T1, T2) -> U,
+) -> [U; N]
+where
+    T1: Copy,
+    T2: Copy,
+    U: Copy,
+{
+    unsafe {
+        let mut res = [MaybeUninit::<U>::uninit(); N];
+        #[rustc_unroll(full)]
+        for i in 0..N {
+            res[i] = MaybeUninit::new(map(arr1[i], arr2[i]));
+        }
+        MaybeUninit::array_assume_init(res)
+    }
 }
 
 pub trait MakeOpaque: sealed::MakeOpaqueSealed {}

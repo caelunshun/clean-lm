@@ -96,8 +96,6 @@ fn xor_permute<const N: usize>(v: &mut [u32; N], h: u32) {
     }
 }
 
-// Following implementation was LLM-synthesized and seems to work. I do not understand it.
-
 #[inline(always)]
 fn bitsel(m: u32, a: u32, b: u32) -> u32 {
     (a & m) | (b & !m)

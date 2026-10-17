@@ -15,7 +15,8 @@
     asm_experimental_arch,
     generic_const_items,
     const_cmp,
-    const_trait_impl
+    const_trait_impl,
+    maybe_uninit_array_assume_init
 )]
 #![allow(
     incomplete_features,

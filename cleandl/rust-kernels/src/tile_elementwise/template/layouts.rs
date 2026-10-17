@@ -20,11 +20,10 @@
 //! Thread | 0    | 1     | 2      | ... | 127        | 0          | 1          | etc.
 //! ```
 //! For bf16x8 loads and stores in SMEM, the SMEM layout is unswizzled and row-major,
-//! tiled using Mx256 tiles to align with the TMA box size
+//! tiled using Mx256 tiles (1x256 for 1xN row slices) to align with the TMA box size
 //! this access pattern has zero bank conflicts. By contrast,
 //! the naive partitioning (where thread `i` gets a contiguous range of elements `i*(N/128)..(i+1)*(N/128)`)
-//! would produce bank conflicts when N>1024. Note that currently, the last tile in SMEM is always padded to 256 columns
-//! except when TN<256.
+//! would produce bank conflicts when N>1024.
 //!
 //! For 8-bit elements, we use the same SMEM layout as bf16, accessing it with 64-bit loads/stores.
 //!
@@ -57,15 +56,25 @@
 //! using 16-bit accesses, f32 with 32-bit accesses, and f8 with 8-bit accesses,
 //! i.e. all SMEM operations are unvectorized.
 
-use crate::tile_elementwise::template::{NUM_WORKER_THREADS, Params};
+use crate::{
+    tile_elementwise::template::{NUM_WORKER_THREADS, Params},
+    utils::block_scale::BlockScaledFormat,
+};
 use core::{hint::select_unpredictable, marker::PhantomData};
-use ptx_std::{bf16, bf16x8, f32x4, f32x8, lane_id};
+use ptx_std::{
+    F32Ext, bf16, bf16x8, f32x4, f32x8, f32xN, lane_id,
+    warp_collectives::{LaneMask, shuffle_xor},
+};
 
 pub struct Layouts<P: Params> {
     _marker: PhantomData<P>,
 }
 
 impl<P: Params> Layouts<P> {
+    /// How many row-contiguous elements within a lane's registers?
+    pub const VECTOR_SIZE: usize = const { Layouts::<P>::new().vector_size() };
+    pub const VECTORS_PER_THREAD_PER_ROW: usize = const { P::THREAD_N / Self::VECTOR_SIZE };
+
     #[inline(always)]
     pub const fn new() -> Self {
         Self {
@@ -74,8 +83,13 @@ impl<P: Params> Layouts<P> {
     }
 
     #[inline(always)]
-    pub fn is_8x_vectorized(&self) -> bool {
+    pub const fn is_8x_vectorized(&self) -> bool {
         P::THREAD_N > 0 && P::THREAD_N.is_multiple_of(8)
+    }
+
+    #[inline(always)]
+    pub const fn vector_size(&self) -> usize {
+        if self.is_8x_vectorized() { 8 } else { 1 }
     }
 
     /// Maps a tuple (thread index, element index within a row for a thread) to its logical N-index.
@@ -100,6 +114,7 @@ impl<P: Params> Layouts<P> {
         smem: *mut bf16,
         row: usize,
         thread_id: u32,
+        panel_rows: usize,
         dir: CopyDir,
     ) {
         unsafe {
@@ -109,7 +124,7 @@ impl<P: Params> Layouts<P> {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
                     let smem_tile =
-                        smem.add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::TMA_PANEL_COLS);
+                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
                     let offset = (n % P::TMA_PANEL_COLS) / 8;
@@ -140,7 +155,7 @@ impl<P: Params> Layouts<P> {
                     let n = thread_id as usize + i * NUM_WORKER_THREADS;
 
                     let smem_tile =
-                        smem.add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::TMA_PANEL_COLS);
+                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
                     let offset = n % P::TMA_PANEL_COLS;
@@ -170,6 +185,7 @@ impl<P: Params> Layouts<P> {
         smem: *mut f32,
         row: usize,
         thread_id: u32,
+        panel_rows: usize,
         dir: CopyDir,
     ) {
         unsafe {
@@ -178,8 +194,8 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N_DIV_8 {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
-                    let smem_tile = smem
-                        .add((n / P::TMA_PANEL_COLS) * P::CTA_TM * P::CTA_TM * P::TMA_PANEL_COLS);
+                    let smem_tile =
+                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
                     let offset = (n % P::TMA_PANEL_COLS) / 4;
@@ -219,6 +235,97 @@ impl<P: Params> Layouts<P> {
             }
         }
     }
+
+    /// Computes rowwise scale factors on worker threads for the given block-scaled format,
+    /// based on the chosen thread partitioning. The amaxes are broadcast in the returned
+    /// array to match the size of thr_vals; the compiler avoids duplicating the registers.
+    #[inline(always)]
+    pub unsafe fn compute_rowwise_thr_amaxs<BS: BlockScaledFormat>(
+        &self,
+        thr_vals: &[[f32; P::THREAD_N]; P::THREAD_M],
+    ) -> [[f32; P::THREAD_N]; P::THREAD_M] {
+        unsafe {
+            let mut amaxs = [[0.0; P::THREAD_N]; P::THREAD_M];
+
+            const {
+                assert!(BS::BLOCK_SIZE <= 32);
+                assert!(BS::BLOCK_SIZE >= Self::VECTOR_SIZE);
+                assert!(BS::BLOCK_SIZE.is_power_of_two());
+            }
+
+            #[rustc_unroll(full)]
+            for i in 0..P::THREAD_M {
+                #[rustc_unroll(full)]
+                for chunk_idx in 0..P::THREAD_N / Self::VECTOR_SIZE {
+                    let chunk = f32xN::<{ Self::VECTOR_SIZE }>::from_array(
+                        thr_vals[i][chunk_idx * Self::VECTOR_SIZE..][..Self::VECTOR_SIZE]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let chunk_amax = chunk.abs().reduce_max();
+
+                    // Intra-warp reduction
+                    let reduction_group_size = BS::BLOCK_SIZE / Self::VECTOR_SIZE;
+                    let block_amax = if reduction_group_size == 32 {
+                        warp_reduce_max_f32(chunk_amax)
+                    } else {
+                        let mut block_amax = chunk_amax;
+                        for i in 0..reduction_group_size.ilog2() {
+                            block_amax =
+                                block_amax.max(shuffle_xor(LaneMask::FULL, block_amax, 1 << i));
+                        }
+                        block_amax
+                    };
+
+                    #[rustc_unroll(full)]
+                    for j in 0..Self::VECTOR_SIZE {
+                        amaxs[i][chunk_idx * Self::VECTOR_SIZE + j] = block_amax;
+                    }
+                }
+            }
+
+            amaxs
+        }
+    }
+}
+
+#[inline(always)]
+#[cfg(target_feature = "sm_100f")]
+unsafe fn warp_reduce_max_f32(val: f32) -> f32 {
+    use ptx_std::warp_collectives::{LaneMask, reduce_f32};
+
+    unsafe {
+        reduce_f32::<
+            {
+                use ptx_std::warp_collectives::ReduxOp;
+
+                ReduxOp::Max
+            },
+            {
+                use ptx_std::warp_collectives::Absolute;
+                Absolute::Disabled
+            },
+            {
+                use ptx_std::NanHandling;
+                NanHandling::Ignore
+            },
+            _,
+        >(LaneMask::FULL, val)
+    }
+}
+
+#[inline(always)]
+#[cfg(not(target_feature = "sm_100f"))]
+unsafe fn warp_reduce_max_f32(mut val: f32) -> f32 {
+    unsafe {
+        use ptx_std::WARP_SIZE;
+
+        for i in 0..WARP_SIZE.ilog2() {
+            use ptx_std::warp_collectives::{LaneMask, shuffle_xor};
+
+            val = val.max(shuffle_xor(LaneMask::FULL, val, 1 << i));
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -229,7 +336,13 @@ pub enum CopyDir {
 
 /// Iterates over each TMA panel, its offset along the N dimension,
 /// and its offset (in elements) within an SMEM slot.
+/// `panel_rows` is the number of rows per panel (see `Layouts::new`).
 #[inline(always)]
-pub fn iter_tma_panels<P: Params>() -> impl Iterator<Item = (usize, usize)> {
-    (0..P::NUM_TMA_PANELS).map(|idx| (idx * P::TMA_PANEL_COLS, idx * P::TMA_PANEL_COLS * P::CTA_TM))
+pub fn iter_tma_panels<P: Params>(panel_rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..P::NUM_TMA_PANELS).map(move |idx| {
+        (
+            idx * P::TMA_PANEL_COLS,
+            idx * P::TMA_PANEL_COLS * panel_rows,
+        )
+    })
 }
