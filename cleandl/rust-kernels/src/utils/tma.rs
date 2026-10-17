@@ -14,7 +14,9 @@ pub const SMEM_TMA_ALIGNMENT_NO_SWIZZLE: usize = 128;
 pub struct CompoundTmaDescriptor {
     pub tma: TmaDescriptor,
     pub global_address: *mut u8,
+    /// In elements, innermost dimension first.
     pub global_size: [u32; 5],
+    /// In bytes, for dimensions 1.. (as in `cuTensorMapEncodeTiled`).
     pub global_strides: [u32; 4],
 }
 

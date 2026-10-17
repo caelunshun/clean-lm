@@ -41,6 +41,13 @@
 //!
 //! We accomplish this through a register select, making it relatively cheap.
 //!
+//! # GMEM stores
+//! Worker threads store directly from registers to GMEM using the same thread partitioning.
+//! In the vectorized layout, each 8-element chunk is stored with a single 64-, 128- or 256-bit store
+//! (the latter only exist for GMEM, so the f32 select trick is not needed). If any lane of a warp would
+//! store out-of-bounds or misaligned chunks, the whole warp instead uses bounds-checked elementwise stores.
+//! In the fallback layout, GMEM stores are always elementwise.
+//!
 //! # Fallback layout
 //! For when the vectorized layout cannot be used.
 //!
@@ -57,17 +64,21 @@
 //! i.e. all SMEM operations are unvectorized.
 
 use crate::{
-    tile_elementwise::template::{NUM_WORKER_THREADS, Params},
+    tile_elementwise::template::{NUM_WORKER_THREADS, Params, StoreReduceOp},
     utils::block_scale::BlockScaledFormat,
 };
 use core::{
     hint::select_unpredictable,
     marker::PhantomData,
-    simd::{u32x2, u32x4},
+    simd::{u32x2, u32x4, u32x8},
 };
 use ptx_std::{
-    F32Ext, f32xN, lane_id, select,
-    warp_collectives::{LaneMask, shuffle_xor},
+    F32Ext, MemoryOrdering, Scope,
+    atomic::{AtomicAdd, AtomicSpace, red_add, red_add_with_cache_hint},
+    bf16, bf16x8, f32x4, f32xN, lane_id,
+    memory::{CachePolicy, store_global},
+    select,
+    warp_collectives::{LaneMask, shuffle_xor, vote_any},
 };
 
 pub struct Layouts<P: Params> {
@@ -108,36 +119,38 @@ impl<P: Params> Layouts<P> {
         }
     }
 
-    /// Copies one row-slice of elements between SMEM and this thread's registers,
-    /// with both SMEM and registers holding `T`.
-    /// `smem` points to the slot base; `regs` points to the row in registers.
+    /// Copies one row-slice of elements between memory and this thread's registers,
+    /// with both memory and registers holding `T`. `regs` points to the row in registers.
     #[inline(always)]
-    pub unsafe fn copy_row<T: Copy>(
-        &mut self,
-        regs: *mut T,
-        smem: *mut T,
-        row: usize,
-        thread_id: u32,
-        panel_rows: usize,
-        dir: CopyDir,
-    ) {
+    pub unsafe fn copy_row<T: Copy>(&self, regs: *mut T, thread_id: u32, dir: CopyDir<T>) {
         const {
             assert!(size_of::<T>().is_power_of_two());
             assert!(size_of::<T>() <= 4);
         }
 
         unsafe {
+            let (smem, to_smem) = match dir {
+                CopyDir::SmemToReg(smem) => (smem, false),
+                CopyDir::RegToSmem(smem) => (smem, true),
+                CopyDir::RegToGmem { dst, predicated } => {
+                    self.copy_row_to_gmem(regs, thread_id, dst, predicated);
+                    return;
+                }
+            };
+
             if self.is_8x_vectorized() {
                 #[rustc_unroll(full)]
                 for i in 0..P::THREAD_N_DIV_8 {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
-                    let smem_chunk = smem.add(smem_offset::<P>(n, row, panel_rows));
+                    let smem_chunk = smem
+                        .slot
+                        .add(smem_offset::<P>(n, smem.row, smem.panel_rows));
                     let regs_chunk = regs.add(i * 8);
 
                     match size_of::<T>() {
-                        1 => copy_unit::<u32x2>(regs_chunk.cast(), smem_chunk.cast(), dir),
-                        2 => copy_unit::<u32x4>(regs_chunk.cast(), smem_chunk.cast(), dir),
+                        1 => copy_unit::<u32x2>(regs_chunk.cast(), smem_chunk.cast(), to_smem),
+                        2 => copy_unit::<u32x4>(regs_chunk.cast(), smem_chunk.cast(), to_smem),
                         4 => {
                             let smem0 = smem_chunk.cast::<u32x4>();
                             let smem1 = smem0.add(1);
@@ -148,27 +161,24 @@ impl<P: Params> Layouts<P> {
 
                             let regs = regs_chunk.cast::<u32x4>();
 
-                            match dir {
-                                CopyDir::SmemToReg => {
-                                    let first = first_smem.read();
-                                    let second = second_smem.read();
+                            if to_smem {
+                                let val0 = regs.read_unaligned();
+                                let val1 = regs.add(1).read_unaligned();
 
-                                    let [val0, val1] =
-                                        select(lane_parity, [second, first], [first, second]);
+                                let [first, second] =
+                                    select(lane_parity, [val1, val0], [val0, val1]);
 
-                                    regs.write_unaligned(val0);
-                                    regs.add(1).write_unaligned(val1);
-                                }
-                                CopyDir::RegToSmem => {
-                                    let val0 = regs.read_unaligned();
-                                    let val1 = regs.add(1).read_unaligned();
+                                first_smem.write(first);
+                                second_smem.write(second);
+                            } else {
+                                let first = first_smem.read();
+                                let second = second_smem.read();
 
-                                    let [first, second] =
-                                        select(lane_parity, [val1, val0], [val0, val1]);
+                                let [val0, val1] =
+                                    select(lane_parity, [second, first], [first, second]);
 
-                                    first_smem.write(first);
-                                    second_smem.write(second);
-                                }
+                                regs.write_unaligned(val0);
+                                regs.add(1).write_unaligned(val1);
                             }
                         }
                         _ => unreachable!(),
@@ -181,10 +191,91 @@ impl<P: Params> Layouts<P> {
 
                     copy_unit(
                         regs.add(i),
-                        smem.add(smem_offset::<P>(n, row, panel_rows)),
-                        dir,
+                        smem.slot
+                            .add(smem_offset::<P>(n, smem.row, smem.panel_rows)),
+                        to_smem,
                     );
                 }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_row_to_gmem<T: Copy>(
+        &self,
+        regs: *const T,
+        thread_id: u32,
+        dst: GmemRow<T>,
+        predicated: bool,
+    ) {
+        unsafe {
+            if self.is_8x_vectorized() && !predicated {
+                #[rustc_unroll(full)]
+                for i in 0..P::THREAD_N_DIV_8 {
+                    let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
+                    store_chunk_to_gmem(
+                        regs.add(i * 8),
+                        dst.start.add(n),
+                        dst.cache_policy,
+                        dst.reduction,
+                    );
+                }
+            } else {
+                #[rustc_unroll(full)]
+                for i in 0..P::THREAD_N {
+                    let n = self.thread_element_n_index(thread_id, i);
+                    if n < dst.valid_cols {
+                        store_unit_to_gmem(
+                            regs.add(i),
+                            dst.start.add(n),
+                            dst.cache_policy,
+                            dst.reduction,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stores `R` rows of this thread's registers to a GMEM tile, skipping out-of-bounds elements.
+    ///
+    /// The warp uses vectorized stores only if every lane's chunks are in bounds and aligned.
+    #[inline(always)]
+    pub unsafe fn store_rows_to_gmem<T: Copy, const R: usize>(
+        &self,
+        regs: &[[T; P::THREAD_N]; R],
+        thread_id: u32,
+        dst: GmemTile<T>,
+    ) {
+        unsafe {
+            let aligned = dst
+                .start
+                .addr()
+                .is_multiple_of(Self::VECTOR_SIZE * size_of::<T>())
+                && (R == 1 || dst.row_stride.is_multiple_of(Self::VECTOR_SIZE));
+            let in_bounds = R <= dst.valid_rows
+                && self.thread_element_n_index(thread_id, P::THREAD_N - 1) < dst.valid_cols;
+            let predicated =
+                !self.is_8x_vectorized() || vote_any(LaneMask::FULL, !(aligned && in_bounds));
+
+            let store = #[inline(always)]
+            |predicated: bool| {
+                #[rustc_unroll(full)]
+                for r in 0..R {
+                    self.copy_row(
+                        regs[r].as_ptr().cast_mut(),
+                        thread_id,
+                        CopyDir::RegToGmem {
+                            dst: dst.row(r),
+                            predicated,
+                        },
+                    );
+                }
+            };
+            if predicated {
+                store(true)
+            } else {
+                store(false)
             }
         }
     }
@@ -283,19 +374,224 @@ unsafe fn warp_reduce_max_f32(mut val: f32) -> f32 {
     }
 }
 
+/// Direction and memory location of a `Layouts::copy_row`.
 #[derive(Copy, Clone)]
-pub enum CopyDir {
-    SmemToReg,
-    RegToSmem,
+pub enum CopyDir<T> {
+    SmemToReg(SmemRow<T>),
+    RegToSmem(SmemRow<T>),
+    RegToGmem {
+        dst: GmemRow<T>,
+        /// Use bounds-checked elementwise stores rather than vectorized ones,
+        /// which require the whole row to be in bounds and aligned to 8 elements.
+        predicated: bool,
+    },
+}
+
+/// A row within an SMEM slot.
+#[derive(Copy, Clone)]
+pub struct SmemRow<T> {
+    /// Base of the slot.
+    pub slot: *mut T,
+    pub row: usize,
+    /// Rows per TMA panel (see `iter_tma_panels`).
+    pub panel_rows: usize,
+}
+
+/// A row of a tile in GMEM.
+#[derive(Copy, Clone)]
+pub struct GmemRow<T> {
+    /// Address of the element in the tile's first column. May be out of bounds (pedantically UB but not avoidable)
+    pub start: *mut T,
+    /// Number of in-bounds elements starting at `start`.
+    pub valid_cols: usize,
+    pub cache_policy: Option<CachePolicy>,
+    /// Reductions interpret 16-bit elements as bf16 and 32-bit elements as f32.
+    pub reduction: Option<StoreReduceOp>,
+}
+
+/// A row-major tile in GMEM.
+#[derive(Copy, Clone)]
+pub struct GmemTile<T> {
+    /// Address of the tile's top-left element. May be out of bounds (pedantically UB but not avoidable)
+    pub start: *mut T,
+    /// Distance between rows in elements.
+    pub row_stride: usize,
+    /// Number of in-bounds rows/columns starting at `start`.
+    pub valid_rows: usize,
+    pub valid_cols: usize,
+    pub cache_policy: Option<CachePolicy>,
+    /// Reductions interpret 16-bit elements as bf16 and 32-bit elements as f32.
+    pub reduction: Option<StoreReduceOp>,
+}
+
+impl<T> GmemTile<T> {
+    #[inline(always)]
+    pub fn row(&self, row: usize) -> GmemRow<T> {
+        GmemRow {
+            start: self.start.wrapping_add(row * self.row_stride),
+            valid_cols: if row < self.valid_rows {
+                self.valid_cols
+            } else {
+                0
+            },
+            cache_policy: self.cache_policy,
+            reduction: self.reduction,
+        }
+    }
+}
+
+/// A single-row tile.
+impl<T> From<GmemRow<T>> for GmemTile<T> {
+    #[inline(always)]
+    fn from(row: GmemRow<T>) -> Self {
+        Self {
+            start: row.start,
+            row_stride: 0,
+            valid_rows: 1,
+            valid_cols: row.valid_cols,
+            cache_policy: row.cache_policy,
+            reduction: row.reduction,
+        }
+    }
 }
 
 /// Copies a single value between an aligned SMEM location and a (possibly unaligned) register location.
 #[inline(always)]
-unsafe fn copy_unit<U: Copy>(regs: *mut U, smem: *mut U, dir: CopyDir) {
+unsafe fn copy_unit<U: Copy>(regs: *mut U, smem: *mut U, to_smem: bool) {
     unsafe {
-        match dir {
-            CopyDir::SmemToReg => regs.write_unaligned(smem.read()),
-            CopyDir::RegToSmem => smem.write(regs.read_unaligned()),
+        if to_smem {
+            smem.write(regs.read_unaligned());
+        } else {
+            regs.write_unaligned(smem.read());
+        }
+    }
+}
+
+/// Stores a contiguous array from a single thread to a GMEM row,
+/// using vectorized stores if the whole row is in bounds and aligned.
+#[inline(always)]
+pub unsafe fn store_contiguous_to_gmem<T: Copy, const N: usize>(vals: &[T; N], dst: GmemRow<T>) {
+    unsafe {
+        let vectorized = N.is_multiple_of(8)
+            && N <= dst.valid_cols
+            && dst.start.addr().is_multiple_of(8 * size_of::<T>());
+        if vectorized {
+            #[rustc_unroll(full)]
+            for i in 0..N / 8 {
+                store_chunk_to_gmem(
+                    vals.as_ptr().add(i * 8),
+                    dst.start.add(i * 8),
+                    dst.cache_policy,
+                    dst.reduction,
+                );
+            }
+        } else {
+            #[rustc_unroll(full)]
+            for i in 0..N {
+                if i < dst.valid_cols {
+                    store_unit_to_gmem(
+                        vals.as_ptr().add(i),
+                        dst.start.add(i),
+                        dst.cache_policy,
+                        dst.reduction,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Stores 8 contiguous elements from (possibly unaligned) registers to GMEM aligned to 8 elements.
+#[inline(always)]
+unsafe fn store_chunk_to_gmem<T: Copy>(
+    regs: *const T,
+    ptr: *mut T,
+    cache_policy: Option<CachePolicy>,
+    reduction: Option<StoreReduceOp>,
+) {
+    unsafe {
+        match reduction {
+            None => match size_of::<T>() {
+                1 => store_global(
+                    ptr.cast::<u32x2>(),
+                    regs.cast::<u32x2>().read_unaligned(),
+                    cache_policy,
+                ),
+                2 => store_global(
+                    ptr.cast::<u32x4>(),
+                    regs.cast::<u32x4>().read_unaligned(),
+                    cache_policy,
+                ),
+                4 => store_global(
+                    ptr.cast::<u32x8>(),
+                    regs.cast::<u32x8>().read_unaligned(),
+                    cache_policy,
+                ),
+                _ => unreachable!(),
+            },
+            Some(StoreReduceOp::Add) => match size_of::<T>() {
+                2 => red_add_global(
+                    ptr.cast::<bf16x8>(),
+                    regs.cast::<bf16x8>().read_unaligned(),
+                    cache_policy,
+                ),
+                4 =>
+                {
+                    #[rustc_unroll(full)]
+                    for i in 0..2 {
+                        red_add_global(
+                            ptr.cast::<f32x4>().add(i),
+                            regs.cast::<f32x4>().add(i).read_unaligned(),
+                            cache_policy,
+                        );
+                    }
+                }
+                _ => unimplemented!("reductions only support bf16 and f32"),
+            },
+        }
+    }
+}
+
+/// Stores a single element from registers to GMEM.
+#[inline(always)]
+unsafe fn store_unit_to_gmem<T: Copy>(
+    regs: *const T,
+    ptr: *mut T,
+    cache_policy: Option<CachePolicy>,
+    reduction: Option<StoreReduceOp>,
+) {
+    unsafe {
+        match reduction {
+            None => match size_of::<T>() {
+                1 => store_global(ptr.cast::<u8>(), regs.cast::<u8>().read(), cache_policy),
+                2 => store_global(ptr.cast::<u16>(), regs.cast::<u16>().read(), cache_policy),
+                4 => store_global(ptr.cast::<u32>(), regs.cast::<u32>().read(), cache_policy),
+                _ => unreachable!(),
+            },
+            Some(StoreReduceOp::Add) => match size_of::<T>() {
+                2 => red_add_global(ptr.cast::<bf16>(), regs.cast::<bf16>().read(), cache_policy),
+                4 => red_add_global(ptr.cast::<f32>(), regs.cast::<f32>().read(), cache_policy),
+                _ => unimplemented!("reductions only support bf16 and f32"),
+            },
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn red_add_global<T: AtomicAdd>(ptr: *mut T, val: T, cache_policy: Option<CachePolicy>) {
+    unsafe {
+        match cache_policy {
+            None => {
+                red_add::<T, { MemoryOrdering::Relaxed }, { Scope::Gpu }, { AtomicSpace::Global }>(
+                    ptr, val,
+                )
+            }
+            Some(cache_policy) => red_add_with_cache_hint::<
+                T,
+                { MemoryOrdering::Relaxed },
+                { Scope::Gpu },
+                { AtomicSpace::Global },
+            >(ptr, val, cache_policy),
         }
     }
 }
