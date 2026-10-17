@@ -60,9 +60,13 @@ use crate::{
     tile_elementwise::template::{NUM_WORKER_THREADS, Params},
     utils::block_scale::BlockScaledFormat,
 };
-use core::{hint::select_unpredictable, marker::PhantomData};
+use core::{
+    hint::select_unpredictable,
+    marker::PhantomData,
+    simd::{u32x2, u32x4},
+};
 use ptx_std::{
-    F32Ext, bf16, bf16x8, f32x4, f32x8, f32xN, lane_id,
+    F32Ext, f32xN, lane_id,
     warp_collectives::{LaneMask, shuffle_xor},
 };
 
@@ -105,18 +109,23 @@ impl<P: Params> Layouts<P> {
     }
 
     /// Copies one row-slice of elements between SMEM and this thread's registers,
-    /// with SMEM in bf16 format and registers in f32.
+    /// with both SMEM and registers holding `T`.
     /// `smem` points to the slot base; `regs` points to the row in registers.
     #[inline(always)]
-    pub unsafe fn copy_bf16_row(
+    pub unsafe fn copy_row<T: Copy>(
         &mut self,
-        regs: *mut f32,
-        smem: *mut bf16,
+        regs: *mut T,
+        smem: *mut T,
         row: usize,
         thread_id: u32,
         panel_rows: usize,
         dir: CopyDir,
     ) {
+        const {
+            assert!(size_of::<T>().is_power_of_two());
+            assert!(size_of::<T>() <= 4);
+        }
+
         unsafe {
             if self.is_8x_vectorized() {
                 #[rustc_unroll(full)]
@@ -127,26 +136,52 @@ impl<P: Params> Layouts<P> {
                         smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
                     let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
 
-                    let offset = (n % P::TMA_PANEL_COLS) / 8;
+                    let smem_chunk = smem_row.add(n % P::TMA_PANEL_COLS);
+                    let regs_chunk = regs.add(i * 8);
 
-                    match dir {
-                        CopyDir::SmemToReg => {
-                            let val = smem_row
-                                .cast::<bf16x8>()
-                                .add(offset)
-                                .read()
-                                .to_f32()
-                                .to_array();
-                            #[rustc_unroll(full)]
-                            for j in 0..8 {
-                                regs.add(i * 8 + j).write(val[j]);
+                    match size_of::<T>() {
+                        1 => copy_unit::<u32x2>(regs_chunk.cast(), smem_chunk.cast(), dir),
+                        2 => copy_unit::<u32x4>(regs_chunk.cast(), smem_chunk.cast(), dir),
+                        4 => {
+                            let smem0 = smem_chunk.cast::<u32x4>();
+                            let smem1 = smem0.add(1);
+
+                            let lane_parity = ((lane_id() % 8) / 4) == 1;
+                            let (first_smem, second_smem) =
+                                select_unpredictable(lane_parity, (smem1, smem0), (smem0, smem1));
+
+                            let regs = regs_chunk.cast::<u32x4>();
+
+                            match dir {
+                                CopyDir::SmemToReg => {
+                                    let first = first_smem.read();
+                                    let second = second_smem.read();
+
+                                    let (val0, val1) = select_unpredictable(
+                                        lane_parity,
+                                        (second, first),
+                                        (first, second),
+                                    );
+
+                                    regs.write_unaligned(val0);
+                                    regs.add(1).write_unaligned(val1);
+                                }
+                                CopyDir::RegToSmem => {
+                                    let val0 = regs.read_unaligned();
+                                    let val1 = regs.add(1).read_unaligned();
+
+                                    let (first, second) = select_unpredictable(
+                                        lane_parity,
+                                        (val1, val0),
+                                        (val0, val1),
+                                    );
+
+                                    first_smem.write(first);
+                                    second_smem.write(second);
+                                }
                             }
                         }
-                        CopyDir::RegToSmem => {
-                            let val = regs.cast::<f32x8>().add(i).read_unaligned();
-                            let val = bf16x8::from_f32(val);
-                            smem_row.cast::<bf16x8>().add(offset).write(val);
-                        }
+                        _ => unreachable!(),
                     }
                 }
             } else {
@@ -160,78 +195,8 @@ impl<P: Params> Layouts<P> {
 
                     let offset = n % P::TMA_PANEL_COLS;
 
-                    match dir {
-                        CopyDir::SmemToReg => {
-                            let val = smem_row.add(offset).read().to_f32();
-                            regs.add(i).write(val);
-                        }
-                        CopyDir::RegToSmem => {
-                            let val = bf16::from_f32(regs.add(i).read());
-                            smem_row.add(offset).write(val);
-                        }
-                    }
+                    copy_unit(regs.add(i), smem_row.add(offset), dir);
                 }
-            }
-        }
-    }
-
-    /// Copies one row-slice of elements between SMEM and this thread's registers,
-    /// with SMEM and registers in f32.
-    /// `smem` points to the slot base; `regs` points to the row in registers.
-    #[inline(always)]
-    pub unsafe fn copy_f32_row(
-        &mut self,
-        regs: *mut f32,
-        smem: *mut f32,
-        row: usize,
-        thread_id: u32,
-        panel_rows: usize,
-        dir: CopyDir,
-    ) {
-        unsafe {
-            if self.is_8x_vectorized() {
-                #[rustc_unroll(full)]
-                for i in 0..P::THREAD_N_DIV_8 {
-                    let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
-
-                    let smem_tile =
-                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
-                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
-
-                    let offset = (n % P::TMA_PANEL_COLS) / 4;
-
-                    let smem0 = smem_row.cast::<f32x4>().add(offset);
-                    let smem1 = smem_row.cast::<f32x4>().add(offset + 1);
-
-                    let lane_parity = ((lane_id() % 8) / 4) == 1;
-                    let (first_smem, second_smem) =
-                        select_unpredictable(lane_parity, (smem1, smem0), (smem0, smem1));
-
-                    match dir {
-                        CopyDir::SmemToReg => {
-                            let first = first_smem.read();
-                            let second = second_smem.read();
-
-                            let (val0, val1) =
-                                select_unpredictable(lane_parity, (second, first), (first, second));
-
-                            regs.cast::<f32x4>().add(i * 2).write_unaligned(val0);
-                            regs.cast::<f32x4>().add(i * 2 + 1).write_unaligned(val1);
-                        }
-                        CopyDir::RegToSmem => {
-                            let val0 = regs.cast::<f32x4>().add(i * 2).read_unaligned();
-                            let val1 = regs.cast::<f32x4>().add(i * 2 + 1).read_unaligned();
-
-                            let (first, second) =
-                                select_unpredictable(lane_parity, (val1, val0), (val0, val1));
-
-                            first_smem.write(first);
-                            second_smem.write(second);
-                        }
-                    }
-                }
-            } else {
-                todo!()
             }
         }
     }
@@ -325,6 +290,8 @@ unsafe fn warp_reduce_max_f32(mut val: f32) -> f32 {
 
             val = val.max(shuffle_xor(LaneMask::FULL, val, 1 << i));
         }
+
+        val
     }
 }
 
@@ -332,6 +299,17 @@ unsafe fn warp_reduce_max_f32(mut val: f32) -> f32 {
 pub enum CopyDir {
     SmemToReg,
     RegToSmem,
+}
+
+/// Copies a single value between an aligned SMEM location and a (possibly unaligned) register location.
+#[inline(always)]
+unsafe fn copy_unit<U: Copy>(regs: *mut U, smem: *mut U, dir: CopyDir) {
+    unsafe {
+        match dir {
+            CopyDir::SmemToReg => regs.write_unaligned(smem.read()),
+            CopyDir::RegToSmem => smem.write(regs.read_unaligned()),
+        }
+    }
 }
 
 /// Iterates over each TMA panel, its offset along the N dimension,
