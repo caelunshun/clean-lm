@@ -66,7 +66,7 @@ use core::{
     simd::{u32x2, u32x4},
 };
 use ptx_std::{
-    F32Ext, f32xN, lane_id,
+    F32Ext, f32xN, lane_id, select,
     warp_collectives::{LaneMask, shuffle_xor},
 };
 
@@ -132,11 +132,7 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N_DIV_8 {
                     let n = thread_id as usize * 8 + i * 8 * NUM_WORKER_THREADS;
 
-                    let smem_tile =
-                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
-                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
-
-                    let smem_chunk = smem_row.add(n % P::TMA_PANEL_COLS);
+                    let smem_chunk = smem.add(smem_offset::<P>(n, row, panel_rows));
                     let regs_chunk = regs.add(i * 8);
 
                     match size_of::<T>() {
@@ -157,11 +153,8 @@ impl<P: Params> Layouts<P> {
                                     let first = first_smem.read();
                                     let second = second_smem.read();
 
-                                    let (val0, val1) = select_unpredictable(
-                                        lane_parity,
-                                        (second, first),
-                                        (first, second),
-                                    );
+                                    let [val0, val1] =
+                                        select(lane_parity, [second, first], [first, second]);
 
                                     regs.write_unaligned(val0);
                                     regs.add(1).write_unaligned(val1);
@@ -170,11 +163,8 @@ impl<P: Params> Layouts<P> {
                                     let val0 = regs.read_unaligned();
                                     let val1 = regs.add(1).read_unaligned();
 
-                                    let (first, second) = select_unpredictable(
-                                        lane_parity,
-                                        (val1, val0),
-                                        (val0, val1),
-                                    );
+                                    let [first, second] =
+                                        select(lane_parity, [val1, val0], [val0, val1]);
 
                                     first_smem.write(first);
                                     second_smem.write(second);
@@ -189,13 +179,11 @@ impl<P: Params> Layouts<P> {
                 for i in 0..P::THREAD_N {
                     let n = thread_id as usize + i * NUM_WORKER_THREADS;
 
-                    let smem_tile =
-                        smem.add((n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS);
-                    let smem_row = smem_tile.add(P::TMA_PANEL_COLS * row);
-
-                    let offset = n % P::TMA_PANEL_COLS;
-
-                    copy_unit(regs.add(i), smem_row.add(offset), dir);
+                    copy_unit(
+                        regs.add(i),
+                        smem.add(smem_offset::<P>(n, row, panel_rows)),
+                        dir,
+                    );
                 }
             }
         }
@@ -310,6 +298,14 @@ unsafe fn copy_unit<U: Copy>(regs: *mut U, smem: *mut U, dir: CopyDir) {
             CopyDir::RegToSmem => smem.write(regs.read_unaligned()),
         }
     }
+}
+
+/// Offset (in elements) within an SMEM slot of the element at (`row`, `n`).
+#[inline(always)]
+fn smem_offset<P: Params>(n: usize, row: usize, panel_rows: usize) -> usize {
+    (n / P::TMA_PANEL_COLS) * panel_rows * P::TMA_PANEL_COLS
+        + P::TMA_PANEL_COLS * row
+        + n % P::TMA_PANEL_COLS
 }
 
 /// Iterates over each TMA panel, its offset along the N dimension,

@@ -1,10 +1,28 @@
 //! Various warp-collective register transposes.
 
-use core::hint::select_unpredictable;
+use crate::utils::compiler_magic::array_map_unrolled;
+use core::{hint::select_unpredictable, mem::MaybeUninit};
 use ptx_std::{
     PermuteMode, U32Ext, lane_id,
     warp_collectives::{LaneMask, shuffle_xor},
 };
+
+#[inline(always)]
+pub fn transpose_array_within_lane<const N1: usize, const N2: usize, T: Copy>(
+    src: [[T; N2]; N1],
+) -> [[T; N1]; N2] {
+    let mut dst = [[MaybeUninit::<T>::uninit(); N1]; N2];
+
+    #[rustc_unroll(full)]
+    for i in 0..N1 {
+        #[rustc_unroll(full)]
+        for j in 0..N2 {
+            dst[j][i].write(src[i][j]);
+        }
+    }
+
+    array_map_unrolled(dst, |x| unsafe { MaybeUninit::array_assume_init(x) })
+}
 
 /// Transposes a 32x32 matrix of 8-bit elements held in registers, where initially
 /// lane `i` holds all elements of row `i` in order, and after the transpose

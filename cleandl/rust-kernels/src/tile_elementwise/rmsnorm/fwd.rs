@@ -240,7 +240,7 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
 
 #[unsafe(no_mangle)]
 #[nvptx(max_registers(128), exact_threads_per_cta(256, 1, 1))]
-pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymx8r_RS2048_BS128(
+pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
     #[nvptx(grid_constant)] x: &CompoundTmaDescriptor,
     #[nvptx(grid_constant)] gamma: &CompoundTmaDescriptor,
     #[nvptx(grid_constant)] y: &CompoundTmaDescriptor,

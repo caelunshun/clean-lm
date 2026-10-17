@@ -1,6 +1,6 @@
 use ptx_std::{
-    Overflow, Relu, Rounding, SupportedVectorLen, Vector, VectorElement, VectorLen, bf16xN, f8e4m3,
-    f8e4m3xN, f8e8m0, f8e8m0xN, f32xN,
+    Overflow, Relu, Rounding, SupportedVectorLen, Vector, VectorElement, VectorLen, WARP_SIZE,
+    bf16xN, f8e4m3, f8e4m3xN, f8e8m0, f8e8m0xN, f32xN,
 };
 
 pub trait BlockScaledFormat {
@@ -75,19 +75,19 @@ pub const SF_TILE_NROWS: u32 = 128;
 pub const SF_TILE_NCOLS: u32 = 4;
 
 /// Computes global index of a scale factor in the scale factor tensor (in units of elements)
-/// given its coordinates as (row, block), where `block` is along the blockscaling dimension
-/// and `row` is the other dimension.
+/// given its coordinates as (row, block), where `col` increases along the blockscaling dimension
+/// and `row` increases along the other dimension.
 ///
 /// This uses the 128x4 swizzled tiled layout for scale factors, as consumed e.g. by cuBLASlt.
 ///
 /// Note that `ncols` is the width of the scale factors tensor, not the original tensor.
 /// It must be padded to a multiple of SF_TILE_NCOLS.
 #[inline(always)]
-pub fn scale_factor_pos(row: u32, col: u32, block_size: u32, ncols: u32) -> usize {
+pub fn scale_factor_pos(row: u32, col: u32, ncols: u32) -> usize {
     let n_col_blocks = ncols / 4;
     let offset = ((row / 128) * n_col_blocks + (col / 4)) * 128 * 4
-        + (row % block_size) * 16
-        + ((row % 128) / block_size) * 4
+        + (row % WARP_SIZE) * 16
+        + ((row % 128) / WARP_SIZE) * 4
         + (col % 4);
     offset as usize
 }
