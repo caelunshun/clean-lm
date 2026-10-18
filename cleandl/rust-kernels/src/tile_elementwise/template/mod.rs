@@ -58,18 +58,17 @@ use crate::{
         clc::{ClcScheduler, ClcSmem},
         compiler_magic::{array_map_unrolled, array_zip_unrolled, uniform_warp_id},
         tma::{CompoundTmaDescriptor, GMEM_TMA_ALIGNMENT, SMEM_TMA_ALIGNMENT_NO_SWIZZLE},
-        transpose::transpose_array_within_lane,
     },
 };
-use core::{cell::UnsafeCell, mem::MaybeUninit, simd::u32x4};
+use core::{cell::UnsafeCell, mem::MaybeUninit};
 use ptx_std::{
-    Denormals, Dim3, F32Ext, MBarrier, MemoryOrdering, NanHandling, PhaseParity, Scope, Vector,
+    Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope,
     barrier::{BarrierAlignment, sync_threads},
-    bf16, bf16x2, bf16x8, bf16xN, block_id_in_cluster, block_size,
+    bf16, bf16x2, bf16xN, block_id_in_cluster, block_size,
     cluster::{self, map_to_cta, st_async},
     cluster_dim, cluster_size,
     cp_async::{self, CacheOperator},
-    dynamic_smem_size, dynamic_smem_start, f32x2, f32x4, f32x8, f32xN,
+    dynamic_smem_size, dynamic_smem_start, f32xN,
     fence::fence_sync_restrict,
     grid_dim, lane_id,
     launch::{decrease_max_registers, increase_max_registers},

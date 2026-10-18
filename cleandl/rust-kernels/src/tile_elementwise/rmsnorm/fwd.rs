@@ -276,3 +276,60 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
         })
     };
 }
+
+#[unsafe(no_mangle)]
+#[nvptx(
+    max_registers(128),
+    exact_threads_per_cta(256, 1, 1),
+    exact_cluster_dim(4, 1, 1)
+)]
+pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
+    #[nvptx(grid_constant)] x: &CompoundTmaDescriptor,
+    #[nvptx(grid_constant)] gamma: &CompoundTmaDescriptor,
+    #[nvptx(grid_constant)] y_rowwise: &CompoundTmaDescriptor,
+    y_rowwise_sf_ptr: *mut u8,
+    #[nvptx(grid_constant)] y_colwise: &CompoundTmaDescriptor,
+    y_colwise_sf_ptr: *mut u8,
+    #[nvptx(grid_constant)] r_inv: &CompoundTmaDescriptor,
+    actual_row_size: u32,
+    rcp_actual_row_size: f32,
+) {
+    struct P;
+
+    impl Params for P {
+        const CGA_TM: usize = 32;
+        const CGA_TN: usize = 2048;
+        const CLUSTER_SIZE_M: usize = 4;
+        const CLUSTER_SIZE_N: usize = 1;
+
+        const MACROBLOCK_SIZE: usize = 16;
+
+        // Needs reduced to 1 to make room for the resharding buffers (64 KiB) while keeping
+        // an occupancy of 2 CTA/SM on B200.
+        const NUM_LOAD_SLOTS: usize = 1;
+
+        const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;
+        const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize = 16;
+        const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize = 0;
+
+        const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool = true;
+    }
+
+    assert!(actual_row_size <= 2048);
+
+    unsafe {
+        template::run(Impl::<P> {
+            x,
+            gamma,
+            r_inv,
+            rcp_actual_row_size,
+            store_mode: StoreMode::Mxfp8RowAndCol(
+                y_rowwise,
+                y_rowwise_sf_ptr,
+                y_colwise,
+                y_colwise_sf_ptr,
+            ),
+            _marker: PhantomData,
+        })
+    };
+}

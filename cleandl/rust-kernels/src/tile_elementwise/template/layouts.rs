@@ -555,7 +555,7 @@ unsafe fn store_chunk_to_gmem<T: Copy>(
 
 /// Stores a single element from registers to GMEM.
 #[inline(always)]
-unsafe fn store_unit_to_gmem<T: Copy>(
+pub unsafe fn store_unit_to_gmem<T: Copy>(
     regs: *const T,
     ptr: *mut T,
     cache_policy: Option<CachePolicy>,

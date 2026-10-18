@@ -1,23 +1,26 @@
 use crate::{
     tile_elementwise::template::{
-        BlockScaledStoreDescriptor, NUM_WORKER_THREADS, Params, Smem, layouts::Layouts,
+        BlockScaledStoreDescriptor, GmemStore, NUM_WORKER_THREADS, Params, Smem,
+        layouts::{Layouts, store_unit_to_gmem},
     },
     utils::{
-        block_scale::BlockScaledFormat,
+        block_scale::{BlockScaledFormat, SF_TILE_NCOLS, SF_TILE_NROWS, scale_factor_pos},
         compiler_magic::{array_map_unrolled, array_zip_unrolled, uniform_warp_id},
     },
 };
-use core::simd::u32x4;
+use core::simd::{u32x4, u32x8};
 use ptx_std::{
     MBarrier, MemoryOrdering, PhaseParity, Scope, Vector, bf16, bf16x8, bf16xN,
     block_id_in_cluster,
     cluster::{map_to_cta, st_async},
     f32x8, f32xN,
     fence::fence_sync_restrict,
+    memory::store_global,
     thread_id,
-    warp_collectives::{LaneMask, elect},
+    warp_collectives::{LaneMask, elect, vote_any},
 };
 
+#[inline(always)]
 pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFormat>(
     smem: &Smem<P>,
     thr_vals: [[f32; P::THREAD_N]; P::THREAD_M],
@@ -73,22 +76,77 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 },
             );
 
-            // TODO(claude) quantize, store elements and scale factors to GMEM in column-major format
-            // (for the elements on the unpredicated path: use 256-bit stores, with each thread sending a column-chunk of 32 FP8 elements)
+            // Scale factors are computed one block index at a time, so that the conversions are vectorized across columns.
+            let mut thr_sfs =
+                [[Default::default(); BLOCKS_PER_THREAD_PER_COL::<BS, P>]; P::THREAD_N];
+            #[rustc_unroll(full)]
+            for b in 0..BLOCKS_PER_THREAD_PER_COL::<BS, P> {
+                let block_sfs = BS::compute_scale_factor(f32xN::from_array(array_map_unrolled(
+                    thr_amaxs,
+                    #[inline(always)]
+                    |amaxs| amaxs[b],
+                )))
+                .to_array();
+                #[rustc_unroll(full)]
+                for j in 0..P::THREAD_N {
+                    thr_sfs[j][b] = block_sfs[j];
+                }
+            }
+
+            let thr_vals_quantized = array_zip_unrolled(
+                thr_vals_chunked,
+                thr_sfs,
+                #[inline(always)]
+                |chunks, sfs| {
+                    array_zip_unrolled(
+                        chunks,
+                        sfs,
+                        #[inline(always)]
+                        |chunk, sf| {
+                            BS::quantize_bf16(bf16xN::from_array(chunk), BS::splat_scale_factor(sf))
+                                .to_array()
+                        },
+                    )
+                },
+            );
+
+            store_quantized_cols::<BS, _, _, _, _, _>(
+                desc,
+                thr_vals_quantized,
+                thr_sfs,
+                [
+                    desc.coord_mn[0] + block_id_in_cluster().x * P::CTA_TM as u32,
+                    desc.coord_mn[1] + block_id_in_cluster().y * P::CTA_TN as u32,
+                ],
+                #[inline(always)]
+                |j| Layouts::<P>::new().thread_element_n_index(thread_id().x, j),
+            );
         } else {
             // We don't have full column blocks within one CTA; re-shard the data.
 
             const RESHARDED_CTA_THREAD_N<P: Params>: usize =
                 P::CLUSTER_RESHARDED_CTA_TN / NUM_WORKER_THREADS;
+            // Widest vector width for the SMEM loads that evenly divides each thread's columns.
+            const RESHARD_LOAD_VECTOR_WIDTH<P: Params>: usize = const {
+                if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(8) {
+                    8
+                } else if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(4) {
+                    4
+                } else if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(2) {
+                    2
+                } else {
+                    1
+                }
+            };
 
             let slot_idx = *cluster_resharding_idx as usize % 2;
 
             let reshard_group_offset = block_id_in_cluster().x
                 / P::CLUSTER_RESHARD_GROUP_WIDTH as u32
                 * P::CLUSTER_RESHARD_GROUP_WIDTH as u32;
+            let idx_in_group = block_id_in_cluster().x - reshard_group_offset;
             // Row of the recipients' buffers at which this CTA's rows begin.
-            let row_offset_in_group =
-                (block_id_in_cluster().x - reshard_group_offset) as usize * P::CTA_TM;
+            let row_offset_in_group = idx_in_group as usize * P::CTA_TM;
 
             // Before sending, wait for all worker threads of this CTA to finish reading
             // the previous reshard's data, so we avoid a data race.
@@ -160,48 +218,13 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             //
             // Note that the received data in SMEM is flat row-major.
             // We transpose within a lane's registers.
-            let mut thr_vals_resharded =
-                [[bf16::ZERO; BS::BLOCK_SIZE]; RESHARDED_CTA_THREAD_N::<P>];
-            #[rustc_unroll(full)]
-            for i in 0..BS::BLOCK_SIZE {
-                if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(8) {
-                    // Vectorized SMEM loads
-                    #[rustc_unroll(full)]
-                    for chunk_idx in 0..RESHARDED_CTA_THREAD_N::<P> / 8 {
-                        let src = smem.cluster_reshard_buffers[slot_idx]
-                            .as_ptr()
-                            .cast::<bf16x8>()
-                            .add(
-                                i * P::CLUSTER_RESHARDED_CTA_TN / 8
-                                    + thread_id().x as usize
-                                    + chunk_idx * NUM_WORKER_THREADS,
-                            );
-
-                        let vals = src.read().to_array();
-
-                        #[rustc_unroll(full)]
-                        for k in 0..8 {
-                            thr_vals_resharded[chunk_idx * 8 + k][i] = vals[k];
-                        }
-                    }
-                } else {
-                    // Unvectorized SMEM loads
-                    #[rustc_unroll(full)]
-                    for element_idx in 0..RESHARDED_CTA_THREAD_N::<P> {
-                        let src = smem.cluster_reshard_buffers[slot_idx]
-                            .as_ptr()
-                            .cast::<bf16>()
-                            .add(
-                                i * P::CLUSTER_RESHARDED_CTA_TN
-                                    + thread_id().x as usize
-                                    + element_idx * NUM_WORKER_THREADS,
-                            );
-
-                        let val = src.read();
-                        thr_vals_resharded[element_idx][i] = val;
-                    }
-                }
-            }
+            let thr_vals_resharded: [[bf16; BS::BLOCK_SIZE]; RESHARDED_CTA_THREAD_N::<P>] =
+                match RESHARD_LOAD_VECTOR_WIDTH::<P> {
+                    8 => load_resharded_cols::<P, 8, _, _>(smem, slot_idx),
+                    4 => load_resharded_cols::<P, 4, _, _>(smem, slot_idx),
+                    2 => load_resharded_cols::<P, 2, _, _>(smem, slot_idx),
+                    _ => load_resharded_cols::<P, 1, _, _>(smem, slot_idx),
+                };
 
             // Release this slot for reuse (see the wait before sending above).
             smem.bars.cluster_reshard_buffer_consumed[slot_idx].arrive();
@@ -214,13 +237,168 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             let thr_sfs = BS::compute_scale_factor(f32xN::from_array(thr_amaxes)).to_array();
 
             let thr_vals_quantized = array_zip_unrolled(thr_vals_resharded, thr_sfs, |col, sf| {
-                BS::quantize_bf16(Vector::from_array(col), BS::splat_scale_factor(sf))
+                [
+                    BS::quantize_bf16(Vector::from_array(col), BS::splat_scale_factor(sf))
+                        .to_array(),
+                ]
             });
 
-            // TODO store to GMEM elementwise with bounds checks if any lane needs them,
-            // otherwise 256-bit stores. Also store scale factors using scalar (8-bit) stores.
+            // This CTA holds the group's BLOCK_SIZE rows, for its shard of the columns.
+            let tid = thread_id().x as usize;
+            store_quantized_cols::<BS, _, _, _, _, _>(
+                desc,
+                thr_vals_quantized,
+                array_map_unrolled(
+                    thr_sfs,
+                    #[inline(always)]
+                    |sf| [sf],
+                ),
+                [
+                    desc.coord_mn[0] + reshard_group_offset * P::CTA_TM as u32,
+                    desc.coord_mn[1]
+                        + block_id_in_cluster().y * P::CTA_TN as u32
+                        + idx_in_group * P::CLUSTER_RESHARDED_CTA_TN as u32,
+                ],
+                // Same column assignment as the SMEM loads above.
+                #[inline(always)]
+                |e| resharded_col_index(tid, e, RESHARD_LOAD_VECTOR_WIDTH::<P>),
+            );
 
             *cluster_resharding_idx += 1;
+        }
+    }
+}
+
+/// Loads this thread's columns of the received reshard buffer (flat row-major) from SMEM,
+/// transposed so that each element of the outer array holds one column, using `V`-element vector loads.
+#[inline(always)]
+unsafe fn load_resharded_cols<P: Params, const V: usize, const M: usize, const N: usize>(
+    smem: &Smem<P>,
+    slot_idx: usize,
+) -> [[bf16; M]; N] {
+    unsafe {
+        let mut cols = [[bf16::ZERO; M]; N];
+        #[rustc_unroll(full)]
+        for i in 0..M {
+            #[rustc_unroll(full)]
+            for chunk_idx in 0..N / V {
+                let src = smem.cluster_reshard_buffers[slot_idx]
+                    .as_ptr()
+                    .cast::<bf16>()
+                    .add(
+                        i * P::CLUSTER_RESHARDED_CTA_TN
+                            + resharded_col_index(thread_id().x as usize, chunk_idx * V, V),
+                    )
+                    .cast::<bf16xN<V>>();
+
+                let vals = src.read().to_array();
+
+                #[rustc_unroll(full)]
+                for k in 0..V {
+                    cols[chunk_idx * V + k][i] = vals[k];
+                }
+            }
+        }
+        cols
+    }
+}
+
+/// Column of the reshard buffer holding thread `tid`'s `e`th column, when loaded with `v`-element vectors.
+#[inline(always)]
+fn resharded_col_index(tid: usize, e: usize, v: usize) -> usize {
+    (e / v) * NUM_WORKER_THREADS * v + tid * v + e % v
+}
+
+/// Stores this thread's quantized column chunks to the column-major output tensor,
+/// along with their scale factors.
+#[inline(always)]
+unsafe fn store_quantized_cols<
+    BS: BlockScaledFormat,
+    Q: Copy,
+    SF: Copy,
+    const C: usize,
+    const B: usize,
+    const L: usize,
+>(
+    desc: &BlockScaledStoreDescriptor,
+    vals: [[[Q; L]; B]; C],
+    sfs: [[SF; B]; C],
+    [m0, n0]: [u32; 2],
+    col_offset: impl Fn(usize) -> usize,
+) {
+    unsafe {
+        // The column-major tensor is a row-major tensor with M and N swapped.
+        let dst = GmemStore {
+            tma_desc: desc.tma_desc,
+            coord_mn: [n0, m0],
+            cache_policy: desc.cache_policy,
+            reduction: None,
+        }
+        .mxn_tile::<Q>();
+
+        let aligned = (L * size_of::<Q>()).is_multiple_of(size_of::<u32x8>())
+            && dst.start.addr().is_multiple_of(size_of::<u32x8>())
+            && (dst.row_stride * size_of::<Q>()).is_multiple_of(size_of::<u32x8>());
+        let in_bounds = col_offset(C - 1) < dst.valid_rows && B * L <= dst.valid_cols;
+        let predicated = vote_any(LaneMask::FULL, !(aligned && in_bounds));
+
+        let store = #[inline(always)]
+        |predicated: bool| {
+            #[rustc_unroll(full)]
+            for j in 0..C {
+                let col = dst.row(col_offset(j));
+                #[rustc_unroll(full)]
+                for b in 0..B {
+                    if predicated {
+                        #[rustc_unroll(full)]
+                        for k in 0..L {
+                            let m = b * L + k;
+                            if m < col.valid_cols {
+                                store_unit_to_gmem(
+                                    vals[j][b].as_ptr().add(k),
+                                    col.start.add(m),
+                                    col.cache_policy,
+                                    None,
+                                );
+                            }
+                        }
+                    } else {
+                        #[rustc_unroll(full)]
+                        for k in 0..L * size_of::<Q>() / size_of::<u32x8>() {
+                            store_global(
+                                col.start.add(b * L).cast::<u32x8>().add(k),
+                                vals[j][b].as_ptr().cast::<u32x8>().add(k).read_unaligned(),
+                                col.cache_policy,
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        if predicated {
+            store(true)
+        } else {
+            store(false)
+        }
+
+        let sf_cols = desc.tma_desc.global_size[0]
+            .div_ceil(BS::BLOCK_SIZE as u32)
+            .next_multiple_of(SF_TILE_NCOLS);
+        let sf_rows = desc.tma_desc.global_size[1].next_multiple_of(SF_TILE_NROWS);
+
+        #[rustc_unroll(full)]
+        for j in 0..C {
+            let sf_row = n0 + col_offset(j) as u32;
+            #[rustc_unroll(full)]
+            for b in 0..B {
+                let sf_col = (m0 + (b * L) as u32) / BS::BLOCK_SIZE as u32;
+                if sf_row < sf_rows && sf_col < sf_cols {
+                    desc.sf_ptr
+                        .cast::<SF>()
+                        .add(scale_factor_pos(sf_row, sf_col, sf_cols))
+                        .write(sfs[j][b]);
+                }
+            }
         }
     }
 }
