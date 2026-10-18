@@ -205,6 +205,10 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
     struct P;
 
     impl Params for P {
+        const NUM_WORKER_WARPS: usize = 4;
+        const WORKER_REGISTERS: u32 = 224;
+        const AUX_REGISTERS: u32 = 32;
+
         const CGA_TM: usize = 8;
         const CGA_TN: usize = 2048;
         const CLUSTER_SIZE_M: usize = 1;
@@ -250,6 +254,10 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
     struct P;
 
     impl Params for P {
+        const NUM_WORKER_WARPS: usize = 4;
+        const WORKER_REGISTERS: u32 = 224;
+        const AUX_REGISTERS: u32 = 32;
+
         const CGA_TM: usize = 8;
         const CGA_TN: usize = 2048;
         const CLUSTER_SIZE_M: usize = 1;
@@ -283,8 +291,8 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
 
 #[unsafe(no_mangle)]
 #[nvptx(
-    max_registers(128),
-    exact_threads_per_cta(256, 1, 1),
+    max_registers(168),
+    exact_threads_per_cta(384, 1, 1),
     exact_cluster_dim(4, 1, 1)
 )]
 pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
@@ -301,15 +309,21 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
     struct P;
 
     impl Params for P {
+        const NUM_WORKER_WARPS: usize = 8;
+        const WORKER_REGISTERS: u32 = 224;
+        const AUX_REGISTERS: u32 = 32;
+
         const CGA_TM: usize = 32;
         const CGA_TN: usize = 2048;
+
         const CLUSTER_SIZE_M: usize = 4;
         const CLUSTER_SIZE_N: usize = 1;
 
         const MACROBLOCK_SIZE: usize = 16;
 
-        // Needs reduced to 1 to make room for the resharding buffers (64 KiB) while keeping
-        // an occupancy of 2 CTA/SM on B200.
+        #[cfg(has_227kb_smem)]
+        const NUM_LOAD_SLOTS: usize = 2;
+        #[cfg(not(has_227kb_smem))]
         const NUM_LOAD_SLOTS: usize = 1;
 
         const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;

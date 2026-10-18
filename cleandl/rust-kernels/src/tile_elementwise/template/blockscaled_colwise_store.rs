@@ -1,6 +1,6 @@
 use crate::{
     tile_elementwise::template::{
-        BlockScaledStoreDescriptor, GmemStore, NUM_WORKER_THREADS, Params, Smem,
+        BlockScaledStoreDescriptor, GmemStore, Params, Smem,
         partitioning::{Partitioning, interleaved_n_index, store_unit_to_gmem, vector_size_for},
     },
     utils::{
@@ -123,7 +123,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             // We don't have full column blocks within one CTA; re-shard the data.
 
             const RESHARDED_CTA_THREAD_N<P: Params>: usize =
-                (P::CLUSTER_RESHARDED_CTA_TN / NUM_WORKER_THREADS).max(1);
+                (P::CLUSTER_RESHARDED_CTA_TN / P::NUM_WORKER_THREADS).max(1);
             // After resharding, each thread's columns follow the thread partitioning layout
             // for RESHARDED_CTA_THREAD_N columns.
             const RESHARD_VECTOR_SIZE<P: Params>: usize =
@@ -260,7 +260,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                         + idx_in_group * P::CLUSTER_RESHARDED_CTA_TN as u32,
                 ],
                 #[inline(always)]
-                |e| interleaved_n_index(tid, e, RESHARD_VECTOR_SIZE::<P>),
+                |e| interleaved_n_index::<P>(tid, e, RESHARD_VECTOR_SIZE::<P>),
             );
 
             *cluster_resharding_idx += 1;
@@ -284,7 +284,7 @@ unsafe fn load_resharded_cols<P: Params, const V: usize, const M: usize, const N
                     .cast::<bf16>()
                     .add(
                         i * P::CLUSTER_RESHARDED_CTA_TN
-                            + interleaved_n_index(thread_id().x as usize, chunk_idx * V, V),
+                            + interleaved_n_index::<P>(thread_id().x as usize, chunk_idx * V, V),
                     )
                     .cast::<bf16xN<V>>();
 

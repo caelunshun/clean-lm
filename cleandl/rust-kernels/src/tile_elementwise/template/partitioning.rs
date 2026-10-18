@@ -14,7 +14,7 @@
 //! using a single vector instruction (e.g. 128-bit instructions on `bf16x8` vectors when `VECTOR_SIZE` is 8 and
 //! the `bf16` type is used). For f32, there are extra considerations (see below).
 //!
-//! For example, with `VECTOR_SIZE` 8, elements are partitioned according to this pattern:
+//! For example, with `VECTOR_SIZE` 8 and 128 worker threads, elements are partitioned according to this pattern:
 //!
 //! ```
 //! N      | 0..8 | 8..16 | 16..24 | ... | 1016..1024 | 1024..1032 | 1032..1040 | etc.
@@ -23,8 +23,8 @@
 //! The SMEM layout is unswizzled and row-major, tiled using Mx256 tiles (1x256 for 1xN row slices)
 //! to align with the TMA box size. Since each warp accesses `32 * VECTOR_SIZE <= 256` contiguous elements,
 //! this access pattern has zero bank conflicts. By contrast,
-//! the naive partitioning (where thread `i` gets a contiguous range of elements `i*(N/128)..(i+1)*(N/128)`)
-//! would produce bank conflicts when N>1024.
+//! the naive partitioning (where thread `i` gets a contiguous range of `N/NUM_WORKER_THREADS` elements)
+//! would produce bank conflicts when N>8*NUM_WORKER_THREADS.
 //!
 //! Each chunk is accessed in SMEM using a single `VECTOR_SIZE * size_of::<T>()`-byte load/store
 //! (e.g. 64-bit for 8-bit elements when `VECTOR_SIZE` is 8), with one exception:
@@ -43,7 +43,7 @@
 //! We accomplish this through a register select, making it relatively cheap.
 //!
 //! # Fallback layout
-//! For when `THREAD_N` is odd (`VECTOR_SIZE` 1). This is the same pattern with single-element chunks:
+//! For when `THREAD_N` is odd (`VECTOR_SIZE` 1). This is the same pattern with single-element chunks (shown for 128 worker threads):
 //! ```
 //! N      | 0  | 1 | 2 | ... | 127 | 128 | 129 | etc.
 //! Thread | 0  | 1 | 2 | ... | 127 | 0   | 1   | etc.
@@ -59,7 +59,7 @@
 //! bounds-checked elementwise stores.
 
 use crate::{
-    tile_elementwise::template::{NUM_WORKER_THREADS, Params, StoreReduceOp},
+    tile_elementwise::template::{Params, StoreReduceOp},
     utils::block_scale::BlockScaledFormat,
 };
 use core::{
@@ -95,7 +95,7 @@ impl<P: Params> Partitioning<P> {
     /// Maps a tuple (thread index, element index within a row for a thread) to its logical N-index.
     #[inline(always)]
     pub fn thread_element_n_index(&self, thread_id: u32, element_index: usize) -> usize {
-        interleaved_n_index(thread_id as usize, element_index, Self::VECTOR_SIZE)
+        interleaved_n_index::<P>(thread_id as usize, element_index, Self::VECTOR_SIZE)
     }
 
     /// Copies one row-slice of elements between memory and this thread's registers,
@@ -589,8 +589,12 @@ pub const fn vector_size_for(thread_n: usize) -> usize {
 /// N-index of a thread's `element_index`th element within a row, in the thread partitioning layout
 /// with the given vector size.
 #[inline(always)]
-pub fn interleaved_n_index(thread_id: usize, element_index: usize, vector_size: usize) -> usize {
-    (element_index / vector_size) * NUM_WORKER_THREADS * vector_size
+pub fn interleaved_n_index<P: Params>(
+    thread_id: usize,
+    element_index: usize,
+    vector_size: usize,
+) -> usize {
+    (element_index / vector_size) * P::NUM_WORKER_THREADS * vector_size
         + thread_id * vector_size
         + element_index % vector_size
 }

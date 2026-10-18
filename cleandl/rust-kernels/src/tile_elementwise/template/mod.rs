@@ -2,13 +2,16 @@
 //!
 //! Template for building tile_elementwise kernels.
 //!
-//! The kernels are built around a warp-specialized design:
-//! - Warps 0..=3 - Worker warps performing computations. These also store
+//! The kernels are built around a warp-specialized design, with `W = Params::NUM_WORKER_WARPS` (4 or 8):
+//! - Warps 0..W - Worker warps performing computations. These also store
 //!   results directly from registers to GMEM.
-//! - Warp 4: TMA load warp.
-//! - Warp 5: idle (only consumes CLC responses).
-//! - Warp 6: cluster synchronization warp.
-//! - Warp 7: CLC scheduler warp.
+//! - Warp W: TMA load warp.
+//! - Warp W+1: idle (only consumes CLC responses).
+//! - Warp W+2: cluster synchronization warp.
+//! - Warp W+3: CLC scheduler warp.
+//!
+//! The non-worker warps form a single auxiliary warpgroup. Registers are rebalanced between
+//! worker and auxiliary warps using `setmaxnreg` (see `Params::WORKER_REGISTERS`).
 //!
 //! The template assumes we are operating on TM (rows) x TN (columns) tiles of some iteration space.
 //! Data within a tile is evenly partitioned among worker threads over the N dimension (each thread holds
@@ -42,8 +45,8 @@
 //! kernel. Each logical CGA processes a "macroblock" of tiles. Larger macroblock sizes reduce scheduling overhead
 //! but increase risk of wave quantization effects.
 //!
-//! The grid must be launched with dimensions `(num_macroblocks * CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`
-//! and cluster dimensions `(CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`. The macroblock index of a CGA
+//! The grid must be launched with dimensions `(num_macroblocks * CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`,
+//! block dimensions `(BLOCK_SIZE, 1, 1)`, and cluster dimensions `(CLUSTER_SIZE_M, CLUSTER_SIZE_N, 1)`. The macroblock index of a CGA
 //! is then `block_id().x / CLUSTER_SIZE_M`.
 //!
 //! Note that the partitioning of tile columns among worker threads is unspecified,
@@ -82,10 +85,22 @@ use ptx_std::{
 mod blockscaled_colwise_store;
 mod partitioning;
 
-pub const NUM_WORKER_WARPS: usize = 4;
-pub const NUM_WORKER_THREADS: usize = 32 * NUM_WORKER_WARPS;
+pub const NUM_AUX_WARPS: usize = 4;
+pub const NUM_AUX_THREADS: usize = 32 * NUM_AUX_WARPS;
 
 pub trait Params {
+    /// Either 4 or 8.
+    const NUM_WORKER_WARPS: usize;
+
+    /// Registers per thread allocated to worker warps via `setmaxnreg`.
+    ///
+    /// `WORKER_REGISTERS * NUM_WORKER_THREADS + AUX_REGISTERS * NUM_AUX_THREADS` must not exceed
+    /// the CTA's register pool, i.e. the kernel's launch `max_registers` times `BLOCK_SIZE`;
+    /// otherwise the kernel deadlocks.
+    const WORKER_REGISTERS: u32;
+    /// Registers per thread allocated to auxiliary (non-worker) warps via `setmaxnreg`.
+    const AUX_REGISTERS: u32;
+
     /// Supports powers of two.
     ///
     /// Tile size across the full CGA.
@@ -118,6 +133,9 @@ pub trait Params {
 
     // --- Derived constants --- //
 
+    const NUM_WORKER_THREADS: usize = 32 * Self::NUM_WORKER_WARPS;
+    const BLOCK_SIZE: usize = Self::NUM_WORKER_THREADS + NUM_AUX_THREADS;
+
     const CLUSTER_SIZE: usize = Self::CLUSTER_SIZE_M * Self::CLUSTER_SIZE_N;
 
     const CTA_TM: usize = Self::CGA_TM / Self::CLUSTER_SIZE_M;
@@ -131,7 +149,7 @@ pub trait Params {
     };
     const NUM_TMA_PANELS: usize = Self::CTA_TN / Self::TMA_PANEL_COLS;
 
-    const THREAD_N: usize = Self::CTA_TN.div_ceil(NUM_WORKER_THREADS);
+    const THREAD_N: usize = Self::CTA_TN.div_ceil(Self::NUM_WORKER_THREADS);
     const THREAD_M: usize = Self::CTA_TM;
 
     const MXN_LOAD_SLOT_BYTES: usize = Self::LARGEST_MXN_LOAD_BITS_PER_ELEMENT
@@ -625,14 +643,18 @@ unsafe fn store_mx1<T: Copy, const N: usize>(vals: &[T; N], dst: &GmemStore) {
 
 // --- Smem --- //
 
+/// Double-buffered `[[f32; ROWS]; N]` reduction scratchpads.
+type RowReductionScratchpads<const ROWS: usize, const N: usize> =
+    [[[UnsafeCell<MaybeUninit<f32>>; ROWS]; N]; 2];
+
 #[repr(C, align(1024))]
 struct Smem<P: Params> {
     load_slots: [[UnsafeCell<MaybeUninit<u8>>; P::LOAD_SLOT_BYTES]; P::NUM_LOAD_SLOTS],
 
     /// These slots are double-buffered to reduce needed barrier waits.
-    cta_reduction_scratchpads: [[[UnsafeCell<MaybeUninit<f32>>; P::CTA_TM]; NUM_WORKER_WARPS]; 2],
+    cta_reduction_scratchpads: RowReductionScratchpads<{ P::CTA_TM }, { P::NUM_WORKER_WARPS }>,
     cluster_row_reduction_scratchpads:
-        [[[UnsafeCell<MaybeUninit<f32>>; P::CTA_TM]; P::CLUSTER_SIZE_N]; 2],
+        RowReductionScratchpads<{ P::CTA_TM }, { P::CLUSTER_SIZE_N }>,
     cluster_reshard_buffers:
         [[UnsafeCell<MaybeUninit<bf16>>; P::CLUSTER_RESHARD_BUFFER_ELEMENTS]; 2],
 
@@ -1011,7 +1033,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
             self.smem.bars.cta_reduction_produced[slot_idx].wait(token);
 
             #[rustc_unroll(full)]
-            for i in 0..NUM_WORKER_WARPS {
+            for i in 0..P::NUM_WORKER_WARPS {
                 #[rustc_unroll(full)]
                 for j in 0..<K::Params as Params>::THREAD_M {
                     let smem_val = self.smem.cta_reduction_scratchpads[slot_idx][i][j]
@@ -1231,13 +1253,16 @@ enum WarpRole {
 }
 
 impl WarpRole {
-    pub unsafe fn get() -> Self {
-        match unsafe { uniform_warp_id() } {
-            0..4 => WarpRole::Worker,
-            4 => WarpRole::TmaLoad,
-            5 => WarpRole::Idle,
-            6 => WarpRole::ClusterSync,
-            7 => WarpRole::Clc,
+    pub unsafe fn get<P: Params>() -> Self {
+        let warp = unsafe { uniform_warp_id() } as usize;
+        if warp < P::NUM_WORKER_WARPS {
+            return WarpRole::Worker;
+        }
+        match warp - P::NUM_WORKER_WARPS {
+            0 => WarpRole::TmaLoad,
+            1 => WarpRole::Idle,
+            2 => WarpRole::ClusterSync,
+            3 => WarpRole::Clc,
             _ => unreachable!(),
         }
     }
@@ -1247,7 +1272,7 @@ impl WarpRole {
 unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
     unsafe {
         assert_eq!(dynamic_smem_size() as usize, size_of::<Smem<P>>());
-        assert_eq!(block_size(), 256);
+        assert_eq!(block_size() as usize, P::BLOCK_SIZE);
         assert_eq!(cluster_size() as usize, P::CLUSTER_SIZE);
         assert_eq!(cluster_dim().x as usize, P::CLUSTER_SIZE_M);
         assert_eq!(cluster_dim().y as usize, P::CLUSTER_SIZE_N);
@@ -1256,12 +1281,12 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
         #[rustc_unroll(full)]
         for slot_idx in 0..P::NUM_LOAD_SLOTS {
             smem.bars.load_slot_produced[slot_idx].init(1);
-            smem.bars.load_slot_consumed[slot_idx].init(NUM_WORKER_THREADS as u32);
+            smem.bars.load_slot_consumed[slot_idx].init(P::NUM_WORKER_THREADS as u32);
         }
 
         #[rustc_unroll(full)]
         for slot_idx in 0..2 {
-            smem.bars.cta_reduction_produced[slot_idx].init(NUM_WORKER_THREADS as u32);
+            smem.bars.cta_reduction_produced[slot_idx].init(P::NUM_WORKER_THREADS as u32);
             smem.bars.cluster_row_reduction_produced[slot_idx].init(1);
             smem.bars.cluster_row_reduction_produced[slot_idx]
                 .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
@@ -1273,7 +1298,7 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
                 .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
                     (size_of::<bf16>() * P::CLUSTER_RESHARD_BUFFER_ELEMENTS) as u32,
                 );
-            smem.bars.cluster_reshard_buffer_consumed[slot_idx].init(NUM_WORKER_THREADS as u32);
+            smem.bars.cluster_reshard_buffer_consumed[slot_idx].init(P::NUM_WORKER_THREADS as u32);
         }
 
         MBarrier::fence_init();
@@ -1284,6 +1309,14 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
 pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K) {
     unsafe {
         const {
+            assert!(P::NUM_WORKER_WARPS == 4 || P::NUM_WORKER_WARPS == 8);
+            assert!(
+                P::WORKER_REGISTERS as usize * P::NUM_WORKER_THREADS
+                    + P::AUX_REGISTERS as usize * NUM_AUX_THREADS
+                    <= 64 * 1024,
+                "register allocation exceeds hardware capacity"
+            );
+
             assert!(P::CLUSTER_SIZE_M > 0);
             assert!(P::CLUSTER_SIZE_N > 0);
             // Cluster row reductions use one lane of warp 0 per peer CTA.
@@ -1298,7 +1331,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
             #[cfg(has_227kb_smem)]
             assert!(
                 size_of::<Smem<P>>() <= 227 * 1024,
-                "SMEM requirement exceeds hardware capacity; try reducing load slots"
+                "SMEM requirement exceeds hardware capacity; try reducing load slots",
             );
             #[cfg(not(has_227kb_smem))]
             assert!(
@@ -1306,7 +1339,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
                 "SMEM requirement exceeds hardware capacity; try reducing load slots"
             );
 
-            assert!(P::CTA_TN >= 128);
+            assert!(P::CTA_TN >= P::NUM_WORKER_THREADS);
             assert!(P::CTA_TN.is_power_of_two());
 
             assert!(P::CTA_TM <= 256);
@@ -1315,7 +1348,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
             if P::DOES_STORE_COLWISE_BLOCK_SCALED_DATA {
                 assert!(P::CGA_TM.is_multiple_of(Mxfp8::BLOCK_SIZE));
                 // Resharded data must be evenly partitioned across worker threads.
-                assert!(P::CLUSTER_RESHARDED_CTA_TN.is_multiple_of(NUM_WORKER_THREADS));
+                assert!(P::CLUSTER_RESHARDED_CTA_TN.is_multiple_of(P::NUM_WORKER_THREADS));
             }
         }
 
@@ -1338,10 +1371,10 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
             current_idx_in_macroblock: 0,
         };
 
-        let role = WarpRole::get();
+        let role = WarpRole::get::<P>();
         match role {
             WarpRole::Worker => {
-                increase_max_registers::<224>();
+                increase_max_registers::<{ P::WORKER_REGISTERS }>();
                 WorkerWarp {
                     smem,
                     sched,
@@ -1353,7 +1386,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
                 .run(&mut kernel);
             }
             _ => {
-                decrease_max_registers::<32>();
+                decrease_max_registers::<{ P::AUX_REGISTERS }>();
                 match role {
                     WarpRole::Worker => unreachable!(),
                     WarpRole::TmaLoad => {
