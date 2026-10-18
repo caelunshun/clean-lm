@@ -1,19 +1,18 @@
 use crate::{
     tile_elementwise::template::{
         BlockScaledStoreDescriptor, GmemStore, NUM_WORKER_THREADS, Params, Smem,
-        layouts::{Layouts, store_unit_to_gmem},
+        partitioning::{Partitioning, interleaved_n_index, store_unit_to_gmem, vector_size_for},
     },
     utils::{
         block_scale::{BlockScaledFormat, SF_TILE_NCOLS, SF_TILE_NROWS, scale_factor_pos},
         compiler_magic::{array_map_unrolled, array_zip_unrolled, uniform_warp_id},
     },
 };
-use core::simd::{u32x4, u32x8};
+use core::simd::{u32x2, u32x4, u32x8};
 use ptx_std::{
-    MBarrier, MemoryOrdering, PhaseParity, Scope, Vector, bf16, bf16x8, bf16xN,
-    block_id_in_cluster,
+    MBarrier, MemoryOrdering, PhaseParity, Scope, Vector, bf16, bf16xN, block_id_in_cluster,
     cluster::{map_to_cta, st_async},
-    f32x8, f32xN,
+    f32xN,
     fence::fence_sync_restrict,
     memory::store_global,
     thread_id,
@@ -76,7 +75,6 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 },
             );
 
-            // Scale factors are computed one block index at a time, so that the conversions are vectorized across columns.
             let mut thr_sfs =
                 [[Default::default(); BLOCKS_PER_THREAD_PER_COL::<BS, P>]; P::THREAD_N];
             #[rustc_unroll(full)]
@@ -110,7 +108,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 },
             );
 
-            store_quantized_cols::<BS, _, _, _, _, _>(
+            store_quantized_cols::<P, BS, _, _, _, _, _>(
                 desc,
                 thr_vals_quantized,
                 thr_sfs,
@@ -119,25 +117,17 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                     desc.coord_mn[1] + block_id_in_cluster().y * P::CTA_TN as u32,
                 ],
                 #[inline(always)]
-                |j| Layouts::<P>::new().thread_element_n_index(thread_id().x, j),
+                |j| Partitioning::<P>::new().thread_element_n_index(thread_id().x, j),
             );
         } else {
             // We don't have full column blocks within one CTA; re-shard the data.
 
             const RESHARDED_CTA_THREAD_N<P: Params>: usize =
-                P::CLUSTER_RESHARDED_CTA_TN / NUM_WORKER_THREADS;
-            // Widest vector width for the SMEM loads that evenly divides each thread's columns.
-            const RESHARD_LOAD_VECTOR_WIDTH<P: Params>: usize = const {
-                if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(8) {
-                    8
-                } else if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(4) {
-                    4
-                } else if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(2) {
-                    2
-                } else {
-                    1
-                }
-            };
+                (P::CLUSTER_RESHARDED_CTA_TN / NUM_WORKER_THREADS).max(1);
+            // After resharding, each thread's columns follow the thread partitioning layout
+            // for RESHARDED_CTA_THREAD_N columns.
+            const RESHARD_VECTOR_SIZE<P: Params>: usize =
+                const { vector_size_for(RESHARDED_CTA_THREAD_N::<P>) };
 
             let slot_idx = *cluster_resharding_idx as usize % 2;
 
@@ -148,8 +138,8 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             // Row of the recipients' buffers at which this CTA's rows begin.
             let row_offset_in_group = idx_in_group as usize * P::CTA_TM;
 
-            // Before sending, wait for all worker threads of this CTA to finish reading
-            // the previous reshard's data, so we avoid a data race.
+            // Wait for all worker threads of this CTA to finish reading
+            // the previous reshard's data
             if *cluster_resharding_idx > 0 {
                 let prev_idx = *cluster_resharding_idx - 1;
                 smem.bars.cluster_reshard_buffer_consumed[prev_idx as usize % 2]
@@ -159,41 +149,52 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             let produced_bar = &smem.bars.cluster_reshard_buffer_produced[slot_idx];
             #[rustc_unroll(full)]
             for i in 0..P::THREAD_M {
-                if Layouts::<P>::new().is_8x_vectorized() {
-                    // Vectorized DSMEM stores
-                    #[rustc_unroll(full)]
-                    for chunk_idx in 0..P::THREAD_N / 8 {
-                        let j = thread_id().x as usize * 8 + chunk_idx * NUM_WORKER_THREADS * 8;
-                        let recipient_idx =
-                            (j / P::CLUSTER_RESHARDED_CTA_TN) as u32 + reshard_group_offset;
-                        let recipient_rank =
-                            recipient_idx + block_id_in_cluster().y * P::CLUSTER_SIZE_M as u32;
-                        let dst = smem.cluster_reshard_buffers[slot_idx]
-                            .as_ptr()
-                            .cast::<bf16>()
-                            .add(
-                                (row_offset_in_group + i) * P::CLUSTER_RESHARDED_CTA_TN
-                                    + j % P::CLUSTER_RESHARDED_CTA_TN,
-                            )
-                            .cast::<bf16x8>()
-                            .cast_mut();
-                        let dst = map_to_cta(dst, recipient_rank);
+                #[rustc_unroll(full)]
+                for chunk_idx in 0..Partitioning::<P>::VECTORS_PER_THREAD_PER_ROW {
+                    let element_idx = chunk_idx * Partitioning::<P>::VECTOR_SIZE;
+                    let j =
+                        Partitioning::<P>::new().thread_element_n_index(thread_id().x, element_idx);
+                    let recipient_idx =
+                        (j / P::CLUSTER_RESHARDED_CTA_TN) as u32 + reshard_group_offset;
+                    let recipient_rank =
+                        recipient_idx + block_id_in_cluster().y * P::CLUSTER_SIZE_M as u32;
+                    let dst = smem.cluster_reshard_buffers[slot_idx]
+                        .as_ptr()
+                        .cast::<bf16>()
+                        .add(
+                            (row_offset_in_group + i) * P::CLUSTER_RESHARDED_CTA_TN
+                                + j % P::CLUSTER_RESHARDED_CTA_TN,
+                        )
+                        .cast_mut();
+                    let dst = map_to_cta(dst, recipient_rank);
+                    let bar = map_to_cta(
+                        produced_bar as *const MBarrier as *mut MBarrier,
+                        recipient_rank,
+                    );
 
-                        let chunk = bf16x8::from_f32(f32x8::from_array(
-                            thr_vals[i][chunk_idx * 8..][..8].try_into().unwrap(),
-                        ));
-                        st_async(
+                    let chunk =
+                        bf16xN::from_f32(f32xN::<{ Partitioning::<P>::VECTOR_SIZE }>::from_array(
+                            thr_vals[i][element_idx..][..Partitioning::<P>::VECTOR_SIZE]
+                                .try_into()
+                                .unwrap(),
+                        ))
+                        .to_array();
+                    let chunk = chunk.as_ptr();
+
+                    match Partitioning::<P>::VECTOR_SIZE * size_of::<bf16>() {
+                        4 => st_async(dst.cast::<u32>(), chunk.cast::<u32>().read_unaligned(), bar),
+                        8 => st_async(
+                            dst.cast::<u32x2>(),
+                            chunk.cast::<u32x2>().read_unaligned(),
+                            bar,
+                        ),
+                        16 => st_async(
                             dst.cast::<u32x4>(),
-                            bytemuck::must_cast(chunk),
-                            map_to_cta(
-                                produced_bar as *const MBarrier as *mut MBarrier,
-                                recipient_rank,
-                            ),
-                        );
+                            chunk.cast::<u32x4>().read_unaligned(),
+                            bar,
+                        ),
+                        _ => unreachable!(),
                     }
-                } else {
-                    // Unvectorized DSMEM stores.
-                    todo!()
                 }
             }
 
@@ -219,7 +220,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             // Note that the received data in SMEM is flat row-major.
             // We transpose within a lane's registers.
             let thr_vals_resharded: [[bf16; BS::BLOCK_SIZE]; RESHARDED_CTA_THREAD_N::<P>] =
-                match RESHARD_LOAD_VECTOR_WIDTH::<P> {
+                match RESHARD_VECTOR_SIZE::<P> {
                     8 => load_resharded_cols::<P, 8, _, _>(smem, slot_idx),
                     4 => load_resharded_cols::<P, 4, _, _>(smem, slot_idx),
                     2 => load_resharded_cols::<P, 2, _, _>(smem, slot_idx),
@@ -243,9 +244,8 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 ]
             });
 
-            // This CTA holds the group's BLOCK_SIZE rows, for its shard of the columns.
             let tid = thread_id().x as usize;
-            store_quantized_cols::<BS, _, _, _, _, _>(
+            store_quantized_cols::<P, BS, _, _, _, _, _>(
                 desc,
                 thr_vals_quantized,
                 array_map_unrolled(
@@ -259,9 +259,8 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                         + block_id_in_cluster().y * P::CTA_TN as u32
                         + idx_in_group * P::CLUSTER_RESHARDED_CTA_TN as u32,
                 ],
-                // Same column assignment as the SMEM loads above.
                 #[inline(always)]
-                |e| resharded_col_index(tid, e, RESHARD_LOAD_VECTOR_WIDTH::<P>),
+                |e| interleaved_n_index(tid, e, RESHARD_VECTOR_SIZE::<P>),
             );
 
             *cluster_resharding_idx += 1;
@@ -269,8 +268,6 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
     }
 }
 
-/// Loads this thread's columns of the received reshard buffer (flat row-major) from SMEM,
-/// transposed so that each element of the outer array holds one column, using `V`-element vector loads.
 #[inline(always)]
 unsafe fn load_resharded_cols<P: Params, const V: usize, const M: usize, const N: usize>(
     smem: &Smem<P>,
@@ -287,7 +284,7 @@ unsafe fn load_resharded_cols<P: Params, const V: usize, const M: usize, const N
                     .cast::<bf16>()
                     .add(
                         i * P::CLUSTER_RESHARDED_CTA_TN
-                            + resharded_col_index(thread_id().x as usize, chunk_idx * V, V),
+                            + interleaved_n_index(thread_id().x as usize, chunk_idx * V, V),
                     )
                     .cast::<bf16xN<V>>();
 
@@ -303,16 +300,9 @@ unsafe fn load_resharded_cols<P: Params, const V: usize, const M: usize, const N
     }
 }
 
-/// Column of the reshard buffer holding thread `tid`'s `e`th column, when loaded with `v`-element vectors.
-#[inline(always)]
-fn resharded_col_index(tid: usize, e: usize, v: usize) -> usize {
-    (e / v) * NUM_WORKER_THREADS * v + tid * v + e % v
-}
-
-/// Stores this thread's quantized column chunks to the column-major output tensor,
-/// along with their scale factors.
 #[inline(always)]
 unsafe fn store_quantized_cols<
+    P: Params,
     BS: BlockScaledFormat,
     Q: Copy,
     SF: Copy,
@@ -327,7 +317,6 @@ unsafe fn store_quantized_cols<
     col_offset: impl Fn(usize) -> usize,
 ) {
     unsafe {
-        // The column-major tensor is a row-major tensor with M and N swapped.
         let dst = GmemStore {
             tma_desc: desc.tma_desc,
             coord_mn: [n0, m0],
@@ -340,7 +329,8 @@ unsafe fn store_quantized_cols<
             && dst.start.addr().is_multiple_of(size_of::<u32x8>())
             && (dst.row_stride * size_of::<Q>()).is_multiple_of(size_of::<u32x8>());
         let in_bounds = col_offset(C - 1) < dst.valid_rows && B * L <= dst.valid_cols;
-        let predicated = vote_any(LaneMask::FULL, !(aligned && in_bounds));
+        let predicated =
+            P::ENABLE_BOUNDS_CHECKS && vote_any(LaneMask::FULL, !(aligned && in_bounds));
 
         let store = #[inline(always)]
         |predicated: bool| {
@@ -392,7 +382,7 @@ unsafe fn store_quantized_cols<
             #[rustc_unroll(full)]
             for b in 0..B {
                 let sf_col = (m0 + (b * L) as u32) / BS::BLOCK_SIZE as u32;
-                if sf_row < sf_rows && sf_col < sf_cols {
+                if !P::ENABLE_BOUNDS_CHECKS || (sf_row < sf_rows && sf_col < sf_cols) {
                     desc.sf_ptr
                         .cast::<SF>()
                         .add(scale_factor_pos(sf_row, sf_col, sf_cols))

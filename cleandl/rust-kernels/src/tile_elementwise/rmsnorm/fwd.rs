@@ -218,6 +218,8 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
         const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize = 0;
 
         const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool = false;
+
+        const ENABLE_BOUNDS_CHECKS: bool = true;
     }
 
     assert!(actual_row_size <= 2048);
@@ -261,6 +263,8 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
         const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize = 0;
 
         const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool = false;
+
+        const ENABLE_BOUNDS_CHECKS: bool = true;
     }
 
     assert!(actual_row_size <= 2048);
@@ -313,6 +317,8 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
         const LARGEST_MX1_LOAD_BITS_PER_ELEMENT: usize = 0;
 
         const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool = true;
+
+        const ENABLE_BOUNDS_CHECKS: bool = true;
     }
 
     assert!(actual_row_size <= 2048);

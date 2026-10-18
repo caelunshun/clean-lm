@@ -50,8 +50,9 @@
 //! and may vary with tile size. Rowwise reductions should use KernelVisitor::rowwise_reduce.
 
 use crate::{
-    tile_elementwise::template::layouts::{
-        CopyDir, GmemRow, GmemTile, Layouts, SmemRow, iter_tma_panels, store_contiguous_to_gmem,
+    tile_elementwise::template::partitioning::{
+        CopyDir, GmemRow, GmemTile, Partitioning, SmemRow, iter_tma_panels,
+        store_contiguous_to_gmem,
     },
     utils::{
         block_scale::{BlockScaledFormat, Mxfp8, SF_TILE_NCOLS, SF_TILE_NROWS, scale_factor_pos},
@@ -79,7 +80,7 @@ use ptx_std::{
 };
 
 mod blockscaled_colwise_store;
-mod layouts;
+mod partitioning;
 
 pub const NUM_WORKER_WARPS: usize = 4;
 pub const NUM_WORKER_THREADS: usize = 32 * NUM_WORKER_WARPS;
@@ -107,6 +108,14 @@ pub trait Params {
 
     const DOES_STORE_COLWISE_BLOCK_SCALED_DATA: bool;
 
+    /// Whether bounds checks are needed on global memory operations.
+    ///
+    /// If `false`, then tensor sizes must be divisible by CGA_TM*MACROBLOCK_SIZE and CGA_TN resp.,
+    /// and the load/store coordinates in their descriptors must produce addresses
+    /// that are in-bounds for the entire tile and aligned to 32 bytes. Otherwise,
+    /// the behavior is undefined.
+    const ENABLE_BOUNDS_CHECKS: bool;
+
     // --- Derived constants --- //
 
     const CLUSTER_SIZE: usize = Self::CLUSTER_SIZE_M * Self::CLUSTER_SIZE_N;
@@ -123,7 +132,6 @@ pub trait Params {
     const NUM_TMA_PANELS: usize = Self::CTA_TN / Self::TMA_PANEL_COLS;
 
     const THREAD_N: usize = Self::CTA_TN.div_ceil(NUM_WORKER_THREADS);
-    const THREAD_N_DIV_8: usize = Self::THREAD_N / 8;
     const THREAD_M: usize = Self::CTA_TM;
 
     const MXN_LOAD_SLOT_BYTES: usize = Self::LARGEST_MXN_LOAD_BITS_PER_ELEMENT
@@ -418,7 +426,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
             #[rustc_unroll(full)]
             for row in 0..P::THREAD_M {
                 let mut raw = [bf16::ZERO; P::THREAD_N];
-                Layouts::<P>::new().copy_row(
+                Partitioning::<P>::new().copy_row(
                     &mut raw as *mut bf16,
                     thread_id().x,
                     CopyDir::SmemToReg(SmemRow {
@@ -439,7 +447,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
             let mut thr_vals = [[0.0; P::THREAD_N]; P::THREAD_M];
             #[rustc_unroll(full)]
             for row in 0..P::THREAD_M {
-                Layouts::<P>::new().copy_row(
+                Partitioning::<P>::new().copy_row(
                     &mut thr_vals[row] as *mut f32,
                     thread_id().x,
                     CopyDir::SmemToReg(SmemRow {
@@ -461,14 +469,14 @@ impl<P: Params> LoadStoreMode<P> for ModeMxN {
                 #[inline(always)]
                 |row| bf16xN::from_f32(f32xN::from_array(row)).to_array(),
             );
-            Layouts::<P>::new().store_rows_to_gmem(&raw, thread_id().x, dst.mxn_tile());
+            Partitioning::<P>::new().store_rows_to_gmem(&raw, thread_id().x, dst.mxn_tile());
         }
     }
 
     #[inline(always)]
     unsafe fn worker_store_to_gmem_f32(&self, thr_vals: &Self::LaneVals, dst: &GmemStore) {
         unsafe {
-            Layouts::<P>::new().store_rows_to_gmem(thr_vals, thread_id().x, dst.mxn_tile());
+            Partitioning::<P>::new().store_rows_to_gmem(thr_vals, thread_id().x, dst.mxn_tile());
         }
     }
 }
@@ -488,7 +496,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
         unsafe {
             let mut raw = [bf16::ZERO; P::THREAD_N];
 
-            Layouts::<P>::new().copy_row(
+            Partitioning::<P>::new().copy_row(
                 &mut raw as *mut bf16,
                 thread_id().x,
                 CopyDir::SmemToReg(SmemRow {
@@ -507,7 +515,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
         unsafe {
             let mut thr_vals = [0.0; P::THREAD_N];
 
-            Layouts::<P>::new().copy_row(
+            Partitioning::<P>::new().copy_row(
                 &mut thr_vals as *mut f32,
                 thread_id().x,
                 CopyDir::SmemToReg(SmemRow {
@@ -525,7 +533,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
     unsafe fn worker_store_to_gmem_bf16(&self, thr_vals: &Self::LaneVals, dst: &GmemStore) {
         unsafe {
             let raw = array_map_unrolled(*thr_vals, bf16::from_f32);
-            Layouts::<P>::new().store_rows_to_gmem(
+            Partitioning::<P>::new().store_rows_to_gmem(
                 &[raw],
                 thread_id().x,
                 dst.slice_1d(dst.coord_mn[1]).into(),
@@ -536,7 +544,7 @@ impl<P: Params> LoadStoreMode<P> for Mode1xN {
     #[inline(always)]
     unsafe fn worker_store_to_gmem_f32(&self, thr_vals: &Self::LaneVals, dst: &GmemStore) {
         unsafe {
-            Layouts::<P>::new().store_rows_to_gmem(
+            Partitioning::<P>::new().store_rows_to_gmem(
                 core::array::from_ref(thr_vals),
                 thread_id().x,
                 dst.slice_1d(dst.coord_mn[1]).into(),
@@ -1128,7 +1136,8 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
             match desc.sf_dim {
                 BlockScaleDim::Rowwise => {
-                    let thr_amaxs = Layouts::<P>::new().compute_rowwise_thr_amaxs::<BS>(&thr_vals);
+                    let thr_amaxs =
+                        Partitioning::<P>::new().compute_rowwise_thr_amaxs::<BS>(&thr_vals);
 
                     let thr_sfs = array_map_unrolled(
                         thr_amaxs,
@@ -1160,7 +1169,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
                     // Only store with one lane per group of lanes sharing a block.
                     let is_sf_writer = (lane_id() as usize)
-                        .is_multiple_of(BS::BLOCK_SIZE / Layouts::<P>::VECTOR_SIZE);
+                        .is_multiple_of(BS::BLOCK_SIZE / Partitioning::<P>::VECTOR_SIZE);
 
                     #[rustc_unroll(full)]
                     for i in 0..P::THREAD_M {
@@ -1168,15 +1177,17 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                         let row_sfs = thr_sfs[i].to_array();
 
                         #[rustc_unroll(full)]
-                        for chunk_idx in 0..Layouts::<P>::VECTORS_PER_THREAD_PER_ROW {
-                            let element_idx = chunk_idx * Layouts::<P>::VECTOR_SIZE;
+                        for chunk_idx in 0..Partitioning::<P>::VECTORS_PER_THREAD_PER_ROW {
+                            let element_idx = chunk_idx * Partitioning::<P>::VECTOR_SIZE;
                             let n = tile_n
-                                + Layouts::<P>::new()
+                                + Partitioning::<P>::new()
                                     .thread_element_n_index(thread_id().x, element_idx)
                                     as u32;
                             let sf_col = n / BS::BLOCK_SIZE as u32;
 
-                            if is_sf_writer && row < sf_rows && sf_col < sf_cols {
+                            if is_sf_writer
+                                && (!P::ENABLE_BOUNDS_CHECKS || (row < sf_rows && sf_col < sf_cols))
+                            {
                                 desc.sf_ptr
                                     .cast::<BS::ScaleFactor<{ P::THREAD_N }>>()
                                     .add(scale_factor_pos(row, sf_col, sf_cols))
@@ -1190,7 +1201,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                         #[inline(always)]
                         |row| row.to_array(),
                     );
-                    Layouts::<P>::new().store_rows_to_gmem(
+                    Partitioning::<P>::new().store_rows_to_gmem(
                         &thr_quantized_vals,
                         thread_id().x,
                         GmemStore::new::<P>(desc.tma_desc, desc.coord_mn, desc.cache_policy, None)
