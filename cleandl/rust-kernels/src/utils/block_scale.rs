@@ -1,6 +1,6 @@
 use ptx_std::{
-    Overflow, Relu, Rounding, SupportedVectorLen, Vector, VectorElement, VectorLen, WARP_SIZE,
-    bf16xN, f8e4m3, f8e4m3xN, f8e8m0, f8e8m0xN, f32xN,
+    Overflow, Relu, Rounding, Vector, VectorElement, WARP_SIZE, bf16xN, f8e4m3, f8e4m3xN, f8e8m0,
+    f8e8m0xN, f32xN,
 };
 
 pub trait BlockScaledFormat {
@@ -9,13 +9,14 @@ pub trait BlockScaledFormat {
     type ScaleFactor<const N: usize>: VectorElement<N>;
 
     fn compute_scale_factor<const N: usize>(amax: f32xN<N>) -> Vector<Self::ScaleFactor<N>, N>;
+    fn splat_scale_factor<const N1: usize, const N2: usize>(
+        sf: Self::ScaleFactor<N1>,
+    ) -> Vector<Self::ScaleFactor<N2>, N2>;
 
     fn quantize_bf16<const N: usize>(
         vals: bf16xN<N>,
         sfs: Vector<Self::ScaleFactor<N>, N>,
-    ) -> Vector<Self::QuantizedVal<N>, N>
-    where
-        VectorLen<N>: SupportedVectorLen;
+    ) -> Vector<Self::QuantizedVal<N>, N>;
     fn quantize_f32<const N: usize>(
         vals: f32xN<N>,
         sfs: Vector<Self::ScaleFactor<N>, N>,
@@ -41,6 +42,12 @@ impl BlockScaledFormat for Mxfp8 {
         Vector::<f8e8m0, N>::from_f32::<{ Rounding::Up }, { Overflow::SaturateFinite }>(
             sf_unrounded,
         )
+    }
+
+    fn splat_scale_factor<const N1: usize, const N2: usize>(
+        sf: Self::ScaleFactor<N1>,
+    ) -> Vector<Self::ScaleFactor<N2>, N2> {
+        Vector::splat(sf)
     }
 
     fn quantize_bf16<const N: usize>(

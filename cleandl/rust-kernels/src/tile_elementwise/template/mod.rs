@@ -63,9 +63,23 @@ use crate::{
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit, simd::u32x4};
 use ptx_std::{
-    Denormals, Dim3, F32Ext, MBarrier, MemoryOrdering, NanHandling, PhaseParity, Scope, Vector, barrier::{BarrierAlignment, sync_threads}, bf16, bf16x2, bf16xN, block_id_in_cluster, block_size, cluster::{self, map_to_cta, st_async}, cluster_dim, cluster_size, cp_async::{self, CacheOperator}, dynamic_smem_size, dynamic_smem_start, f32x2, f32x4, f32x8, f32xN, fence::fence_sync_restrict, grid_dim, lane_id, launch::{decrease_max_registers, increase_max_registers}, memory::CachePolicy, thread_id, tma, warp_collectives::{LaneMask, elect, shuffle_xor}, warp_id,
+    Denormals, Dim3, F32Ext, MBarrier, MemoryOrdering, NanHandling, PhaseParity, Scope, Vector,
+    barrier::{BarrierAlignment, sync_threads},
+    bf16, bf16x2, bf16x8, bf16xN, block_id_in_cluster, block_size,
+    cluster::{self, map_to_cta, st_async},
+    cluster_dim, cluster_size,
+    cp_async::{self, CacheOperator},
+    dynamic_smem_size, dynamic_smem_start, f32x2, f32x4, f32x8, f32xN,
+    fence::fence_sync_restrict,
+    grid_dim, lane_id,
+    launch::{decrease_max_registers, increase_max_registers},
+    memory::CachePolicy,
+    thread_id, tma,
+    warp_collectives::{LaneMask, elect, shuffle_xor},
+    warp_id,
 };
 
+mod blockscaled_colwise_store;
 mod layouts;
 
 pub const NUM_WORKER_WARPS: usize = 4;
@@ -136,15 +150,17 @@ pub trait Params {
         }
     };
 
-    /// Cluster-wide colwise reduction currently only used for writing colwise block-scaled
-    /// data.
-    const CLUSTER_COL_REDUCTION_SCRATCHPAD_BYTES: usize = const {
-        if Self::DOES_STORE_COLWISE_BLOCK_SCALED_DATA && Self::CLUSTER_SIZE_M > 1 {
-            size_of::<f32>() * Self::CTA_TN * (Mxfp8::BLOCK_SIZE / Self::CTA_TM)
+    /// Used to re-gather data in row-sharded format among peer CTAs
+    /// for MXFP8 columnwise stores. This buffer holds pre-quantization
+    /// `bf16` values received from peer CTAs.
+    const CLUSTER_RESHARD_BUFFER_ELEMENTS: usize = const {
+        if Self::DOES_STORE_COLWISE_BLOCK_SCALED_DATA && Self::CTA_TM < Mxfp8::BLOCK_SIZE {
+            Mxfp8::BLOCK_SIZE * Self::CLUSTER_RESHARD_GROUP_WIDTH
         } else {
             0
         }
     };
+    const CLUSTER_RESHARD_GROUP_WIDTH: usize = Self::CGA_TM / Self::CTA_TM;
 }
 
 /// Specifies kernel description used to instantiate the kernel template.
@@ -575,7 +591,7 @@ impl<P: Params> LoadStoreMode<P> for ModeMx1 {
     #[inline(always)]
     unsafe fn worker_store_to_gmem_bf16(&self, thr_vals: &Self::LaneVals, dst: &GmemStore) {
         unsafe {
-            let thr_vals_bf16 = bf16xN::from_f32(f32xN::from_array(*thr_vals)).to_array(); 
+            let thr_vals_bf16 = bf16xN::from_f32(f32xN::from_array(*thr_vals)).to_array();
             store_mx1(&thr_vals_bf16, dst);
         }
     }
@@ -606,8 +622,8 @@ struct Smem<P: Params> {
     cta_reduction_scratchpads: [[[UnsafeCell<MaybeUninit<f32>>; P::CTA_TM]; NUM_WORKER_WARPS]; 2],
     cluster_row_reduction_scratchpads:
         [[[UnsafeCell<MaybeUninit<f32>>; P::CTA_TM]; P::CLUSTER_SIZE_N]; 2],
-    cluster_col_reduction_scratchpads:
-        [[UnsafeCell<MaybeUninit<u8>>; P::CLUSTER_COL_REDUCTION_SCRATCHPAD_BYTES]; 2],
+    cluster_reshard_buffers:
+        [[UnsafeCell<MaybeUninit<bf16>>; P::CLUSTER_RESHARD_BUFFER_ELEMENTS]; 2],
 
     bars: Barriers<P>,
     clc: UnsafeCell<ClcSmem>,
@@ -620,7 +636,8 @@ struct Barriers<P: Params> {
 
     cta_reduction_produced: [MBarrier; 2],
     cluster_row_reduction_produced: [MBarrier; 2],
-    cluster_col_reduction_produced: [MBarrier; 2],
+
+    cluster_reshard_buffer_produced: [MBarrier; 2],
 }
 
 // --- TileScheduler --- //
@@ -892,7 +909,7 @@ struct WorkerWarp<'a, K: TileElementwiseKernel, P: Params> {
     state: K::WorkerState,
     load_idx: u32,
     row_reduction_idx: u32,
-    col_reduction_idx: u32,
+    cluster_resharding_idx: u32,
 }
 
 impl<'a, K: TileElementwiseKernel<Params = P>, P: Params> WorkerWarp<'a, K, P> {
@@ -1177,134 +1194,12 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                     );
                 }
                 BlockScaleDim::Colwise => {
-                    assert!(P::DOES_STORE_COLWISE_BLOCK_SCALED_DATA);
-
-                    // Every column resides in a single warp within a CTA, so our thr_amax
-                    // reduction is easier. However, when CTA_TM < BLOCK_SIZE, we need to do amax
-                    // reduction across multiple CTAs.
-                    assert!(P::CGA_TM.is_multiple_of(BS::BLOCK_SIZE));
-
-                    // Transpose our register view such that each element of the outer array contains a column of elements.
-                    const BLOCK_SIZE_PER_THREAD<BS: BlockScaledFormat, P: Params>: usize =
-                        const { BS::BLOCK_SIZE.min(P::THREAD_M) };
-                    const BLOCKS_PER_THREAD_PER_COL<BS: BlockScaledFormat, P: Params>: usize =
-                        const { P::THREAD_M / BLOCK_SIZE_PER_THREAD::<BS, P> };
-
-                    let mut thr_vals_chunked = [[[0.0f32; BLOCK_SIZE_PER_THREAD::<BS, P>];
-                        BLOCKS_PER_THREAD_PER_COL::<BS, P>];
-                        P::THREAD_N];
-                    #[rustc_unroll(full)]
-                    for i in 0..P::THREAD_M {
-                        #[rustc_unroll(full)]
-                        for j in 0..P::THREAD_N {
-                            thr_vals_chunked[j][i / BLOCK_SIZE_PER_THREAD::<BS, P>]
-                                [i % BLOCK_SIZE_PER_THREAD::<BS, P>] = thr_vals[i][j];
-                        }
-                    }
-
-                    let mut thr_amaxs = array_map_unrolled(
-                        thr_vals_chunked,
-                        #[inline(always)]
-                        |chunks| {
-                            array_map_unrolled(
-                                chunks,
-                                #[inline(always)]
-                                |chunk| f32xN::from_array(chunk).reduce_max(),
-                            )
-                        },
+                    blockscaled_colwise_store::worker_warp_blockscaled_colwise_store::<P, BS>(
+                        self.smem,
+                        thr_vals,
+                        &desc,
+                        &mut self.cluster_resharding_idx,
                     );
-
-                    if BLOCK_SIZE_PER_THREAD::<BS, P> < BS::BLOCK_SIZE {
-                        // Need to reduce amax across the cluster. Note this implies BLOCKS_PER_THREAD_PER_COL == 1
-                        // and thr_amaxs is effectively of shape Nx1.
-                        let slot_idx = self.col_reduction_idx as usize % 2;
-
-                        let num_ctas = BS::BLOCK_SIZE / P::CTA_TM;
-                        assert!(num_ctas <= P::CLUSTER_SIZE_M);
-
-                        let this_cta_idx = block_id_in_cluster().x;
-                        #[rustc_unroll(full)]
-                        for dst_cta_idx in 0..num_ctas {
-                            let dst_rank = block_id_in_cluster().y * P::CLUSTER_SIZE_M as u32
-                                + dst_cta_idx as u32
-                                + block_id_in_cluster().y % num_ctas as u32;
-                            let dst_bar = map_to_cta(
-                                &self.smem.bars.cluster_col_reduction_produced[slot_idx]
-                                    as *const MBarrier
-                                    as *mut MBarrier,
-                                dst_rank,
-                            );
-
-                            if P::THREAD_N.is_multiple_of(4) {
-                                // Vectorized store
-                                #[rustc_unroll(full)]
-                                for i in 0..P::THREAD_N / 4 {
-                                    let vals =
-                                        thr_amaxs.as_ptr().cast::<u32x4>().add(i).read_unaligned();
-                                    let dst = self.smem.cluster_col_reduction_scratchpads[slot_idx]
-                                        .as_ptr()
-                                        .cast::<f32>()
-                                        .add(this_cta_idx as usize * P::CTA_TN)
-                                        .cast::<u32x4>()
-                                        .add(i * NUM_WORKER_THREADS + thread_id().x as usize)
-                                        .cast_mut();
-                                    st_async(map_to_cta(dst, dst_rank), vals, dst_bar);
-                                }
-                            } else {
-                                // Unvectorized store
-                                #[rustc_unroll(full)]
-                                for i in 0..P::THREAD_N {
-                                    let val = thr_amaxs[i][0];
-                                    let dst = self.smem.cluster_col_reduction_scratchpads[slot_idx]
-                                        .as_ptr()
-                                        .cast::<f32>()
-                                        .add(this_cta_idx as usize * P::CTA_TN)
-                                        .add(i * NUM_WORKER_THREADS + thread_id().x as usize)
-                                        .cast_mut();
-                                    st_async(map_to_cta(dst, dst_rank), val, dst_bar);
-                                }
-                            }
-                        }
-
-                        // Wait on amaxs from peer CTAs to arrive, then re-arm the barrier
-                        self.smem.bars.cluster_col_reduction_produced[slot_idx]
-                            .wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
-                                PhaseParity::of_phase(self.col_reduction_idx / 2),
-                            );
-                        fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
-                        if uniform_warp_id() == 0 && elect(LaneMask::FULL).is_leader {
-                            self.smem.bars.cluster_col_reduction_produced[slot_idx].arrive_expect_tx_scoped::<{Scope::Cluster}, {MemoryOrdering::Relaxed}>(P::CLUSTER_COL_REDUCTION_SCRATCHPAD_BYTES as u32);
-                        }
-
-                        // Consume peers' amax values and reduce with ours
-                        for src_cta_idx in 0..num_ctas {
-                            if src_cta_idx != this_cta_idx as usize {
-                                if P::THREAD_N.is_multiple_of(4) {
-                                    // Vectorized loads
-                                    #[rustc_unroll(full)]
-                                    for i in 0..P::THREAD_N / 4 {
-                                        let src = self.smem.cluster_col_reduction_scratchpads
-                                            [slot_idx]
-                                            .as_ptr()
-                                            .cast::<f32>()
-                                            .add(this_cta_idx as usize * P::CTA_TN)
-                                            .cast::<f32x4>()
-                                            .add(i * NUM_WORKER_THREADS + thread_id().x as usize);
-                                        let peer_vals = src.read().to_array();
-                                        #[rustc_unroll(full)]
-                                        for j in 0..4 {
-                                            thr_amaxs[i * 4 + j][0] =
-                                                thr_amaxs[i * 4 + j][0].max(peer_vals[j]);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        todo!();
-
-                        self.col_reduction_idx += 1;
-                    }
                 }
             }
         }
@@ -1425,7 +1320,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
                     state: kernel.init_worker_state(),
                     load_idx: 0,
                     row_reduction_idx: 0,
-                    col_reduction_idx: 0,
+                    cluster_resharding_idx: 0,
                 }
                 .run(&mut kernel);
             }
