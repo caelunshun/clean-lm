@@ -5,9 +5,8 @@
 //! The kernels are built around a warp-specialized design, with `W = Params::NUM_WORKER_WARPS` (4 or 8):
 //! - Warps 0..W - Worker warps performing computations. These also store
 //!   results directly from registers to GMEM.
-//! - Warp W: TMA load warp.
-//! - Warp W+1: idle (only consumes CLC responses).
-//! - Warp W+2: cluster synchronization warp.
+//! - Warps W, W+1, W+2: load warps for M x N, 1 x N, and M x 1 loads respectively. Each load shape
+//!   has its own ring of SMEM load slots (see `Params::NUM_*_LOAD_SLOTS`).
 //! - Warp W+3: CLC scheduler warp.
 //!
 //! The non-worker warps form a single auxiliary warpgroup. Registers are rebalanced between
@@ -64,7 +63,7 @@ use crate::{
         tma::{CompoundTmaDescriptor, GMEM_TMA_ALIGNMENT, SMEM_TMA_ALIGNMENT_NO_SWIZZLE},
     },
 };
-use core::{cell::UnsafeCell, mem::MaybeUninit};
+use core::{cell::UnsafeCell, marker::ConstParamTy, mem::MaybeUninit};
 use ptx_std::{
     Dim3, MBarrier, MemoryOrdering, PhaseParity, Scope,
     barrier::{BarrierAlignment, sync_threads},
@@ -113,9 +112,13 @@ pub trait Params {
     const CLUSTER_SIZE_N: usize;
     const MACROBLOCK_SIZE: usize;
 
-    /// A load slot is sized for the largest of the M x N, 1 x N, and M x 1 loads
-    /// (see the LARGEST_*_LOAD_BITS_PER_ELEMENT constants). Every load consumes a full slot.
-    const NUM_LOAD_SLOTS: usize;
+    /// Number of slots in the ring of SMEM load slots for each load shape. Each slot is sized for
+    /// the largest load of its shape (see the LARGEST_*_LOAD_BITS_PER_ELEMENT constants).
+    ///
+    /// May be 0 if the kernel never issues loads of that shape.
+    const NUM_MXN_LOAD_SLOTS: usize;
+    const NUM_1XN_LOAD_SLOTS: usize;
+    const NUM_MX1_LOAD_SLOTS: usize;
 
     const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize;
     const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize;
@@ -152,19 +155,17 @@ pub trait Params {
     const THREAD_N: usize = Self::CTA_TN.div_ceil(Self::NUM_WORKER_THREADS);
     const THREAD_M: usize = Self::CTA_TM;
 
-    const MXN_LOAD_SLOT_BYTES: usize = Self::LARGEST_MXN_LOAD_BITS_PER_ELEMENT
+    const MXN_LOAD_SLOT_BYTES: usize = (Self::LARGEST_MXN_LOAD_BITS_PER_ELEMENT
         * Self::CTA_TM
         * Self::TMA_PANEL_COLS
         * Self::NUM_TMA_PANELS
-        / 8;
-    const MX1_LOAD_SLOT_BYTES: usize = Self::LARGEST_MX1_LOAD_BITS_PER_ELEMENT * Self::CTA_TM / 8;
-    const _1XN_LOAD_SLOT_BYTES: usize =
-        Self::LARGEST_1XN_LOAD_BITS_PER_ELEMENT * Self::TMA_PANEL_COLS * Self::NUM_TMA_PANELS / 8;
-
-    const LOAD_SLOT_BYTES: usize = Self::MXN_LOAD_SLOT_BYTES
-        .max(Self::MX1_LOAD_SLOT_BYTES)
-        .max(Self::_1XN_LOAD_SLOT_BYTES)
+        / 8)
+    .next_multiple_of(SMEM_TMA_ALIGNMENT_NO_SWIZZLE);
+    const MX1_LOAD_SLOT_BYTES: usize = (Self::LARGEST_MX1_LOAD_BITS_PER_ELEMENT * Self::CTA_TM / 8)
         .next_multiple_of(SMEM_TMA_ALIGNMENT_NO_SWIZZLE);
+    const _1XN_LOAD_SLOT_BYTES: usize =
+        (Self::LARGEST_1XN_LOAD_BITS_PER_ELEMENT * Self::TMA_PANEL_COLS * Self::NUM_TMA_PANELS / 8)
+            .next_multiple_of(SMEM_TMA_ALIGNMENT_NO_SWIZZLE);
 
     const CLUSTER_ENABLED: bool = Self::CLUSTER_SIZE > 1;
     const CLUSTER_SCOPE: Scope = const {
@@ -408,17 +409,30 @@ pub enum BlockScaleDim {
 
 // --- Load/StoreMode --- //
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, ConstParamTy)]
 pub enum LoadStoreModeEnum {
     ModeMxN,
     Mode1xN,
     ModeMx1,
 }
 
+impl LoadStoreModeEnum {
+    pub const ALL: [Self; 3] = [Self::ModeMxN, Self::Mode1xN, Self::ModeMx1];
+
+    #[inline(always)]
+    const fn num_load_slots<P: Params>(self) -> usize {
+        match self {
+            Self::ModeMxN => P::NUM_MXN_LOAD_SLOTS,
+            Self::Mode1xN => P::NUM_1XN_LOAD_SLOTS,
+            Self::ModeMx1 => P::NUM_MX1_LOAD_SLOTS,
+        }
+    }
+}
+
 pub trait LoadStoreMode<P: Params> {
     type LaneVals;
 
-    fn mode_enum(&self) -> LoadStoreModeEnum;
+    const MODE: LoadStoreModeEnum;
 
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals;
     unsafe fn worker_load_from_smem_f32(&self, smem: *const u8) -> Self::LaneVals;
@@ -432,10 +446,7 @@ pub struct ModeMxN;
 impl<P: Params> LoadStoreMode<P> for ModeMxN {
     type LaneVals = [[f32; P::THREAD_N]; P::THREAD_M];
 
-    #[inline(always)]
-    fn mode_enum(&self) -> LoadStoreModeEnum {
-        LoadStoreModeEnum::ModeMxN
-    }
+    const MODE: LoadStoreModeEnum = LoadStoreModeEnum::ModeMxN;
 
     #[inline(always)]
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
@@ -504,10 +515,7 @@ pub struct Mode1xN;
 impl<P: Params> LoadStoreMode<P> for Mode1xN {
     type LaneVals = [f32; P::THREAD_N];
 
-    #[inline(always)]
-    fn mode_enum(&self) -> LoadStoreModeEnum {
-        LoadStoreModeEnum::Mode1xN
-    }
+    const MODE: LoadStoreModeEnum = LoadStoreModeEnum::Mode1xN;
 
     #[inline(always)]
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
@@ -579,10 +587,7 @@ pub struct ModeMx1;
 impl<P: Params> LoadStoreMode<P> for ModeMx1 {
     type LaneVals = [f32; P::THREAD_M];
 
-    #[inline(always)]
-    fn mode_enum(&self) -> LoadStoreModeEnum {
-        LoadStoreModeEnum::ModeMx1
-    }
+    const MODE: LoadStoreModeEnum = LoadStoreModeEnum::ModeMx1;
 
     #[inline(always)]
     unsafe fn worker_load_from_smem_bf16(&self, smem: *const u8) -> Self::LaneVals {
@@ -647,9 +652,15 @@ unsafe fn store_mx1<T: Copy, const N: usize>(vals: &[T; N], dst: &GmemStore) {
 type RowReductionScratchpads<const ROWS: usize, const N: usize> =
     [[[UnsafeCell<MaybeUninit<f32>>; ROWS]; N]; 2];
 
+type LoadSlots<const SLOT_BYTES: usize, const N: usize> =
+    [[UnsafeCell<MaybeUninit<u8>>; SLOT_BYTES]; N];
+
 #[repr(C, align(1024))]
 struct Smem<P: Params> {
-    load_slots: [[UnsafeCell<MaybeUninit<u8>>; P::LOAD_SLOT_BYTES]; P::NUM_LOAD_SLOTS],
+    /// Slot sizes are multiples of the TMA alignment, so every slot is aligned.
+    mxn_load_slots: LoadSlots<{ P::MXN_LOAD_SLOT_BYTES }, { P::NUM_MXN_LOAD_SLOTS }>,
+    _1xn_load_slots: LoadSlots<{ P::_1XN_LOAD_SLOT_BYTES }, { P::NUM_1XN_LOAD_SLOTS }>,
+    mx1_load_slots: LoadSlots<{ P::MX1_LOAD_SLOT_BYTES }, { P::NUM_MX1_LOAD_SLOTS }>,
 
     /// These slots are double-buffered to reduce needed barrier waits.
     cta_reduction_scratchpads: RowReductionScratchpads<{ P::CTA_TM }, { P::NUM_WORKER_WARPS }>,
@@ -664,14 +675,65 @@ struct Smem<P: Params> {
 
 #[repr(C)]
 struct Barriers<P: Params> {
-    load_slot_produced: [MBarrier; P::NUM_LOAD_SLOTS],
-    load_slot_consumed: [MBarrier; P::NUM_LOAD_SLOTS],
+    mxn_load_slot_produced: [MBarrier; P::NUM_MXN_LOAD_SLOTS],
+    mxn_load_slot_consumed: [MBarrier; P::NUM_MXN_LOAD_SLOTS],
+    _1xn_load_slot_produced: [MBarrier; P::NUM_1XN_LOAD_SLOTS],
+    _1xn_load_slot_consumed: [MBarrier; P::NUM_1XN_LOAD_SLOTS],
+    mx1_load_slot_produced: [MBarrier; P::NUM_MX1_LOAD_SLOTS],
+    mx1_load_slot_consumed: [MBarrier; P::NUM_MX1_LOAD_SLOTS],
 
     cta_reduction_produced: [MBarrier; 2],
     cluster_row_reduction_produced: [MBarrier; 2],
 
     cluster_reshard_buffer_produced: [MBarrier; 2],
     cluster_reshard_buffer_consumed: [MBarrier; 2],
+}
+
+/// View of the ring of load slots for one load shape.
+#[derive(Copy, Clone)]
+struct LoadRing<'a> {
+    slots: *mut u8,
+    slot_bytes: usize,
+    produced: &'a [MBarrier],
+    consumed: &'a [MBarrier],
+}
+
+impl LoadRing<'_> {
+    #[inline(always)]
+    fn num_slots(&self) -> usize {
+        self.produced.len()
+    }
+
+    #[inline(always)]
+    fn slot(&self, slot_idx: usize) -> *mut u8 {
+        self.slots.wrapping_add(slot_idx * self.slot_bytes)
+    }
+}
+
+impl<P: Params> Smem<P> {
+    #[inline(always)]
+    fn load_ring(&self, mode: LoadStoreModeEnum) -> LoadRing<'_> {
+        match mode {
+            LoadStoreModeEnum::ModeMxN => LoadRing {
+                slots: self.mxn_load_slots.as_ptr().cast::<u8>().cast_mut(),
+                slot_bytes: P::MXN_LOAD_SLOT_BYTES,
+                produced: &self.bars.mxn_load_slot_produced,
+                consumed: &self.bars.mxn_load_slot_consumed,
+            },
+            LoadStoreModeEnum::Mode1xN => LoadRing {
+                slots: self._1xn_load_slots.as_ptr().cast::<u8>().cast_mut(),
+                slot_bytes: P::_1XN_LOAD_SLOT_BYTES,
+                produced: &self.bars._1xn_load_slot_produced,
+                consumed: &self.bars._1xn_load_slot_consumed,
+            },
+            LoadStoreModeEnum::ModeMx1 => LoadRing {
+                slots: self.mx1_load_slots.as_ptr().cast::<u8>().cast_mut(),
+                slot_bytes: P::MX1_LOAD_SLOT_BYTES,
+                produced: &self.bars.mx1_load_slot_produced,
+                consumed: &self.bars.mx1_load_slot_consumed,
+            },
+        }
+    }
 }
 
 // --- TileScheduler --- //
@@ -721,13 +783,16 @@ impl<K: TileElementwiseKernel> TileScheduler<K> {
 
 // --- TmaLoadWarp --- //
 
-struct TmaLoadWarp<'a, K: TileElementwiseKernel, P: Params> {
+/// Issues the loads of shape `MODE`, ignoring all others.
+struct TmaLoadWarp<'a, K: TileElementwiseKernel, P: Params, const MODE: LoadStoreModeEnum> {
     smem: &'a Smem<P>,
     sched: TileScheduler<K>,
     load_idx: u32,
 }
 
-impl<'a, K: TileElementwiseKernel<Params = P>, P: Params> TmaLoadWarp<'a, K, P> {
+impl<'a, K: TileElementwiseKernel<Params = P>, P: Params, const MODE: LoadStoreModeEnum>
+    TmaLoadWarp<'a, K, P, MODE>
+{
     #[inline(always)]
     pub fn run(&mut self, kernel: &mut K) {
         unsafe {
@@ -740,8 +805,8 @@ impl<'a, K: TileElementwiseKernel<Params = P>, P: Params> TmaLoadWarp<'a, K, P> 
     }
 }
 
-impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K, P>
-    for &'tmp mut TmaLoadWarp<'a, K, P>
+impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params, const MODE: LoadStoreModeEnum>
+    KernelVisitor<K, P> for &'tmp mut TmaLoadWarp<'a, K, P, MODE>
 {
     #[inline(always)]
     fn load<M>(
@@ -751,15 +816,23 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
     ) where
         M: LoadStoreMode<P>,
     {
+        if M::MODE != MODE {
+            return;
+        }
+
         unsafe {
-            let num_load_slots = <K::Params as Params>::NUM_LOAD_SLOTS;
+            let ring = self.smem.load_ring(MODE);
+            let num_load_slots = ring.num_slots();
 
             let slot_idx = self.load_idx as usize % num_load_slots;
 
             if self.load_idx >= num_load_slots as u32 {
-                self.smem.bars.load_slot_consumed[slot_idx]
+                ring.consumed[slot_idx]
                     .wait(PhaseParity::of_phase(self.load_idx / num_load_slots as u32).flip());
             }
+
+            let slot = ring.slot(slot_idx);
+            let produced_bar = &ring.produced[slot_idx];
 
             let cta_offset_mn = [
                 block_id_in_cluster().x as usize * P::CTA_TM,
@@ -767,7 +840,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
             ];
 
             if elect(LaneMask::FULL).is_leader {
-                match desc.mode.mode_enum() {
+                match MODE {
                     LoadStoreModeEnum::ModeMxN => {
                         assert!(P::LARGEST_MXN_LOAD_BITS_PER_ELEMENT >= desc.ty.bits_per_element());
 
@@ -776,21 +849,16 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                             * P::TMA_PANEL_COLS
                             * P::NUM_TMA_PANELS
                             / 8;
-                        self.smem.bars.load_slot_produced[slot_idx]
-                            .arrive_expect_tx(num_bytes as u32);
+                        produced_bar.arrive_expect_tx(num_bytes as u32);
 
                         #[rustc_unroll(full)]
                         for (panel_coord_offset, panel_smem_offset) in
                             iter_tma_panels::<P>(P::CTA_TM)
                         {
-                            let dst = self.smem.load_slots[slot_idx]
-                                .as_ptr()
-                                .cast::<u8>()
-                                .cast_mut()
-                                .add(panel_smem_offset * desc.ty.bits_per_element() / 8);
+                            let dst = slot.add(panel_smem_offset * desc.ty.bits_per_element() / 8);
                             tma::tma_load_tile(
                                 dst,
-                                &self.smem.bars.load_slot_produced[slot_idx],
+                                produced_bar,
                                 &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
@@ -808,19 +876,14 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
                         let num_bytes =
                             desc.ty.bits_per_element() * P::TMA_PANEL_COLS * P::NUM_TMA_PANELS / 8;
-                        self.smem.bars.load_slot_produced[slot_idx]
-                            .arrive_expect_tx(num_bytes as u32);
+                        produced_bar.arrive_expect_tx(num_bytes as u32);
 
                         #[rustc_unroll(full)]
                         for (panel_coord_offset, panel_smem_offset) in iter_tma_panels::<P>(1) {
-                            let dst = self.smem.load_slots[slot_idx]
-                                .as_ptr()
-                                .cast::<u8>()
-                                .cast_mut()
-                                .add(panel_smem_offset * desc.ty.bits_per_element() / 8);
+                            let dst = slot.add(panel_smem_offset * desc.ty.bits_per_element() / 8);
                             tma::tma_load_tile(
                                 dst,
-                                &self.smem.bars.load_slot_produced[slot_idx],
+                                produced_bar,
                                 &desc.tma_desc.tma,
                                 [
                                     (desc.coord_mn[1] as usize
@@ -839,14 +902,10 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
                         if num_bytes.is_multiple_of(GMEM_TMA_ALIGNMENT) {
                             // (1) Access is TMA-aligned => use TMA directly.
-                            self.smem.bars.load_slot_produced[slot_idx]
-                                .arrive_expect_tx(num_bytes as u32);
+                            produced_bar.arrive_expect_tx(num_bytes as u32);
                             tma::tma_load_tile(
-                                self.smem.load_slots[slot_idx]
-                                    .as_ptr()
-                                    .cast::<u8>()
-                                    .cast_mut(),
-                                &self.smem.bars.load_slot_produced[slot_idx],
+                                slot,
+                                produced_bar,
                                 &desc.tma_desc.tma,
                                 [(desc.coord_mn[0] as usize + cta_offset_mn[0]) as i32],
                                 desc.cache_policy,
@@ -861,11 +920,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 
                             #[rustc_unroll(full)]
                             for i in 0..num_bytes / 4 {
-                                let dst = self.smem.load_slots[slot_idx]
-                                    .as_ptr()
-                                    .cast::<u32>()
-                                    .cast_mut()
-                                    .add(i);
+                                let dst = slot.cast::<u32>().add(i);
 
                                 let byte_offset = tile_byte_offset + i * 4;
 
@@ -881,7 +936,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
                                 );
                             }
 
-                            self.smem.bars.load_slot_produced[slot_idx].cp_async_arrive_no_inc();
+                            produced_bar.cp_async_arrive_no_inc();
                         } else {
                             // <4 byte alignment is unsupported for now. Could technically be supported
                             // with some bitshifting tricks on the worker warps.
@@ -941,7 +996,8 @@ struct WorkerWarp<'a, K: TileElementwiseKernel, P: Params> {
     smem: &'a Smem<P>,
     sched: TileScheduler<K>,
     state: K::WorkerState,
-    load_idx: u32,
+    /// Indexed by `LoadStoreModeEnum`.
+    load_idxs: [u32; 3],
     row_reduction_idx: u32,
     cluster_resharding_idx: u32,
 }
@@ -970,26 +1026,32 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
     ) where
         M: LoadStoreMode<P>,
     {
-        let num_load_slots = P::NUM_LOAD_SLOTS;
-        let slot_idx = self.load_idx as usize % num_load_slots;
-        let parity = PhaseParity::of_phase(self.load_idx / num_load_slots as u32);
+        const {
+            assert!(
+                M::MODE.num_load_slots::<P>() > 0,
+                "kernel issues a load of a shape that has no load slots"
+            );
+        }
+
+        let ring = self.smem.load_ring(M::MODE);
+        let load_idx = &mut self.load_idxs[M::MODE as usize];
+        let num_load_slots = ring.num_slots();
+        let slot_idx = *load_idx as usize % num_load_slots;
+        let parity = PhaseParity::of_phase(*load_idx / num_load_slots as u32);
 
         unsafe {
-            self.smem.bars.load_slot_produced[slot_idx].wait(parity);
+            ring.produced[slot_idx].wait(parity);
 
+            let slot = ring.slot(slot_idx);
             let vals = match desc.ty {
-                LoadTy::F32 => desc
-                    .mode
-                    .worker_load_from_smem_f32(self.smem.load_slots[slot_idx].as_ptr().cast()),
-                LoadTy::Bf16 => desc
-                    .mode
-                    .worker_load_from_smem_bf16(self.smem.load_slots[slot_idx].as_ptr().cast()),
+                LoadTy::F32 => desc.mode.worker_load_from_smem_f32(slot),
+                LoadTy::Bf16 => desc.mode.worker_load_from_smem_bf16(slot),
             };
-            self.smem.bars.load_slot_consumed[slot_idx].arrive();
+            ring.consumed[slot_idx].arrive();
 
             load_callback(&mut self.state, vals);
 
-            self.load_idx += 1;
+            *load_idx += 1;
         }
     }
 
@@ -1246,9 +1308,7 @@ impl<'a, 'tmp, K: TileElementwiseKernel<Params = P>, P: Params> KernelVisitor<K,
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum WarpRole {
     Worker,
-    TmaLoad,
-    Idle,
-    ClusterSync,
+    TmaLoad(LoadStoreModeEnum),
     Clc,
 }
 
@@ -1259,9 +1319,9 @@ impl WarpRole {
             return WarpRole::Worker;
         }
         match warp - P::NUM_WORKER_WARPS {
-            0 => WarpRole::TmaLoad,
-            1 => WarpRole::Idle,
-            2 => WarpRole::ClusterSync,
+            0 => WarpRole::TmaLoad(LoadStoreModeEnum::ModeMxN),
+            1 => WarpRole::TmaLoad(LoadStoreModeEnum::Mode1xN),
+            2 => WarpRole::TmaLoad(LoadStoreModeEnum::ModeMx1),
             3 => WarpRole::Clc,
             _ => unreachable!(),
         }
@@ -1279,9 +1339,13 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
         assert_eq!(grid_dim().y as usize, P::CLUSTER_SIZE_N);
 
         #[rustc_unroll(full)]
-        for slot_idx in 0..P::NUM_LOAD_SLOTS {
-            smem.bars.load_slot_produced[slot_idx].init(1);
-            smem.bars.load_slot_consumed[slot_idx].init(P::NUM_WORKER_THREADS as u32);
+        for mode in LoadStoreModeEnum::ALL {
+            let ring = smem.load_ring(mode);
+            #[rustc_unroll(full)]
+            for slot_idx in 0..ring.num_slots() {
+                ring.produced[slot_idx].init(1);
+                ring.consumed[slot_idx].init(P::NUM_WORKER_THREADS as u32);
+            }
         }
 
         #[rustc_unroll(full)]
@@ -1325,7 +1389,6 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
             assert!(P::CGA_TM.is_multiple_of(P::CLUSTER_SIZE_M));
             assert!(P::CGA_TN.is_multiple_of(P::CLUSTER_SIZE_N));
 
-            assert!(P::NUM_LOAD_SLOTS > 0);
             assert!(P::MACROBLOCK_SIZE > 0);
 
             #[cfg(has_227kb_smem)]
@@ -1379,7 +1442,7 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
                     smem,
                     sched,
                     state: kernel.init_worker_state(),
-                    load_idx: 0,
+                    load_idxs: [0; 3],
                     row_reduction_idx: 0,
                     cluster_resharding_idx: 0,
                 }
@@ -1389,21 +1452,29 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
                 decrease_max_registers::<{ P::AUX_REGISTERS }>();
                 match role {
                     WarpRole::Worker => unreachable!(),
-                    WarpRole::TmaLoad => {
-                        TmaLoadWarp {
+                    WarpRole::TmaLoad(LoadStoreModeEnum::ModeMxN) => {
+                        TmaLoadWarp::<K, P, { LoadStoreModeEnum::ModeMxN }> {
                             smem,
                             sched,
                             load_idx: 0,
                         }
                         .run(&mut kernel);
                     }
-                    WarpRole::Idle => {
-                        // Still needs to consume CLC responses for soundness.
-                        while sched.clc.get_next_block().is_some() {}
+                    WarpRole::TmaLoad(LoadStoreModeEnum::Mode1xN) => {
+                        TmaLoadWarp::<K, P, { LoadStoreModeEnum::Mode1xN }> {
+                            smem,
+                            sched,
+                            load_idx: 0,
+                        }
+                        .run(&mut kernel);
                     }
-                    WarpRole::ClusterSync => {
-                        // TODO, placeholder for now
-                        while sched.clc.get_next_block().is_some() {}
+                    WarpRole::TmaLoad(LoadStoreModeEnum::ModeMx1) => {
+                        TmaLoadWarp::<K, P, { LoadStoreModeEnum::ModeMx1 }> {
+                            smem,
+                            sched,
+                            load_idx: 0,
+                        }
+                        .run(&mut kernel);
                     }
                     WarpRole::Clc => {
                         sched.clc.run_scheduler();

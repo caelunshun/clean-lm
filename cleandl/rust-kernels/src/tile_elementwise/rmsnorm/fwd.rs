@@ -215,7 +215,9 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ybf16_RS2048_BS128(
         const CLUSTER_SIZE_N: usize = 1;
 
         const MACROBLOCK_SIZE: usize = 16;
-        const NUM_LOAD_SLOTS: usize = 2;
+        const NUM_MXN_LOAD_SLOTS: usize = 2;
+        const NUM_1XN_LOAD_SLOTS: usize = 1;
+        const NUM_MX1_LOAD_SLOTS: usize = 0;
 
         const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;
         const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize = 16;
@@ -264,7 +266,9 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
         const CLUSTER_SIZE_N: usize = 1;
 
         const MACROBLOCK_SIZE: usize = 16;
-        const NUM_LOAD_SLOTS: usize = 2;
+        const NUM_MXN_LOAD_SLOTS: usize = 2;
+        const NUM_1XN_LOAD_SLOTS: usize = 1;
+        const NUM_MX1_LOAD_SLOTS: usize = 0;
 
         const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;
         const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize = 16;
@@ -290,10 +294,21 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8r_RS2048_BS128(
 }
 
 #[unsafe(no_mangle)]
-#[nvptx(
-    max_registers(168),
-    exact_threads_per_cta(384, 1, 1),
-    exact_cluster_dim(4, 1, 1)
+#[cfg_attr(
+    has_227kb_smem,
+    nvptx(
+        max_registers(168),
+        exact_threads_per_cta(384, 1, 1),
+        exact_cluster_dim(4, 1, 1)
+    )
+)]
+#[cfg_attr(
+    not(has_227kb_smem),
+    nvptx(
+        max_registers(168),
+        exact_threads_per_cta(384, 1, 1),
+        exact_cluster_dim(8, 1, 1)
+    )
 )]
 pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
     #[nvptx(grid_constant)] x: &CompoundTmaDescriptor,
@@ -316,15 +331,21 @@ pub unsafe extern "ptx-kernel" fn rmsnorm_fwd_Xbf16_Ymxfp8rc_RS2048_BS128(
         const CGA_TM: usize = 32;
         const CGA_TN: usize = 2048;
 
+        // Larger cluster on non-227KB targets to reduce per-CTA SMEM usage.
+        #[cfg(has_227kb_smem)]
         const CLUSTER_SIZE_M: usize = 4;
+        #[cfg(not(has_227kb_smem))]
+        const CLUSTER_SIZE_M: usize = 8;
         const CLUSTER_SIZE_N: usize = 1;
 
         const MACROBLOCK_SIZE: usize = 16;
 
         #[cfg(has_227kb_smem)]
-        const NUM_LOAD_SLOTS: usize = 2;
+        const NUM_MXN_LOAD_SLOTS: usize = 2;
         #[cfg(not(has_227kb_smem))]
-        const NUM_LOAD_SLOTS: usize = 1;
+        const NUM_MXN_LOAD_SLOTS: usize = 1;
+        const NUM_1XN_LOAD_SLOTS: usize = 1;
+        const NUM_MX1_LOAD_SLOTS: usize = 0;
 
         const LARGEST_MXN_LOAD_BITS_PER_ELEMENT: usize = 16;
         const LARGEST_1XN_LOAD_BITS_PER_ELEMENT: usize = 16;
