@@ -9,7 +9,7 @@ use crate::{
 };
 use core::simd::u32x4;
 use ptx_std::{
-    F32Ext, MBarrier, MemoryOrdering, PhaseParity, Scope, Vector, bf16, bf16x8, bf16xN,
+    MBarrier, MemoryOrdering, PhaseParity, Scope, Vector, bf16, bf16x8, bf16xN,
     block_id_in_cluster,
     cluster::{map_to_cta, st_async},
     f32x8, f32xN,
@@ -25,12 +25,13 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
     cluster_resharding_idx: &mut u32,
 ) {
     unsafe {
-        // Every column resides in a single warp within a CTA, so our thr_amax
+        // Every column resides in a single thread within a CTA, so our thr_amax
         // reduction is easier. However, when CTA_TM < BLOCK_SIZE, we need to re-shard
         // our data so each CTA can hold full BLOCK_SIZE-length columns, requiring a one-way trip through DSMEM.
+        //
+        // In both cases, values are converted to bf16 before computing amaxes and quantizing.
 
         assert!(P::DOES_STORE_COLWISE_BLOCK_SCALED_DATA);
-        assert!(P::CGA_TM.is_multiple_of(BS::BLOCK_SIZE));
 
         if P::CTA_TM >= BS::BLOCK_SIZE {
             // No need for a cluster-wide communication; can quantize and store directly from this CTA's
@@ -42,7 +43,13 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             const BLOCKS_PER_THREAD_PER_COL<BS: BlockScaledFormat, P: Params>: usize =
                 const { P::THREAD_M / BLOCK_SIZE_PER_THREAD::<BS, P> };
 
-            let mut thr_vals_chunked = [[[0.0f32; BLOCK_SIZE_PER_THREAD::<BS, P>];
+            let thr_vals_bf16 = array_map_unrolled(
+                thr_vals,
+                #[inline(always)]
+                |row| bf16xN::from_f32(f32xN::from_array(row)).to_array(),
+            );
+
+            let mut thr_vals_chunked = [[[bf16::ZERO; BLOCK_SIZE_PER_THREAD::<BS, P>];
                 BLOCKS_PER_THREAD_PER_COL::<BS, P>];
                 P::THREAD_N];
             #[rustc_unroll(full)]
@@ -50,7 +57,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 #[rustc_unroll(full)]
                 for j in 0..P::THREAD_N {
                     thr_vals_chunked[j][i / BLOCK_SIZE_PER_THREAD::<BS, P>]
-                        [i % BLOCK_SIZE_PER_THREAD::<BS, P>] = thr_vals[i][j];
+                        [i % BLOCK_SIZE_PER_THREAD::<BS, P>] = thr_vals_bf16[i][j];
                 }
             }
 
@@ -61,7 +68,7 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                     array_map_unrolled(
                         chunks,
                         #[inline(always)]
-                        |chunk| f32xN::from_array(chunk).reduce_max(),
+                        |chunk| bf16xN::from_array(chunk).abs().reduce_max().to_f32(),
                     )
                 },
             );
@@ -71,23 +78,27 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
         } else {
             // We don't have full column blocks within one CTA; re-shard the data.
 
-            const RESHARDED_CTA_TN<P: Params, BS: BlockScaledFormat>: usize =
-                P::CTA_TN / P::CLUSTER_RESHARD_GROUP_WIDTH;
-            const RESHARDED_CTA_THREAD_N<P: Params, BS: BlockScaledFormat>: usize =
-                RESHARDED_CTA_TN::<P, BS> / NUM_WORKER_THREADS;
-
-            // Ensure resharded data can be evenly partitioned across worker threads.
-            // Runtime assert, not const, because this condition only needs
-            // to hold when this path is actually used.
-            assert!(RESHARDED_CTA_TN::<P, BS>.is_multiple_of(NUM_WORKER_THREADS));
+            const RESHARDED_CTA_THREAD_N<P: Params>: usize =
+                P::CLUSTER_RESHARDED_CTA_TN / NUM_WORKER_THREADS;
 
             let slot_idx = *cluster_resharding_idx as usize % 2;
 
             let reshard_group_offset = block_id_in_cluster().x
                 / P::CLUSTER_RESHARD_GROUP_WIDTH as u32
                 * P::CLUSTER_RESHARD_GROUP_WIDTH as u32;
+            // Row of the recipients' buffers at which this CTA's rows begin.
+            let row_offset_in_group =
+                (block_id_in_cluster().x - reshard_group_offset) as usize * P::CTA_TM;
 
-            let bar = &smem.bars.cluster_reshard_buffer_produced[slot_idx];
+            // Before sending, wait for all worker threads of this CTA to finish reading
+            // the previous reshard's data, so we avoid a data race.
+            if *cluster_resharding_idx > 0 {
+                let prev_idx = *cluster_resharding_idx - 1;
+                smem.bars.cluster_reshard_buffer_consumed[prev_idx as usize % 2]
+                    .wait(PhaseParity::of_phase(prev_idx / 2));
+            }
+
+            let produced_bar = &smem.bars.cluster_reshard_buffer_produced[slot_idx];
             #[rustc_unroll(full)]
             for i in 0..P::THREAD_M {
                 if Layouts::<P>::new().is_8x_vectorized() {
@@ -96,13 +107,16 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                     for chunk_idx in 0..P::THREAD_N / 8 {
                         let j = thread_id().x as usize * 8 + chunk_idx * NUM_WORKER_THREADS * 8;
                         let recipient_idx =
-                            (j / RESHARDED_CTA_TN::<P, BS>) as u32 + reshard_group_offset;
+                            (j / P::CLUSTER_RESHARDED_CTA_TN) as u32 + reshard_group_offset;
                         let recipient_rank =
                             recipient_idx + block_id_in_cluster().y * P::CLUSTER_SIZE_M as u32;
                         let dst = smem.cluster_reshard_buffers[slot_idx]
                             .as_ptr()
                             .cast::<bf16>()
-                            .add(i * RESHARDED_CTA_TN::<P, BS> + j % RESHARDED_CTA_TN::<P, BS>)
+                            .add(
+                                (row_offset_in_group + i) * P::CLUSTER_RESHARDED_CTA_TN
+                                    + j % P::CLUSTER_RESHARDED_CTA_TN,
+                            )
                             .cast::<bf16x8>()
                             .cast_mut();
                         let dst = map_to_cta(dst, recipient_rank);
@@ -113,7 +127,10 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                         st_async(
                             dst.cast::<u32x4>(),
                             bytemuck::must_cast(chunk),
-                            map_to_cta(bar as *const MBarrier as *mut MBarrier, recipient_rank),
+                            map_to_cta(
+                                produced_bar as *const MBarrier as *mut MBarrier,
+                                recipient_rank,
+                            ),
                         );
                     }
                 } else {
@@ -123,16 +140,17 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             }
 
             // Wait for data to arrive from peer CTAs.
-            bar.wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
+            produced_bar.wait_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
                 PhaseParity::of_phase(*cluster_resharding_idx / 2),
             );
             fence_sync_restrict::<{ MemoryOrdering::Acquire }>();
 
             // Re-arm the cluster receive barrier.
             if uniform_warp_id() == 0 && elect(LaneMask::FULL).is_leader {
-                bar.arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
-                    (P::CLUSTER_RESHARD_BUFFER_ELEMENTS * size_of::<bf16>()) as u32,
-                );
+                produced_bar
+                    .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
+                        (P::CLUSTER_RESHARD_BUFFER_ELEMENTS * size_of::<bf16>()) as u32,
+                    );
             }
 
             // Load the received data into worker threads' registers.
@@ -143,18 +161,18 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
             // Note that the received data in SMEM is flat row-major.
             // We transpose within a lane's registers.
             let mut thr_vals_resharded =
-                [[bf16::ZERO; BS::BLOCK_SIZE]; RESHARDED_CTA_THREAD_N::<P, BS>];
+                [[bf16::ZERO; BS::BLOCK_SIZE]; RESHARDED_CTA_THREAD_N::<P>];
             #[rustc_unroll(full)]
             for i in 0..BS::BLOCK_SIZE {
-                if RESHARDED_CTA_THREAD_N::<P, BS>.is_multiple_of(8) {
+                if RESHARDED_CTA_THREAD_N::<P>.is_multiple_of(8) {
                     // Vectorized SMEM loads
                     #[rustc_unroll(full)]
-                    for chunk_idx in 0..RESHARDED_CTA_THREAD_N::<P, BS> / 8 {
+                    for chunk_idx in 0..RESHARDED_CTA_THREAD_N::<P> / 8 {
                         let src = smem.cluster_reshard_buffers[slot_idx]
                             .as_ptr()
                             .cast::<bf16x8>()
                             .add(
-                                i * RESHARDED_CTA_TN::<P, BS> / 8
+                                i * P::CLUSTER_RESHARDED_CTA_TN / 8
                                     + thread_id().x as usize
                                     + chunk_idx * NUM_WORKER_THREADS,
                             );
@@ -169,12 +187,12 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                 } else {
                     // Unvectorized SMEM loads
                     #[rustc_unroll(full)]
-                    for element_idx in 0..RESHARDED_CTA_THREAD_N::<P, BS> {
+                    for element_idx in 0..RESHARDED_CTA_THREAD_N::<P> {
                         let src = smem.cluster_reshard_buffers[slot_idx]
                             .as_ptr()
                             .cast::<bf16>()
                             .add(
-                                i * RESHARDED_CTA_TN::<P, BS>
+                                i * P::CLUSTER_RESHARDED_CTA_TN
                                     + thread_id().x as usize
                                     + element_idx * NUM_WORKER_THREADS,
                             );
@@ -184,6 +202,9 @@ pub unsafe fn worker_warp_blockscaled_colwise_store<P: Params, BS: BlockScaledFo
                     }
                 }
             }
+
+            // Release this slot for reuse (see the wait before sending above).
+            smem.bars.cluster_reshard_buffer_consumed[slot_idx].arrive();
 
             let thr_amaxes = array_map_unrolled(
                 thr_vals_resharded,

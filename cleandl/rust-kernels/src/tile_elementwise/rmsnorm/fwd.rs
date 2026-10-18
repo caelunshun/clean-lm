@@ -156,7 +156,7 @@ where
                 );
                 v.store_block_scaled::<Mxfp8>(
                     BlockScaledStoreDescriptor {
-                        sf_dim: BlockScaleDim::Rowwise,
+                        sf_dim: BlockScaleDim::Colwise,
                         tma_desc: col_tma_desc,
                         sf_ptr: col_sf_ptr,
                         coord_mn: [coord.x, 0],

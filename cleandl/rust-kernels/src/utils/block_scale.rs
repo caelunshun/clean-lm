@@ -38,7 +38,7 @@ impl BlockScaledFormat for Mxfp8 {
     type QuantizedVal<const N: usize> = f8e4m3;
 
     fn compute_scale_factor<const N: usize>(amax: f32xN<N>) -> Vector<Self::ScaleFactor<N>, N> {
-        let sf_unrounded = amax * f8e4m3::MAX.to_f32::<{ Relu::Disabled }>();
+        let sf_unrounded = amax * f8e4m3::MAX.to_f32::<{ Relu::Disabled }>().recip();
         Vector::<f8e8m0, N>::from_f32::<{ Rounding::Up }, { Overflow::SaturateFinite }>(
             sf_unrounded,
         )

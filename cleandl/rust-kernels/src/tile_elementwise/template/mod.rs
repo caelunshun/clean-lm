@@ -155,12 +155,16 @@ pub trait Params {
     /// `bf16` values received from peer CTAs.
     const CLUSTER_RESHARD_BUFFER_ELEMENTS: usize = const {
         if Self::DOES_STORE_COLWISE_BLOCK_SCALED_DATA && Self::CTA_TM < Mxfp8::BLOCK_SIZE {
-            Mxfp8::BLOCK_SIZE * Self::CLUSTER_RESHARD_GROUP_WIDTH
+            Mxfp8::BLOCK_SIZE * Self::CLUSTER_RESHARDED_CTA_TN
         } else {
             0
         }
     };
-    const CLUSTER_RESHARD_GROUP_WIDTH: usize = Self::CGA_TM / Self::CTA_TM;
+    /// Number of CTAs (adjacent along M) that reshard data among each other so that
+    /// each holds full `BLOCK_SIZE`-row columns. 1 when `CTA_TM >= BLOCK_SIZE`.
+    const CLUSTER_RESHARD_GROUP_WIDTH: usize = Mxfp8::BLOCK_SIZE.div_ceil(Self::CTA_TM);
+    /// Number of columns each CTA holds after resharding.
+    const CLUSTER_RESHARDED_CTA_TN: usize = Self::CTA_TN / Self::CLUSTER_RESHARD_GROUP_WIDTH;
 }
 
 /// Specifies kernel description used to instantiate the kernel template.
@@ -638,6 +642,7 @@ struct Barriers<P: Params> {
     cluster_row_reduction_produced: [MBarrier; 2],
 
     cluster_reshard_buffer_produced: [MBarrier; 2],
+    cluster_reshard_buffer_consumed: [MBarrier; 2],
 }
 
 // --- TileScheduler --- //
@@ -1252,6 +1257,13 @@ unsafe fn do_setup<P: Params>(smem: &Smem<P>) {
                 .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
                     (size_of::<f32>() * P::CLUSTER_SIZE_N * P::CTA_TM) as u32,
                 );
+
+            smem.bars.cluster_reshard_buffer_produced[slot_idx].init(1);
+            smem.bars.cluster_reshard_buffer_produced[slot_idx]
+                .arrive_expect_tx_scoped::<{ Scope::Cluster }, { MemoryOrdering::Relaxed }>(
+                    (size_of::<bf16>() * P::CLUSTER_RESHARD_BUFFER_ELEMENTS) as u32,
+                );
+            smem.bars.cluster_reshard_buffer_consumed[slot_idx].init(NUM_WORKER_THREADS as u32);
         }
 
         MBarrier::fence_init();
@@ -1289,6 +1301,12 @@ pub unsafe fn run<K: TileElementwiseKernel<Params = P>, P: Params>(mut kernel: K
 
             assert!(P::CTA_TM <= 256);
             assert!(P::CTA_TM.is_power_of_two());
+
+            if P::DOES_STORE_COLWISE_BLOCK_SCALED_DATA {
+                assert!(P::CGA_TM.is_multiple_of(Mxfp8::BLOCK_SIZE));
+                // Resharded data must be evenly partitioned across worker threads.
+                assert!(P::CLUSTER_RESHARDED_CTA_TN.is_multiple_of(NUM_WORKER_THREADS));
+            }
         }
 
         let smem = &*dynamic_smem_start().cast::<Smem<P>>();

@@ -314,9 +314,10 @@ impl<P: Params> Layouts<P> {
                         warp_reduce_max_f32(chunk_amax)
                     } else {
                         let mut block_amax = chunk_amax;
-                        for i in 0..reduction_group_size.ilog2() {
+                        #[rustc_unroll(full)]
+                        for bit in 0..reduction_group_size.ilog2() {
                             block_amax =
-                                block_amax.max(shuffle_xor(LaneMask::FULL, block_amax, 1 << i));
+                                block_amax.max(shuffle_xor(LaneMask::FULL, block_amax, 1 << bit));
                         }
                         block_amax
                     };
