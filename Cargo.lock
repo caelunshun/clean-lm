@@ -378,6 +378,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "boxcar"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
+
+[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2031,6 +2037,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-generator"
+version = "0.1.0"
+dependencies = [
+ "nvvm-builder",
+ "skytens-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2362,6 +2377,37 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "nvvm-builder"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "nvvm-ir",
+ "nvvm-sys",
+ "skycuda",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "nvvm-ir"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "boxcar",
+ "indexmap",
+ "slotmap",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "nvvm-sys"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.9.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3512,6 +3558,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "smallvec"
