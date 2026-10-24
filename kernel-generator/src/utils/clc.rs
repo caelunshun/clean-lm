@@ -3,7 +3,8 @@ use nvvm_builder::{
     Ptr, Shared, SharedCarve, Val, Var, block_dim_x, block_dim_y, block_dim_z, clc,
     cluster_block_idx_x, cluster_block_idx_y, cluster_block_idx_z, cluster_block_rank,
     cluster_dim_x, cluster_dim_y, cluster_dim_z, fence_proxy_async_generic_acquire,
-    fence_proxy_async_generic_release, fence_sync_restrict_acquire, if_, if_else, loop_,
+    fence_proxy_async_generic_release, fence_sync_restrict_acquire, fence_sync_restrict_release,
+    if_, if_else, loop_,
     mbarrier::{self, MbarrierArray},
     select, shared, with_leader, with_warp,
 };
@@ -74,6 +75,7 @@ impl ClcScheduler {
                             self.num_stages as u32,
                         ));
                     fence_sync_restrict_acquire();
+                    fence_proxy_async_generic_acquire();
                 });
 
                 let response_buf = self
@@ -95,12 +97,12 @@ impl ClcScheduler {
                     .cluster()
                     .relaxed()
                     .wait_parity(parity_from_idx(self.i, self.num_stages as u32));
-                fence_proxy_async_generic_acquire();
 
                 let response = clc::ResponseBuf::at(response_buf).load();
                 fence_proxy_async_generic_release();
+                fence_sync_restrict_release();
                 let consumed_bar = self.response_consumed_bars.get(slot_idx).remote(0);
-                consumed_bar.arrive(); // TODO should be relaxed
+                consumed_bar.relaxed().arrive();
 
                 if_else(
                     response.is_canceled(),
@@ -124,7 +126,7 @@ impl ClcScheduler {
         bar.cluster()
             .relaxed()
             .wait_parity(parity_from_idx(self.i, self.num_stages as u32));
-        fence_proxy_async_generic_acquire();
+        fence_sync_restrict_acquire();
 
         let response = clc::ResponseBuf::at(
             self.response_bufs
@@ -133,8 +135,9 @@ impl ClcScheduler {
         .load();
 
         fence_proxy_async_generic_release();
+        fence_sync_restrict_release();
         let bar = self.response_consumed_bars.get(slot_idx).remote(0);
-        bar.arrive(); // TODO should be relaxed
+        bar.relaxed().arrive();
 
         let success = response.is_canceled();
         let x = select(
