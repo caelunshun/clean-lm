@@ -1,7 +1,5 @@
 use crate::utils::view::{View1D, View2D};
-use nvvm_builder::{
-    AddrSpace, IntoVal, Ptr, Scalar, Val, ValueType, Vector, if_, if_else, vote_all, vote_any,
-};
+use nvvm_builder::{AddrSpace, Ptr, Scalar, Val, ValueType, Vector, if_, if_else, vote_any};
 
 #[derive(Debug, Copy, Clone)]
 pub struct ChunkedThreadLayout1D {

@@ -2399,6 +2399,7 @@ dependencies = [
  "boxcar",
  "indexmap",
  "slotmap",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
