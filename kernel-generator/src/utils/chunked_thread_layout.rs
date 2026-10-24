@@ -134,10 +134,7 @@ impl ChunkedThreadLayout2D {
         let mut rows = Vec::new();
         for row_idx in 0..self.num_rows {
             let offset_ptr = view.base.offset(row_idx as u32 * view.outer_stride);
-            rows.push(
-                self.inner
-                    .load_aligned_unchecked(offset_ptr, thread_idx),
-            );
+            rows.push(self.inner.load_aligned_unchecked(offset_ptr, thread_idx));
         }
         rows
     }
