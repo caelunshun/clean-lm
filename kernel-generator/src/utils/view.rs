@@ -19,3 +19,11 @@ pub struct View2D<T: Scalar, S: AddrSpace> {
     /// Stride, in elements, as the outermost dimension coordinate increases.
     pub outer_stride: Val<u32>,
 }
+
+#[derive(Debug, Copy, Clone)]
+pub struct ViewPosWithinTensor2D {
+    pub row_offset: Val<u32>,
+    pub col_offset: Val<u32>,
+    pub total_tensor_rows: Val<u32>,
+    pub total_tensor_cols: Val<u32>,
+}

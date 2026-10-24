@@ -65,4 +65,25 @@ impl BlockScaledFormat {
             }
         }
     }
+
+    pub fn placeholder_scale_factor(&self) -> DynVal {
+        match self {
+            BlockScaledFormat::Mxfp8 => Val::<UE8M0>::new(UE8M0(0)).into(),
+            BlockScaledFormat::Nvfp4 => Val::<F8E4M3>::new(F8E4M3(0)).into(),
+        }
+    }
+}
+
+/// Computes the index within the scale factors tensor of the given block coordinate
+/// (row, col) [here assumes rowwise block scales; input coordinates need swapped if colwise].
+pub fn compute_scale_factor_index(
+    format: BlockScaledFormat,
+    row: Val<u32>,
+    col: Val<u32>,
+    ncols: Val<u32>,
+) -> Val<u32> {
+    ((row / 128) * ncols + (col / 4)) * 128 * 4
+        + (row % 32) * 16
+        + ((row % 128) / 32) * 4
+        + (col % 4)
 }

@@ -1,5 +1,11 @@
-use crate::utils::view::{View1D, View2D};
-use nvvm_builder::{AddrSpace, Ptr, Scalar, Val, ValueType, Vector, if_, if_else, vote_any};
+use crate::utils::{
+    block_scale::{self, BlockScaledFormat},
+    view::{View1D, View2D, ViewPosWithinTensor2D},
+};
+use nvvm_builder::{
+    AddrSpace, DynVector, Global, Ptr, Scalar, Val, ValueType, Vector, bf16, if_, if_else, lane_id,
+    shfl_sync_bfly, vote_any,
+};
 
 #[derive(Debug, Copy, Clone)]
 pub struct ChunkedThreadLayout1D {
@@ -160,8 +166,108 @@ impl ChunkedThreadLayout2D {
             let is_in_bounds = view.outer_len.gt(row_idx as u32);
             if_(is_in_bounds, || {
                 let offset_ptr = view.base.offset(row_idx as u32 * view.outer_stride);
-                self.inner
-                    .store_aligned_unchecked(offset_ptr, *vals, thread_idx);
+                self.inner.store_aligned(
+                    View1D {
+                        base: offset_ptr,
+                        len: view.inner_len,
+                    },
+                    *vals,
+                    thread_idx,
+                );
+            });
+        }
+    }
+
+    /// Performs rowwise block-scaled quantization using warp collectives,
+    /// then stores quantized values and scale factors to GMEM, with bounds checking.
+    /// Requires num_elements >= block_size and block_size a power of two, at most 32.
+    pub fn store_aligned_rowwise_block_scaled<Q: ValueType + Scalar, SF: ValueType + Scalar>(
+        &self,
+        format: BlockScaledFormat,
+        quantized_vals_view: View2D<Q, Global>,
+        quantized_vals_pos: ViewPosWithinTensor2D,
+        scale_factors_base: Val<Ptr<SF, Global>>,
+        vals: &[Val<Vector<bf16>>],
+        thread_idx: Val<u32>,
+    ) {
+        let block_size = format.block_size();
+        assert!(block_size.is_power_of_two());
+        assert!(block_size <= 32);
+        assert!(
+            self.inner.threads * self.inner.chunk_size * self.inner.chunks_per_thread >= block_size
+        );
+
+        for (row_idx, vals) in vals.iter().enumerate() {
+            let is_in_bounds = quantized_vals_view.outer_len.gt(row_idx as u32);
+            if_(is_in_bounds, || {
+                let mut amaxs = Val::<Vector<bf16>>::splat(self.inner.chunks_per_thread, 0.0f32);
+
+                for chunk_idx in 0..self.inner.chunks_per_thread {
+                    let chunk_vals = vals.slice(
+                        chunk_idx * self.inner.chunk_size..(chunk_idx + 1) * self.inner.chunk_size,
+                    );
+                    let chunk_amax = chunk_vals.abs().reduce_max();
+                    amaxs = amaxs.set(chunk_idx, chunk_amax);
+                }
+
+                let amax_reduction_lanes = block_size / self.inner.chunk_size;
+                assert!(amax_reduction_lanes.is_power_of_two());
+                assert!(self.inner.chunk_size <= format.block_size());
+                for bit in 0..amax_reduction_lanes.ilog2() {
+                    amaxs = amaxs.max(shfl_sync_bfly(u32::MAX, amaxs, 1 << bit));
+                }
+
+                let scale_factors = format.compute_scale_factors_from_amaxs(amaxs);
+
+                let mut quantized_vals = None;
+
+                for chunk_idx in 0..self.inner.chunks_per_thread {
+                    let chunk_sf = scale_factors.get(chunk_idx);
+                    let chunk_vals = vals.slice(
+                        chunk_idx * self.inner.chunk_size..(chunk_idx + 1) * self.inner.chunk_size,
+                    );
+                    let chunk_vals_quantized = format.quantize(
+                        chunk_vals,
+                        DynVector::splat(self.inner.chunk_size, &chunk_sf),
+                    );
+                    quantized_vals = match quantized_vals {
+                        None => Some(chunk_vals_quantized),
+                        Some(v) => Some(v.concat(&chunk_vals_quantized)),
+                    };
+
+                    let col = thread_idx * self.inner.chunk_size as u32
+                        + chunk_idx as u32 * (self.inner.chunk_size * self.inner.threads) as u32;
+                    let sf_col = col / format.block_size() as u32;
+
+                    let n_sf_cols = quantized_vals_pos
+                        .total_tensor_cols
+                        .div_ceil(format.block_size() as u32);
+                    let sf_in_bounds = sf_col.lt(n_sf_cols);
+                    let should_store_sf =
+                        (lane_id() & !((1 << amax_reduction_lanes as u32) - 1)).eq(0);
+                    if_(sf_in_bounds & should_store_sf, || {
+                        let index = block_scale::compute_scale_factor_index(
+                            format,
+                            row_idx as u32 + quantized_vals_pos.row_offset,
+                            (col + quantized_vals_pos.col_offset) / format.block_size() as u32,
+                            n_sf_cols,
+                        );
+                        scale_factors_base
+                            .offset(index)
+                            .store(chunk_sf.downcast().unwrap());
+                    });
+                }
+
+                self.inner.store_aligned(
+                    View1D {
+                        base: quantized_vals_view
+                            .base
+                            .offset(quantized_vals_view.outer_stride * row_idx as u32),
+                        len: quantized_vals_view.outer_len,
+                    },
+                    quantized_vals.unwrap().downcast::<Q>().unwrap(),
+                    thread_idx,
+                );
             });
         }
     }
