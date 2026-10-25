@@ -2041,6 +2041,8 @@ name = "kernel-generator"
 version = "0.1.0"
 dependencies = [
  "nvvm-builder",
+ "serde",
+ "skycuda",
  "skytens-core",
  "thiserror 2.0.21",
 ]

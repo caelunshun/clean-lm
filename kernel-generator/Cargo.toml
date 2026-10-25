@@ -7,4 +7,6 @@ edition = "2024"
 nvvm-builder = { path = "../../nvvm-rs/crates/nvvm-builder" }
 thiserror = "2.0.21"
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
+serde = { version = "1.0.229", features = ["derive"] }
+skycuda = { git = "https://github.com/caelunshun/skycuda" }
 # z3 = { version = "0.21.1", features = ["gh-release"] }

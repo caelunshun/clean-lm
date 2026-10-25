@@ -4,9 +4,11 @@ use crate::utils::{
     view::{View1D, View2D, ViewPosWithinTensor2D},
 };
 use nvvm_builder::{
-    AddrSpace, DynVector, Global, Mbarrier, Ptr, Scalar, Shared, SharedCarve, Val, ValueType, Var,
-    Vector, bf16, cluster_block_rank, fence_sync_restrict_acquire, fence_sync_restrict_release,
-    if_, if_else, lane_id, mbarrier, shfl_sync_bfly, vote_any, with_leader_of_warp,
+    AddrSpace, DynVector, Global, IntoVal, Mbarrier, Ptr, Scalar, Shared, SharedCarve, Val,
+    ValueType, Var, Vector, bf16, cluster_block_rank,
+    cp_async::{self, CopyOpts},
+    fence_sync_restrict_acquire, fence_sync_restrict_release, if_, if_else, lane_id, mbarrier,
+    shfl_sync_bfly, tma, vote_any, with_leader_of_warp,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -56,6 +58,43 @@ impl ChunkedThreadLayout1D {
             };
         }
         concat.unwrap()
+    }
+
+    /// Performs an asynchronous copy operation of this row of data from GMEM to SMEM,
+    /// using TMA bulk (non-tensor) copies. If the tail is not aligned to 16 bytes,
+    /// a LDGSTS (cp.async) is issued to handle it. This should be called by one thread only.
+    /// Returns # of bytes copied; an arrive_expect_tx operation on the barrier with appropriate byte count
+    /// should follow this call.
+    ///
+    /// The length of `dst` (SMEM buffer) must be the layout's element count; this is currently
+    /// not checked.
+    pub fn async_bulk_copy_g2s_aligned<T: ValueType + Scalar>(
+        &self,
+        src: View1D<T, Global>,
+        dst: View1D<T, Shared>,
+        bar: Mbarrier,
+    ) -> Val<u32> {
+        let aligned_bytes_to_copy = src.len * T::SIZE as u32 / 16 * 16;
+        tma::bulk_load(
+            dst.base,
+            src.base,
+            aligned_bytes_to_copy / T::SIZE as u32,
+            bar,
+        );
+
+        let tail_bytes = src.len * T::SIZE as u32 - aligned_bytes_to_copy;
+        if_(tail_bytes.gt(0), || {
+            cp_async::copy_with(
+                dst.base.offset(aligned_bytes_to_copy / T::SIZE as u32),
+                src.base.offset(aligned_bytes_to_copy / T::SIZE as u32),
+                16,
+                CopyOpts::new().src_bytes(tail_bytes),
+            );
+            cp_async::mbarrier_arrive(bar);
+        });
+
+        // tail does not contribute to expect-tx count; only count bulk-copy bytes
+        aligned_bytes_to_copy
     }
 
     pub fn num_elements(&self) -> usize {
@@ -155,6 +194,40 @@ impl ChunkedThreadLayout2D {
             rows.push(self.inner.load_aligned_unchecked(offset_ptr, thread_idx));
         }
         rows
+    }
+
+    /// Performs an asynchronous copy operation of this tile of data from GMEM to SMEM,
+    /// using TMA bulk (non-tensor) copies. If the tail of each row is not aligned to 16 bytes,
+    /// LDGSTS (cp.async) operations are issued to handle it. This function should be called by one thread only.
+    /// Returns # of bytes copied; an arrive_expect_tx operation on the barrier with appropriate byte count
+    /// should follow this call.
+    ///
+    /// The sizes of `dst` (SMEM buffer) must match the layout's sizes; this is currently
+    /// not checked.
+    pub fn async_bulk_copy_g2s_aligned<T: ValueType + Scalar>(
+        &self,
+        src: View2D<T, Global>,
+        dst: View2D<T, Shared>,
+        bar: Mbarrier,
+    ) -> Val<u32> {
+        let bytes_expect_tx = Var::<u32>::new(0);
+        for row_idx in 0..self.num_rows {
+            if_(Val::<u32>::new(row_idx as u32).lt(src.outer_len), || {
+                let row_bytes = self.inner.async_bulk_copy_g2s_aligned(
+                    View1D {
+                        base: src.base.offset(row_idx as u32 * src.outer_stride),
+                        len: src.inner_len,
+                    },
+                    View1D {
+                        base: dst.base.offset(row_idx as u32 * dst.outer_stride),
+                        len: dst.inner_len,
+                    },
+                    bar,
+                );
+                bytes_expect_tx.set(bytes_expect_tx.get() + row_bytes);
+            });
+        }
+        bytes_expect_tx.into_val()
     }
 
     pub fn store_aligned_unchecked<T: ValueType + Scalar, S: AddrSpace>(
