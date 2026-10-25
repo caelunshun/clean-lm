@@ -4,6 +4,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use skycuda::{function::Function, stream::Stream};
 use std::sync::Arc;
 
+pub mod norm;
+
 pub trait KernelGenerator: Sized {
     type Config: Eq + Serialize + DeserializeOwned;
     type ExecArgs<'a>;
