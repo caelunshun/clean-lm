@@ -1,3 +1,4 @@
+use super::NormType;
 use crate::{
     error::{Error, Result},
     kernels::{
@@ -7,10 +8,17 @@ use crate::{
     utils::{
         arch::{max_cluster_size, max_smem, reg_bytes_per_sm},
         block_scale::BlockScaledFormat,
+        chunked_thread_layout::{ChunkedThreadLayout2D, Resharder},
+        clc::ClcScheduler,
         params::{DynParamsBuilder, dtype},
+        view::{View1D, View2D},
     },
 };
-use nvvm_builder::{mbarrier::Pipeline, prelude::*};
+use nvvm_builder::{
+    mbarrier::{Pipeline, PipelineState},
+    prelude::*,
+    setmaxnreg_dec, setmaxnreg_inc,
+};
 use skycuda::stream::Stream;
 use std::cmp::Ordering;
 
@@ -33,6 +41,8 @@ impl KernelGenerator for NormForwardKernelGenerator {
         params.add(Param::X, dtype::<Ptr<bf16, Global>>());
         params.add(Param::ActualRowSize, dtype::<u32>());
         params.add(Param::RecipActualRowSize, dtype::<f32>());
+        params.add(Param::NumRows, dtype::<u32>());
+        params.add(Param::RowStride, dtype::<u32>());
         params.add(Param::RInv, dtype::<Ptr<f32, Global>>());
 
         if config.has_bias {
@@ -62,24 +72,68 @@ impl KernelGenerator for NormForwardKernelGenerator {
             }
         };
 
-        let tuning_params = TuningParams::decide(&config, &arch)?;
+        let tuning_config = TuningConfig::decide(&config, &arch)?;
 
         module.kernel_dyn(
             "norm_fwd",
             KernelOpts::new()
-                .cluster_dims([tuning_params.cluster_size, 1, 1])
-                .req_threads([128 + tuning_params.num_worker_threads, 1, 1])
+                .cluster_dims([tuning_config.cluster_size, 1, 1])
+                .req_threads([128 + tuning_config.num_worker_threads, 1, 1])
                 .restrict_pointers(true)
-                .min_blocks_per_sm(tuning_params.occupancy)
+                .min_blocks_per_sm(tuning_config.occupancy)
                 .max_regs(
                     reg_bytes_per_sm(&arch) as u32
-                        / tuning_params.occupancy
+                        / tuning_config.occupancy
                         / size_of::<u32>() as u32
-                        / (128 + tuning_params.num_worker_threads),
+                        / (128 + tuning_config.num_worker_threads),
                 ),
             &params.param_dtypes(),
             |args| {
                 params.bind(args);
+
+                let mut smem = SharedCarve::dynamic();
+
+                const CLC_STAGES: usize = 3;
+
+                let layout = ChunkedThreadLayout2D::new(
+                    config.max_row_size,
+                    tuning_config.rows_per_tile as usize,
+                    tuning_config.num_worker_threads as usize,
+                );
+
+                let builder = Builder {
+                    config,
+                    tuning_config,
+                    load_pipeline: Pipeline::shared(
+                        "load_pipeline",
+                        tuning_config.num_smem_staging_slots,
+                        mbarrier::Release::Threads(tuning_config.num_worker_threads),
+                    ),
+                    load_slots_base: smem.array::<bf16>(
+                        (tuning_config.num_smem_staging_slots * tuning_config.rows_per_tile)
+                            as usize
+                            * config.max_row_size,
+                        16,
+                    ),
+                    clc: ClcScheduler::init(CLC_STAGES, 0, &mut smem),
+                    resharder: (tuning_config.cluster_size > 1).then(|| {
+                        Resharder::init(tuning_config.cluster_size, &layout, &mut smem, 4)
+                    }),
+                    layout,
+                    params: &params,
+                };
+
+                with_leader_of_warp(0, || {
+                    builder.load_pipeline.init();
+                });
+
+                if tuning_config.cluster_size > 1 {
+                    cluster_sync();
+                } else {
+                    sync_threads();
+                }
+
+                builder.build();
             },
         );
 
@@ -111,18 +165,192 @@ enum Param {
     RInv,
     ActualRowSize,
     RecipActualRowSize,
+    NumRows,
+    RowStride,
 }
 
-struct Builder {
+struct Builder<'a> {
     config: super::Config,
-    tuning_params: TuningParams,
+    tuning_config: TuningConfig,
     load_pipeline: Pipeline,
-    load_slots: Vec<Val<Ptr<bf16, Shared>>>,
+    load_slots_base: Val<Ptr<bf16, Shared>>,
+    clc: ClcScheduler,
+    resharder: Option<Resharder<bf16>>,
+    layout: ChunkedThreadLayout2D,
+    params: &'a DynParamsBuilder<Param>,
 }
 
-impl Builder {}
+impl<'a> Builder<'a> {
+    pub fn build(&self) {
+        let (aux_thread_regs, worker_thread_regs) = (32, 232);
 
-struct TuningParams {
+        with_warps(0..4, || {
+            setmaxnreg_dec(aux_thread_regs);
+
+            with_warp(0, || {
+                self.clc.emit_scheduler_loop_on_leader_warp();
+            });
+
+            with_warp(1, || {
+                self.build_tma_loader_warp();
+            });
+
+            with_warps(1..4, || {
+                self.build_idle_warp();
+            });
+        });
+
+        with_warps(4..4 + self.tuning_config.num_worker_warps, || {
+            setmaxnreg_inc(worker_thread_regs);
+            self.build_worker_warps();
+        });
+    }
+
+    fn build_idle_warp(&self) {
+        loop_(|l| {
+            let (has_next, _, _, _) = self.clc.get_next_block_idx();
+            if_(!has_next, || {
+                l.break_();
+            });
+        });
+    }
+
+    fn build_tma_loader_warp(&self) {
+        let pipeline_state = self.load_pipeline.producer_state();
+
+        let current_schedule_unit = Var::new(block_idx_x());
+
+        loop_(|l| {
+            for_range(
+                current_schedule_unit * self.tuning_config.tiles_per_schedule_unit,
+                (current_schedule_unit + 1) * self.tuning_config.tiles_per_schedule_unit,
+                |tile| {
+                    let first_row_in_tile = tile * self.tuning_config.rows_per_tile;
+
+                    let stage = self.load_pipeline.producer_acquire(pipeline_state);
+
+                    let dst = View2D {
+                        base: self.load_slots_base.offset(
+                            stage.index()
+                                * size_of::<bf16>() as u32
+                                * self.config.max_row_size as u32,
+                        ),
+                        inner_len: Val::new(self.config.max_row_size as u32),
+                        outer_len: Val::new(self.tuning_config.rows_per_tile),
+                        outer_stride: Val::new(self.config.max_row_size as u32),
+                    };
+                    let src = View2D {
+                        base: self.params.get(Param::X),
+                        inner_len: self.params.get(Param::ActualRowSize),
+                        outer_len: (self
+                            .params
+                            .get::<u32>(Param::NumRows)
+                            .saturating_sub(first_row_in_tile))
+                        .max(self.tuning_config.rows_per_tile),
+                        outer_stride: self.params.get(Param::RowStride),
+                    };
+
+                    with_leader(|| {
+                        let bar = stage.arrive_expect_tx(
+                            self.layout.async_bulk_copy_g2s_aligned_num_bytes(src, dst),
+                        );
+                        self.layout.async_bulk_copy_g2s_aligned(src, dst, bar);
+                    });
+
+                    pipeline_state.advance();
+                },
+            );
+
+            let (has_next, next_schedule_unit, _, _) = self.clc.get_next_block_idx();
+            if_else(
+                has_next,
+                || {
+                    current_schedule_unit.set(next_schedule_unit);
+                },
+                || {
+                    l.break_();
+                },
+            );
+        });
+    }
+
+    fn build_worker_warps(&self) {
+        let pipeline_state = self.load_pipeline.consumer_state();
+
+        let current_schedule_unit = Var::new(block_idx_x());
+
+        let thread_idx = thread_idx_x() - 128;
+
+        // Load scale and bias, if needed.
+        let scale = self.config.has_scale.then(|| {
+            self.layout.as_1d().load_aligned(
+                View1D::<bf16, Global> {
+                    base: self.params.get(Param::Scale),
+                    len: self.params.get(Param::ActualRowSize),
+                },
+                thread_idx,
+            )
+        });
+        let bias = self.config.has_scale.then(|| {
+            self.layout.as_1d().load_aligned(
+                View1D::<bf16, Global> {
+                    base: self.params.get(Param::Bias),
+                    len: self.params.get(Param::ActualRowSize),
+                },
+                thread_idx,
+            )
+        });
+
+        let i = Var::<u32>::new(0);
+
+        loop_(|l| {
+            for_range(
+                current_schedule_unit * self.tuning_config.tiles_per_schedule_unit,
+                (current_schedule_unit + 1) * self.tuning_config.tiles_per_schedule_unit,
+                |tile| {
+                    let first_row_in_tile = tile * self.tuning_config.rows_per_tile;
+                    let stage = self.load_pipeline.consumer_wait(pipeline_state);
+
+                    let x = self.layout.load_aligned_unchecked(
+                        View2D {
+                            base: self.load_slots_base.offset(
+                                size_of::<bf16>() as u32
+                                    * stage.index()
+                                    * self.config.max_row_size as u32,
+                            ),
+                            inner_len: Val::new(self.config.max_row_size as u32),
+                            outer_len: Val::new(self.tuning_config.rows_per_tile),
+                            outer_stride: Val::new(self.config.max_row_size as u32),
+                        },
+                        thread_idx,
+                    );
+
+                    let y = match self.config.norm_type {
+                        NormType::RmsNorm => {}
+                        NormType::LayerNorm => {}
+                    };
+
+                    stage.release();
+                    pipeline_state.advance();
+                },
+            );
+
+            let (has_next, next_schedule_unit, _, _) = self.clc.get_next_block_idx();
+            if_else(
+                has_next,
+                || {
+                    current_schedule_unit.set(next_schedule_unit);
+                },
+                || {
+                    l.break_();
+                },
+            );
+        });
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TuningConfig {
     occupancy: u32,
     num_worker_warps: u32,
     num_worker_threads: u32,
@@ -132,7 +360,7 @@ struct TuningParams {
     tiles_per_schedule_unit: u32,
 }
 
-impl TuningParams {
+impl TuningConfig {
     pub fn decide(config: &super::Config, arch: &Arch) -> Result<Self> {
         let reg_capacity_per_sm = reg_bytes_per_sm(arch);
         let smem_capacity_per_sm = max_smem(arch);
@@ -144,7 +372,7 @@ impl TuningParams {
 
         let staging_slot_bytes_per_row = reg_bytes_per_row;
 
-        fn cmp(first: &TuningParams, second: &TuningParams) -> Ordering {
+        fn cmp(first: &TuningConfig, second: &TuningConfig) -> Ordering {
             (
                 first.occupancy,
                 first.rows_per_tile,
@@ -161,7 +389,7 @@ impl TuningParams {
             regs * 3 / 2 // heuristic
         }
 
-        let mut best = None::<TuningParams>;
+        let mut best = None::<TuningConfig>;
 
         for occupancy in 1..=2 {
             let reg_capacity = reg_capacity_per_sm / occupancy;
@@ -201,7 +429,7 @@ impl TuningParams {
                         continue;
                     }
 
-                    let config = TuningParams {
+                    let config = TuningConfig {
                         occupancy: occupancy as u32,
                         num_worker_warps: 8 / occupancy as u32,
                         num_worker_threads: 8 / occupancy as u32 * 32,

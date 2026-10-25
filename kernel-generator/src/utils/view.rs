@@ -1,6 +1,7 @@
+use derive_where::derive_where;
 use nvvm_builder::{AddrSpace, Ptr, Scalar, Val};
 
-#[derive(Debug, Copy, Clone)]
+#[derive_where(Debug, Copy, Clone)]
 pub struct View1D<T: Scalar, S: AddrSpace> {
     /// Start of the view (e.g. a row of a tensor).
     pub base: Val<Ptr<T, S>>,
@@ -8,7 +9,7 @@ pub struct View1D<T: Scalar, S: AddrSpace> {
     pub len: Val<u32>,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive_where(Debug, Copy, Clone)]
 pub struct View2D<T: Scalar, S: AddrSpace> {
     /// Start of the view.
     pub base: Val<Ptr<T, S>>,
