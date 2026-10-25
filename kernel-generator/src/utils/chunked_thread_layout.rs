@@ -271,4 +271,132 @@ impl ChunkedThreadLayout2D {
             });
         }
     }
+
+    /// Column-major block-scaled store. Thread layout's num_rows must be a multiple of, and at least,
+    /// the block size. Note that `quantized_vals_view` is interpreted as column-major.
+    pub fn store_aligned_colwise_block_scaled<Q: ValueType + Scalar, SF: ValueType + Scalar>(
+        &self,
+        format: BlockScaledFormat,
+        quantized_vals_view: View2D<Q, Global>,
+        quantized_vals_pos: ViewPosWithinTensor2D,
+        scale_factors_base: Val<Ptr<SF, Global>>,
+        vals: &[Val<Vector<bf16>>],
+        thread_idx: Val<u32>,
+    ) {
+        assert!(
+            self.num_rows >= format.block_size()
+                && self.num_rows.is_multiple_of(format.block_size())
+        );
+
+        for block in 0..self.num_rows / format.block_size() {
+            for chunk_idx in 0..self.inner.chunks_per_thread {
+                let mut chunk_amaxs = None;
+
+                for row in &vals[block * format.block_size()..][..format.block_size()] {
+                    chunk_amaxs = match chunk_amaxs {
+                        None => Some(row.abs()),
+                        Some(x) => Some(x.max(row.abs())),
+                    };
+                }
+
+                let chunk_amaxs = chunk_amaxs.unwrap();
+
+                let chunk_sfs = format.compute_scale_factors_from_amaxs(chunk_amaxs);
+
+                // Quantize and store elements
+                for col_within_chunk in 0..chunk_idx {
+                    let col = thread_idx * self.inner.chunk_size as u32
+                        + chunk_idx as u32
+                            * self.inner.chunk_size as u32
+                            * self.inner.chunks_per_thread as u32
+                        + col_within_chunk as u32;
+
+                    let col_in_bounds = col.lt(quantized_vals_view.outer_len);
+
+                    if_(col_in_bounds, || {
+                        let mut col_vals: Option<Val<Vector<bf16>>> = None;
+                        for row in &vals[block * format.block_size()..][..format.block_size()] {
+                            col_vals = Some(match col_vals {
+                                None => Val::<Vector<bf16>>::splat(1, row.get(col_within_chunk)),
+                                Some(v) => v.concat(Val::<Vector<bf16>>::splat(
+                                    1,
+                                    row.get(col_within_chunk),
+                                )),
+                            });
+                        }
+
+                        let col_vals = col_vals.unwrap();
+                        let col_vals_quantized = format.quantize(
+                            col_vals,
+                            DynVector::splat(format.block_size(), &chunk_sfs.get(col_within_chunk)),
+                        );
+
+                        let last_row = block * format.block_size() + format.block_size() - 1;
+                        let all_rows_in_bounds = quantized_vals_view.inner_len.gt(last_row as u32);
+
+                        let store_sfs = || {
+                            scale_factors_base
+                                .offset(block_scale::compute_scale_factor_index(
+                                    format,
+                                    col + quantized_vals_pos.col_offset,
+                                    block as u32 * format.block_size() as u32
+                                        + quantized_vals_pos.row_offset,
+                                    quantized_vals_pos.total_tensor_cols
+                                        / format.block_size() as u32,
+                                ))
+                                .store(chunk_sfs.get(col_within_chunk));
+                        };
+
+                        if_else(
+                            all_rows_in_bounds,
+                            || {
+                                // Vectorized store
+                                quantized_vals_view
+                                    .base
+                                    .offset(
+                                        block as u32 * format.block_size() as u32
+                                            + col * quantized_vals_view.outer_stride,
+                                    )
+                                    .store(&col_vals_quantized);
+                                store_sfs();
+                            },
+                            || {
+                                let any_row_in_bounds = quantized_vals_view
+                                    .inner_len
+                                    .gt((block * format.block_size()) as u32);
+                                if_else(
+                                    any_row_in_bounds,
+                                    || {
+                                        // Elementwise store
+                                        for row_in_block in 0..format.block_size() {
+                                            let row = (block * format.block_size()) as u32
+                                                + row_in_block as u32;
+                                            let row_in_bounds =
+                                                quantized_vals_view.inner_len.gt(row);
+                                            if_(row_in_bounds, || {
+                                                quantized_vals_view
+                                                    .base
+                                                    .offset(
+                                                        block as u32 * format.block_size() as u32
+                                                            + row_in_block as u32
+                                                            + col
+                                                                * quantized_vals_view.outer_stride,
+                                                    )
+                                                    .store(col_vals_quantized.get(row_in_block));
+                                            });
+                                        }
+
+                                        store_sfs();
+                                    },
+                                    || {
+                                        // No store - all rows out of bounds
+                                    },
+                                );
+                            },
+                        );
+                    });
+                }
+            }
+        }
+    }
 }
