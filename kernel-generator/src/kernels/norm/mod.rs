@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod forward;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NormType {
     RmsNorm,
@@ -19,6 +21,8 @@ pub const MAX_SUPPORTED_ROW_SIZE: usize = 8192;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Config {
     pub norm_type: NormType,
+    pub has_scale: bool,
+    pub has_bias: bool,
     pub output_types: OutputTypes,
     /// Maximum row size that the kernel needs to support.
     /// Using the kernel for larger rows than this has undefined behavior.

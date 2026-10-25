@@ -26,7 +26,7 @@ pub trait KernelGenerator: Sized {
 #[derive(Debug, Clone)]
 pub struct BuiltKernel<G: KernelGenerator> {
     config: G::Config,
-    ptx: Arc<[u8]>,
+    cubin: Arc<[u8]>,
     arch: Arch,
 }
 
