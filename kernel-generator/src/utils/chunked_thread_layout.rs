@@ -1,10 +1,12 @@
 use crate::utils::{
     block_scale::{self, BlockScaledFormat},
+    parity::parity_from_idx,
     view::{View1D, View2D, ViewPosWithinTensor2D},
 };
 use nvvm_builder::{
-    AddrSpace, DynVector, Global, Ptr, Scalar, Val, ValueType, Vector, bf16, if_, if_else, lane_id,
-    shfl_sync_bfly, vote_any,
+    AddrSpace, DynVector, Global, Mbarrier, Ptr, Scalar, Shared, SharedCarve, Val, ValueType, Var,
+    Vector, bf16, cluster_block_rank, fence_sync_restrict_acquire, fence_sync_restrict_release,
+    if_, if_else, lane_id, mbarrier, shfl_sync_bfly, vote_any, with_leader_of_warp,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -54,6 +56,10 @@ impl ChunkedThreadLayout1D {
             };
         }
         concat.unwrap()
+    }
+
+    pub fn num_elements(&self) -> usize {
+        self.chunk_size * self.chunks_per_thread * self.threads
     }
 
     pub fn store_aligned_unchecked<T: ValueType + Scalar, S: AddrSpace>(
@@ -128,6 +134,14 @@ impl ChunkedThreadLayout2D {
             inner: ChunkedThreadLayout1D::new(elements_per_row, threads),
             num_rows: rows,
         }
+    }
+
+    pub fn num_elements_per_row(&self) -> usize {
+        self.inner.num_elements()
+    }
+
+    pub fn num_elements_total(&self) -> usize {
+        self.num_elements_per_row() * self.num_rows
     }
 
     pub fn load_aligned_unchecked<T: ValueType + Scalar, S: AddrSpace>(
@@ -398,5 +412,187 @@ impl ChunkedThreadLayout2D {
                 }
             }
         }
+    }
+}
+
+/// Holds data (SMEM and mbarriers) needed for resharding.
+///
+/// A resharding reassigns elements within a CGA-wide 2D tile, such that:
+/// - Before the resharding, each CTA holds different _rows_ but the same _columns_;
+/// - After the resharding, each CTA holds different _columns_ but the same _rows_.
+///
+/// In other words, we change the dimension a tensor is sharded across within a CGA.
+pub struct Resharder<T: Scalar + ValueType> {
+    buffer: Val<Ptr<T, Shared>>,
+    /// Arrived on by async stores from peer CTAs.
+    produced: Mbarrier,
+    /// Arrived on by each peer upon consuming their own SMEM buffers,
+    /// signaling that we can do another reshard without a data race.
+    consumed: Mbarrier,
+    /// Number of reshards performed.
+    i: Var<u32>,
+    src_layout: ChunkedThreadLayout2D,
+    dst_layout: ChunkedThreadLayout2D,
+    cluster_size: u32,
+    leader_warp: u32,
+}
+
+impl<T: Scalar + ValueType> Resharder<T> {
+    /// Must be called by every warp in every CTA. A cluster sync
+    /// must be completed before the first reshard operations.
+    pub fn init(
+        cluster_size: u32,
+        src_layout: &ChunkedThreadLayout2D,
+        smem: &mut SharedCarve,
+        leader_warp: u32,
+    ) -> Self {
+        assert!(
+            src_layout
+                .num_elements_per_row()
+                .is_multiple_of(cluster_size as usize)
+        );
+
+        let dst_layout = ChunkedThreadLayout2D::new(
+            src_layout.num_elements_per_row() / cluster_size as usize,
+            src_layout.num_rows * cluster_size as usize,
+            src_layout.inner.threads,
+        );
+
+        let needed_elements = src_layout.num_elements_total();
+        let buffer = smem.array::<T>(needed_elements, 16);
+
+        let produced = Mbarrier::shared("reshard_produced");
+        let consumed = Mbarrier::shared("reshard_consumed");
+
+        with_leader_of_warp(0, || {
+            produced.init(1);
+
+            // Initial arming of producer barrier
+            produced
+                .cluster()
+                .relaxed()
+                .arrive_expect_tx((needed_elements * T::SIZE) as u32);
+
+            consumed.init(src_layout.inner.threads as u32 * cluster_size);
+
+            mbarrier::fence_init();
+        });
+
+        Self {
+            buffer,
+            produced,
+            consumed,
+            i: Var::new(0),
+            cluster_size,
+            src_layout: *src_layout,
+            dst_layout,
+            leader_warp,
+        }
+    }
+
+    /// This function initiates resharding by asynchronously sending our data to peer CTAs.
+    /// Complete the resharding by calling `finish_resharding` on the returned object.
+    /// In between the calls, other work can overlap the cluster transfers, hiding latency.
+    #[must_use]
+    pub fn initiate_resharding<'a>(
+        &'a self,
+        vals: &[Val<Vector<T>>],
+        pos_in_tensor: ViewPosWithinTensor2D,
+        thread_idx: Val<u32>,
+    ) -> ReshardingInProgress<'a, T> {
+        let needs_wait = self.i.ge(1);
+        if_(needs_wait, || {
+            self.consumed
+                .cluster()
+                .relaxed()
+                .wait_parity(parity_from_idx(self.i, 1));
+        });
+
+        let dst_layout_elements_per_row =
+            self.src_layout.num_elements_per_row() as u32 / self.cluster_size;
+
+        for (row_idx, row_vals) in vals.iter().copied().enumerate() {
+            for chunk_idx in 0..self.src_layout.inner.chunks_per_thread {
+                let col = thread_idx * self.src_layout.inner.chunk_size as u32
+                    + chunk_idx as u32
+                        * (self.src_layout.inner.chunks_per_thread
+                            * self.src_layout.inner.chunk_size) as u32;
+                let dst_rank = col / dst_layout_elements_per_row;
+
+                let dst_col = col % dst_layout_elements_per_row;
+                let dst_row =
+                    cluster_block_rank() * self.dst_layout.num_rows as u32 + row_idx as u32;
+
+                let ptr_local = self
+                    .buffer
+                    .offset(dst_col + dst_row * self.dst_layout.num_elements_per_row() as u32);
+                let ptr_remote = ptr_local.map_rank(dst_rank);
+                let bar_remote = self.produced.remote(dst_rank);
+
+                ptr_remote
+                    .cast_shaped::<Vector<T>>(self.src_layout.inner.chunk_size)
+                    .store_async(
+                        row_vals.slice(
+                            chunk_idx * self.src_layout.inner.chunk_size
+                                ..(chunk_idx + 1) * self.src_layout.inner.chunk_size,
+                        ),
+                        bar_remote,
+                    );
+            }
+        }
+
+        ReshardingInProgress {
+            resharder: self,
+            thread_idx,
+        }
+    }
+}
+
+pub struct ReshardingInProgress<'a, T: Scalar + ValueType> {
+    resharder: &'a Resharder<T>,
+    thread_idx: Val<u32>,
+}
+
+impl<'a, T: Scalar + ValueType> ReshardingInProgress<'a, T> {
+    /// Waits and receives data from peer CTAs. Returns the thread layout of the resulting
+    /// resharded data (which remains row-major, but with a smaller row size and more rows),
+    /// as well as the data itself.
+    pub fn finish_resharding(&self) -> (ChunkedThreadLayout2D, Vec<Val<Vector<T>>>) {
+        self.resharder
+            .produced
+            .cluster()
+            .relaxed()
+            .wait_parity(parity_from_idx(self.resharder.i, 1));
+        fence_sync_restrict_acquire();
+
+        let vals = self.resharder.dst_layout.load_aligned_unchecked(
+            View2D {
+                base: self.resharder.buffer,
+                inner_len: Val::new(self.resharder.dst_layout.num_elements_per_row() as u32),
+                outer_len: Val::new(self.resharder.dst_layout.num_rows as u32),
+                outer_stride: Val::new(self.resharder.dst_layout.num_elements_per_row() as u32),
+            },
+            self.thread_idx,
+        );
+
+        // Re-arm our producer barrier to receive the next reshard.
+        with_leader_of_warp(self.resharder.leader_warp, || {
+            self.resharder
+                .produced
+                .cluster()
+                .relaxed()
+                .arrive_expect_tx(
+                    (self.resharder.dst_layout.num_elements_total() * T::SIZE) as u32,
+                );
+        });
+
+        fence_sync_restrict_release();
+        for peer in 0..self.resharder.cluster_size {
+            self.resharder.consumed.remote(peer).relaxed().arrive();
+        }
+
+        self.resharder.i.set(self.resharder.i + 1);
+
+        (self.resharder.dst_layout, vals)
     }
 }
