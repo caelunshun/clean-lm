@@ -24,10 +24,10 @@ impl BlockScaledFormat {
     /// computed after already applying the global descale.
     pub fn compute_scale_factors_from_amaxs(&self, amaxs: Val<Vector<bf16>>) -> DynVector {
         match self {
-            BlockScaledFormat::Mxfp8 => (amaxs / 448.0f32)
+            BlockScaledFormat::Mxfp8 => (amaxs.div_approx(448.0f32))
                 .convert::<UE8M0>(ConvertOpts::new().rounding(Rounding::Rp).satfinite())
                 .into(),
-            BlockScaledFormat::Nvfp4 => (amaxs / 6.0f32)
+            BlockScaledFormat::Nvfp4 => (amaxs.div_approx(6.0f32))
                 .convert::<F8E4M3>(ConvertOpts::new().rounding(Rounding::Rn).satfinite())
                 .into(),
         }
@@ -63,13 +63,6 @@ impl BlockScaledFormat {
                     .convert::<F4E2M1>(ConvertOpts::default().rounding(Rounding::Rn).satfinite())
                     .into()
             }
-        }
-    }
-
-    pub fn placeholder_scale_factor(&self) -> DynVal {
-        match self {
-            BlockScaledFormat::Mxfp8 => Val::<UE8M0>::new(UE8M0(0)).into(),
-            BlockScaledFormat::Nvfp4 => Val::<F8E4M3>::new(F8E4M3(0)).into(),
         }
     }
 }

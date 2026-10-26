@@ -1,7 +1,8 @@
 [workspace]
 members = [
-    "cleandl", 
+    "cleandl",
     "kernel-generator",
+    "kernel-generator/cli",
     "sky-1",
     "skytokens",
 ]

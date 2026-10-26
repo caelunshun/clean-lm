@@ -8,7 +8,7 @@ use nvvm_builder::{
     ValueType, Var, Vector, bf16, cluster_block_rank,
     cp_async::{self, CopyOpts},
     fence_sync_restrict_acquire, fence_sync_restrict_release, if_, if_else, lane_id, mbarrier,
-    shfl_sync_bfly, tma, vote_any, with_leader_of_warp,
+    shfl_sync_bfly, tma, vote_all, vote_any, with_leader_of_warp,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -25,7 +25,7 @@ impl ChunkedThreadLayout1D {
         assert!(elements.is_multiple_of(threads));
         let elements_per_thread = elements / threads;
 
-        let chunk_size = (0..=elements_per_thread.ilog2().min(Self::MAX_CHUNK_SIZE as u32))
+        let chunk_size = (0..=(1 << elements_per_thread.ilog2()).min(Self::MAX_CHUNK_SIZE))
             .rev()
             .find(|x| elements_per_thread.is_multiple_of(*x as usize))
             .unwrap() as usize;
@@ -60,18 +60,60 @@ impl ChunkedThreadLayout1D {
         concat.unwrap()
     }
 
-    pub fn load_aligned<T: ValueType + Scalar, S: AddrSpace>(
+    /// Aligned load, with out-of-bounds elements checked and set to zero.
+    pub fn load_aligned_or_zero<T: ValueType + Scalar, S: AddrSpace>(
         &self,
         view: View1D<T, S>,
         thread_idx: Val<u32>,
     ) -> Val<Vector<T>> {
-        todo!()
+        let mut chunks = Vec::new();
+        for chunk in 0..self.chunks_per_thread {
+            let col = thread_idx * self.chunk_size as u32
+                + (chunk * self.threads * self.chunk_size) as u32;
+            let entire_chunk_in_bounds = (col + self.chunk_size as u32).le(view.len);
+            let any_element_in_bounds = col.lt(view.len);
+
+            let needs_elementwise_load =
+                vote_any(u32::MAX, !entire_chunk_in_bounds & any_element_in_bounds);
+
+            let chunk_data = Var::new(Val::<Vector<T>>::zero_shaped(self.chunk_size));
+
+            if_else(
+                needs_elementwise_load,
+                || {
+                    let mut lanes = Vec::new();
+                    for offset in 0..self.chunk_size {
+                        let col = col + offset as u32;
+                        let is_in_bounds = col.lt(view.len);
+                        let val = Var::new(Val::<T>::zero());
+                        if_(is_in_bounds, || {
+                            val.set(view.base.offset(col).load());
+                        });
+                        lanes.push(val.into_val());
+                    }
+                    chunk_data.set(Val::from_lanes(lanes));
+                },
+                || {
+                    if_(entire_chunk_in_bounds, || {
+                        chunk_data.set(
+                            view.base
+                                .offset(col)
+                                .load_vector(self.chunk_size, self.chunk_size * T::SIZE),
+                        );
+                    });
+                },
+            );
+
+            chunks.push(chunk_data.into_val());
+        }
+
+        Val::from_lanes(chunks.into_iter().flat_map(|chunk| chunk.to_vec()))
     }
 
     pub fn async_bulk_copy_g2s_aligned_num_bytes<T: ValueType + Scalar>(
         &self,
         src: View1D<T, Global>,
-        dst: View1D<T, Shared>,
+        _dst: View1D<T, Shared>,
     ) -> Val<u32> {
         src.len * T::SIZE as u32 / 16 * 16
     }
@@ -613,7 +655,6 @@ impl<T: Scalar + ValueType> Resharder<T> {
     pub fn initiate_resharding<'a>(
         &'a self,
         vals: &[Val<Vector<T>>],
-        pos_in_tensor: ViewPosWithinTensor2D,
         thread_idx: Val<u32>,
     ) -> ReshardingInProgress<'a, T> {
         let needs_wait = self.i.ge(1);

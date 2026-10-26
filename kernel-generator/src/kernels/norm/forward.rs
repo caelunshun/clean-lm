@@ -2,8 +2,8 @@ use super::NormType;
 use crate::{
     error::{Error, Result},
     kernels::{
-        BuiltKernel, KernelGenerator,
-        norm::{MAX_SUPPORTED_ROW_SIZE, OutputTypes},
+        HasCubin, KernelGenerator,
+        norm::{MAX_SUPPORTED_ROW_SIZE, OutputTypes, compile_kernel_to_cubin},
     },
     utils::{
         arch::{max_cluster_size, max_smem, reg_bytes_per_sm},
@@ -11,14 +11,11 @@ use crate::{
         chunked_thread_layout::{ChunkedThreadLayout2D, Resharder},
         clc::ClcScheduler,
         params::{DynParamsBuilder, dtype},
-        view::{View1D, View2D},
+        view::{View1D, View2D, ViewPosWithinTensor2D},
     },
 };
-use nvvm_builder::{
-    mbarrier::{Pipeline, PipelineState},
-    prelude::*,
-    setmaxnreg_dec, setmaxnreg_inc,
-};
+use nvvm_builder::{mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc};
+use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
 use std::cmp::Ordering;
 
@@ -27,8 +24,9 @@ pub struct NormForwardKernelGenerator;
 impl KernelGenerator for NormForwardKernelGenerator {
     type Config = super::Config;
     type ExecArgs<'a> = ();
+    type BuiltKernel = BuiltKernel;
 
-    fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel<Self>> {
+    fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
         config.max_row_size = config.max_row_size.next_power_of_two();
 
         if config.max_row_size > MAX_SUPPORTED_ROW_SIZE {
@@ -73,6 +71,8 @@ impl KernelGenerator for NormForwardKernelGenerator {
         };
 
         let tuning_config = TuningConfig::decide(&config, &arch)?;
+
+        tracing::debug!(?config, ?tuning_config, "selected tuning config");
 
         module.kernel_dyn(
             "norm_fwd",
@@ -137,12 +137,18 @@ impl KernelGenerator for NormForwardKernelGenerator {
             },
         );
 
-        todo!()
+        let cubin = compile_kernel_to_cubin(module, arch)?;
+
+        Ok(BuiltKernel {
+            config,
+            tuning_config,
+            cubin,
+        })
     }
 
     unsafe fn execute_kernel<'a>(
         &self,
-        kernel: &BuiltKernel<Self>,
+        kernel: &BuiltKernel,
         args: Self::ExecArgs<'a>,
         stream: &Stream,
     ) -> Result<()> {
@@ -240,7 +246,10 @@ impl<'a> Builder<'a> {
                         outer_stride: Val::new(self.config.max_row_size as u32),
                     };
                     let src = View2D {
-                        base: self.params.get(Param::X),
+                        base: self
+                            .params
+                            .get(Param::X)
+                            .offset(first_row_in_tile * self.params.get::<u32>(Param::RowStride)),
                         inner_len: self.params.get(Param::ActualRowSize),
                         outer_len: (self
                             .params
@@ -283,7 +292,7 @@ impl<'a> Builder<'a> {
 
         // Load scale and bias, if needed.
         let scale = self.config.has_scale.then(|| {
-            self.layout.as_1d().load_aligned(
+            self.layout.as_1d().load_aligned_or_zero(
                 View1D::<bf16, Global> {
                     base: self.params.get(Param::Scale),
                     len: self.params.get(Param::ActualRowSize),
@@ -292,7 +301,7 @@ impl<'a> Builder<'a> {
             )
         });
         let bias = self.config.has_scale.then(|| {
-            self.layout.as_1d().load_aligned(
+            self.layout.as_1d().load_aligned_or_zero(
                 View1D::<bf16, Global> {
                     base: self.params.get(Param::Bias),
                     len: self.params.get(Param::ActualRowSize),
@@ -310,6 +319,7 @@ impl<'a> Builder<'a> {
                 |tile| {
                     let first_row_in_tile = tile * self.tuning_config.rows_per_tile;
                     let stage = self.load_pipeline.consumer_wait(pipeline_state);
+                    let reduction_slot_idx = i % 2;
 
                     let x = self.layout.load_aligned_unchecked(
                         View2D {
@@ -326,12 +336,163 @@ impl<'a> Builder<'a> {
                     );
 
                     let y = match self.config.norm_type {
-                        NormType::RmsNorm => {}
-                        NormType::LayerNorm => {}
+                        NormType::RmsNorm => {
+                            let smem_row_sums_of_squares = shared_shaped::<Vector<f32>>(
+                                "row_sums_of_squares",
+                                2 * self.tuning_config.num_worker_warps as usize,
+                                16,
+                                self.tuning_config.rows_per_tile as usize,
+                            );
+
+                            let local_sums_of_squares = x
+                                .iter()
+                                .map(|row_chunks| {
+                                    let row_chunks = row_chunks.convert::<f32>(Default::default());
+                                    (row_chunks * row_chunks).reduce_add()
+                                })
+                                .collect::<Vec<_>>();
+
+                            let local_sums_of_squares =
+                                Var::new(Val::from_lanes(local_sums_of_squares));
+                            for bit in 0..5 {
+                                local_sums_of_squares.set(
+                                    local_sums_of_squares
+                                        + shfl_sync_bfly(u32::MAX, local_sums_of_squares, 1 << bit),
+                                );
+                            }
+
+                            with_leader(|| {
+                                smem_row_sums_of_squares
+                                    .offset(
+                                        self.tuning_config.num_worker_warps * reduction_slot_idx
+                                            + warp_id(),
+                                    )
+                                    .store(local_sums_of_squares);
+                            });
+                            named_barrier(0x2, self.tuning_config.num_worker_threads);
+
+                            let global_sums_of_squares = Var::new(Val::<Vector<f32>>::zero_shaped(
+                                local_sums_of_squares.lanes(),
+                            ));
+                            for w in 0..self.tuning_config.num_worker_warps {
+                                global_sums_of_squares.set(
+                                    global_sums_of_squares
+                                        + smem_row_sums_of_squares
+                                            .offset(
+                                                self.tuning_config.num_worker_warps
+                                                    * reduction_slot_idx
+                                                    + w,
+                                            )
+                                            .load(),
+                                );
+                            }
+
+                            let r_inv = (global_sums_of_squares + 1e-6f32).rsqrt();
+
+                            // Store r_inv
+                            if_(thread_idx.eq(0), || {
+                                for row_idx in 0..self.tuning_config.rows_per_tile {
+                                    let row_r_inv = r_inv.get(row_idx as usize);
+                                    let coord = first_row_in_tile + row_idx;
+                                    if_(coord.lt(self.params.get(Param::NumRows)), || {
+                                        let dst = self.params.get::<Ptr<f32, Global>>(Param::RInv);
+                                        if_(!dst.is_null(), || {
+                                            dst.offset(coord).store(row_r_inv);
+                                        });
+                                    });
+                                }
+                            });
+
+                            let mut y_rows = Vec::new();
+                            for row_idx in 0..self.tuning_config.rows_per_tile {
+                                let row_r_inv = r_inv.get(row_idx as usize);
+
+                                let mut y_row = x[row_idx as usize]
+                                    .convert::<f32>(Default::default())
+                                    * row_r_inv;
+                                if let Some(scale) = scale {
+                                    y_row = y_row * scale.convert::<f32>(Default::default());
+                                }
+                                if let Some(bias) = bias {
+                                    y_row = y_row + bias.convert::<f32>(Default::default());
+                                }
+                                y_rows.push(y_row.convert::<bf16>(Default::default()));
+                            }
+
+                            y_rows
+                        }
+                        NormType::LayerNorm => todo!(),
                     };
+
+                    // Store results. If we need to reshard for MXFP8 colwise store, initiate this first
+                    // to hide latency.
+                    let resharding_in_progress = self
+                        .resharder
+                        .as_ref()
+                        .map(|resharder| resharder.initiate_resharding(&y, thread_idx));
+
+                    let valid_rows_in_tile = (self
+                        .params
+                        .get::<u32>(Param::NumRows)
+                        .saturating_sub(first_row_in_tile))
+                    .max(self.tuning_config.rows_per_tile);
+
+                    match self.config.output_types {
+                        OutputTypes::Bf16 => {
+                            self.layout.store_aligned(
+                                View2D::<_, Global> {
+                                    base: self.params.get(Param::YBf16).offset(
+                                        first_row_in_tile
+                                            * self.params.get::<u32>(Param::RowStride),
+                                    ),
+                                    inner_len: self.params.get(Param::ActualRowSize),
+                                    outer_len: valid_rows_in_tile,
+                                    outer_stride: self.params.get(Param::RowStride),
+                                },
+                                &y,
+                                thread_idx,
+                            );
+                        }
+                        OutputTypes::Mxfp8Rowwise | OutputTypes::Mxfp8RowwiseAndColwise => {
+                            self.layout
+                                .store_aligned_rowwise_block_scaled::<F8E4M3, UE8M0>(
+                                    BlockScaledFormat::Mxfp8,
+                                    View2D::<_, Global> {
+                                        base: self.params.get(Param::YMxfp8Row).offset(
+                                            first_row_in_tile
+                                                * self.params.get::<u32>(Param::RowStride),
+                                        ),
+                                        inner_len: self.params.get(Param::ActualRowSize),
+                                        outer_len: valid_rows_in_tile,
+                                        outer_stride: self.params.get(Param::RowStride),
+                                    },
+                                    ViewPosWithinTensor2D {
+                                        row_offset: first_row_in_tile,
+                                        col_offset: Val::new(0),
+                                        total_tensor_rows: self.params.get(Param::NumRows),
+                                        total_tensor_cols: self.params.get(Param::ActualRowSize),
+                                    },
+                                    self.params.get(Param::YMxfp8RowSf),
+                                    &y,
+                                    thread_idx,
+                                );
+
+                            if self.config.output_types == OutputTypes::Mxfp8RowwiseAndColwise {
+                                let (resharded_layout, resharded_vals) =
+                                    match resharding_in_progress {
+                                        Some(reshard) => reshard.finish_resharding(),
+                                        None => (self.layout, y),
+                                    };
+
+                                todo!()
+                            }
+                        }
+                        OutputTypes::Nvfp4Rowwise => todo!(),
+                    }
 
                     stage.release();
                     pipeline_state.advance();
+                    i.set(i + 1);
                 },
             );
 
@@ -349,7 +510,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 struct TuningConfig {
     occupancy: u32,
     num_worker_warps: u32,
@@ -365,7 +526,7 @@ impl TuningConfig {
         let reg_capacity_per_sm = reg_bytes_per_sm(arch);
         let smem_capacity_per_sm = max_smem(arch);
 
-        let reg_bytes_per_row = config.max_row_size * size_of::<bf16>();
+        let reg_bytes_per_row = config.max_row_size * size_of::<f32>();
         let reg_aux_bytes = (config.has_scale as usize + config.has_bias as usize)
             * config.max_row_size
             * size_of::<bf16>();
@@ -452,5 +613,18 @@ impl TuningConfig {
         }
 
         best.ok_or(Error::Unsupported("no tuning params valid for config"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltKernel {
+    config: super::Config,
+    tuning_config: TuningConfig,
+    cubin: Vec<u8>,
+}
+
+impl HasCubin for BuiltKernel {
+    fn cubin(&self) -> &[u8] {
+        &self.cubin
     }
 }

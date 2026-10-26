@@ -1,4 +1,4 @@
-use nvvm_builder::{DType, DynVal, Scalar, Val, ValueType};
+use nvvm_builder::{DType, DynVal, Val, ValueType};
 
 /// Dynamic kernel parameter helper.
 pub struct DynParamsBuilder<K> {
