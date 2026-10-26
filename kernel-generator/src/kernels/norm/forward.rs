@@ -27,7 +27,7 @@ impl KernelGenerator for NormForwardKernelGenerator {
     type BuiltKernel = BuiltKernel;
 
     fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
-        config.max_row_size = config.max_row_size.next_power_of_two();
+        config.max_row_size = config.max_row_size.next_power_of_two().max(128);
 
         if config.max_row_size > MAX_SUPPORTED_ROW_SIZE {
             return Err(Error::Unsupported("row size > 8192"));
@@ -584,8 +584,8 @@ impl TuningConfig {
                 };
 
                 for num_smem_staging_slots in 1..=4 {
-                    let smem =
-                        staging_slot_bytes_per_row * num_smem_staging_slots + reshard_buffer_bytes;
+                    let smem = staging_slot_bytes_per_row * num_smem_staging_slots * rows_per_tile
+                        + reshard_buffer_bytes;
                     if smem > smem_capacity {
                         continue;
                     }
