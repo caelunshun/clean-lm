@@ -295,6 +295,14 @@ impl Tensor {
     }
 
     #[must_use]
+    pub fn into_transposed(self, dim_a: usize, dim_b: usize) -> Self {
+        Self {
+            virt: self.virt.transposed(dim_a, dim_b),
+            ..self
+        }
+    }
+
+    #[must_use]
     pub fn unsqueezed(&self) -> TensorView<'_> {
         self.view().unsqueezed()
     }

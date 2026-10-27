@@ -587,7 +587,10 @@ dependencies = [
  "directories",
  "faer",
  "float-cmp",
+ "float4",
+ "float8",
  "half",
+ "kernel-generator",
  "parking_lot",
  "postcard",
  "rand 0.10.3",
@@ -1181,6 +1184,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "float4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a5404bf31d22893d61cf24d4dda149d8e6b2ff07601c3cb3be651031f61a4ed"
+
+[[package]]
+name = "float8"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
+dependencies = [
+ "bytemuck",
+ "half",
 ]
 
 [[package]]
