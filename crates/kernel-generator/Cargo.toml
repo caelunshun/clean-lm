@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 nvvm-builder = { path = "../../../nvvm-rs/crates/nvvm-builder" }
-tileir-builder = { path = "../../../tileir-rs/crates/tileir-builder" }
 thiserror = "2.0.21"
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
 serde = { version = "1.0.229", features = ["derive"] }

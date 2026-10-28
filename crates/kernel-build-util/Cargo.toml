@@ -1,0 +1,11 @@
+[package]
+name = "kernel-build-util"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+derive-where = { version = "1.7.0", features = ["serde"] }
+nvvm-builder = { path = "../../../nvvm-rs/crates/nvvm-builder" }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+tileir-builder = { path = "../../../tileir-rs/crates/tileir-builder" }
+skycuda = { git = "https://github.com/caelunshun/skycuda" }

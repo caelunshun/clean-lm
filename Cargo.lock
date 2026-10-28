@@ -2067,6 +2067,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-build-util"
+version = "0.1.0"
+dependencies = [
+ "derive-where",
+ "nvvm-builder",
+ "serde",
+ "skycuda",
+ "tileir-builder",
+]
+
+[[package]]
 name = "kernel-generator"
 version = "0.1.0"
 dependencies = [
@@ -2077,7 +2088,6 @@ dependencies = [
  "skycuda",
  "skytens-core",
  "thiserror 2.0.21",
- "tileir-builder",
  "tracing",
 ]
 
