@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "cleandl",
-    "kernel-generator",
-    "kernel-generator/cli",
-    "sky-1",
-    "skytokens",
+    "crates/cleandl",
+    "crates/kernel-generator",
+    "crates/kernel-generator/cli",
+    "crates/sky-1",
+    "crates/skytokens",
 ]
-exclude = ["cleandl/rust-kernels"]
+exclude = ["crates/cleandl/rust-kernels"]
 resolver = "3"
 
 [profile.dev.package.'*']
