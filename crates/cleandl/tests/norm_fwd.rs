@@ -70,6 +70,7 @@ fn reference_rms_norm(
     Reference { y, r_inv }
 }
 
+#[derive(Debug)]
 struct Case {
     shape: Shape,
     has_scale: bool,

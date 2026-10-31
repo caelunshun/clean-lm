@@ -1,6 +1,4 @@
-use nvvm_builder::{
-    ConvertOpts, DynVal, DynVector, F4E2M1, F8E4M3, Rounding, UE4M3, UE8M0, Val, Vector, bf16,
-};
+use nvvm_builder::{ConvertOpts, DynVector, F4E2M1, F8E4M3, Rounding, UE8M0, Val, Vector, bf16};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlockScaledFormat {

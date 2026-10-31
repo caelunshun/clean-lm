@@ -17,9 +17,7 @@ use kernel_build_util::{
     ArgBundle, Kernel, LoadedKernelCache, Param, PtrArg,
     nvvm::{Args, KernelBuilder},
 };
-use nvvm_builder::{
-    mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc, tma::bulk_store,
-};
+use nvvm_builder::{mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc};
 use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
 use std::cmp::Ordering;
@@ -80,15 +78,10 @@ impl KernelGenerator for NormForwardKernelGenerator {
             "norm_fwd",
             KernelOpts::new()
                 .cluster_dims([tuning_config.cluster_size, 1, 1])
-                .req_threads([128 + tuning_config.num_worker_threads, 1, 1])
+                .req_threads([tuning_config.threads_per_block(), 1, 1])
                 .restrict_pointers(true)
                 .min_blocks_per_sm(tuning_config.occupancy)
-                .max_regs(
-                    reg_bytes_per_sm(&arch) as u32
-                        / tuning_config.occupancy
-                        / size_of::<u32>() as u32
-                        / (128 + tuning_config.num_worker_threads),
-                ),
+                .max_regs(tuning_config.max_regs_per_thread(&arch)),
             |args| {
                 let mut smem = SharedCarve::dynamic();
 
@@ -103,6 +96,7 @@ impl KernelGenerator for NormForwardKernelGenerator {
                 let builder = Builder {
                     config,
                     tuning_config,
+                    worker_thread_regs: tuning_config.worker_regs_per_thread(&arch),
                     load_pipeline: Pipeline::shared(
                         "load_pipeline",
                         tuning_config.num_smem_staging_slots,
@@ -331,6 +325,7 @@ enum OutputParams {
 struct Builder<'a> {
     config: super::Config,
     tuning_config: TuningConfig,
+    worker_thread_regs: u32,
     load_pipeline: Pipeline,
     load_slots_base: Val<Ptr<bf16, Shared>>,
     clc: ClcScheduler,
@@ -342,10 +337,8 @@ struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     pub fn build(&self) {
-        let (aux_thread_regs, worker_thread_regs) = (32, 232);
-
         with_warps(0..4, || {
-            setmaxnreg_dec(aux_thread_regs);
+            setmaxnreg_dec(AUX_THREAD_REGS);
 
             with_warp(0, || {
                 self.clc.emit_scheduler_loop_on_leader_warp();
@@ -355,13 +348,13 @@ impl<'a> Builder<'a> {
                 self.build_tma_loader_warp();
             });
 
-            with_warps(1..4, || {
+            with_warps(2..4, || {
                 self.build_idle_warp();
             });
         });
 
         with_warps(4..4 + self.tuning_config.num_worker_warps, || {
-            setmaxnreg_inc(worker_thread_regs);
+            setmaxnreg_inc(self.worker_thread_regs);
             self.build_worker_warps();
         });
     }
@@ -521,7 +514,7 @@ impl<'a> Builder<'a> {
                                 smem_row_sums_of_squares
                                     .offset(
                                         self.tuning_config.num_worker_warps * reduction_slot_idx
-                                            + warp_id(),
+                                            + (warp_id() - 4),
                                     )
                                     .store(local_sums_of_squares);
                             });
@@ -684,7 +677,33 @@ struct TuningConfig {
     tiles_per_schedule_unit: u32,
 }
 
+/// Register count for the 4 non-worker warps after `setmaxnreg.dec`.
+const AUX_THREAD_REGS: u32 = 32;
+const NUM_AUX_THREADS: u32 = 128;
+
 impl TuningConfig {
+    fn threads_per_block(&self) -> u32 {
+        NUM_AUX_THREADS + self.num_worker_threads
+    }
+
+    /// Launch-time per-thread register limit; register allocation granularity is 8 per thread.
+    fn max_regs_per_thread(&self, arch: &Arch) -> u32 {
+        let regs = reg_bytes_per_sm(arch) as u32
+            / self.occupancy
+            / size_of::<u32>() as u32
+            / self.threads_per_block();
+        regs.min(256) / 8 * 8
+    }
+
+    /// Largest `setmaxnreg.inc` target for worker warps that the CTA's register
+    /// pool can satisfy after the aux warps release down to `AUX_THREAD_REGS`.
+    /// Requesting more than this makes `setmaxnreg.inc` block forever.
+    fn worker_regs_per_thread(&self, arch: &Arch) -> u32 {
+        let pool = self.max_regs_per_thread(arch) * self.threads_per_block();
+        let available = pool - AUX_THREAD_REGS * NUM_AUX_THREADS;
+        (available / self.num_worker_threads).min(256) / 8 * 8
+    }
+
     pub fn decide(config: &super::Config, arch: &Arch) -> Result<Self> {
         let reg_capacity_per_sm = reg_bytes_per_sm(arch);
         let smem_capacity_per_sm = max_smem(arch);

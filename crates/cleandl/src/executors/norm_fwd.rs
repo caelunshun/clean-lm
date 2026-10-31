@@ -238,15 +238,19 @@ impl ResourceKey for ConfigWrapper {
         struct DiskKey {
             config: norm::Config,
             arch: Arch,
+            version: u32,
         }
 
         #[typetag::serde]
         impl DiskCacheKey for DiskKey {}
 
+        const VERSION: u32 = 0;
+
         let kernel: norm::forward::BuiltKernel = cx.disk_cache().get_or_create(
             &DiskKey {
                 config: self.inner,
                 arch: cx.nvvm_arch(),
+                version: VERSION,
             },
             || {
                 NormForwardKernelGenerator
