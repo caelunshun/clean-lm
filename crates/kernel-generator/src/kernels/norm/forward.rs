@@ -17,7 +17,9 @@ use kernel_build_util::{
     ArgBundle, Kernel, LoadedKernelCache, Param, PtrArg,
     nvvm::{Args, KernelBuilder},
 };
-use nvvm_builder::{mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc};
+use nvvm_builder::{
+    mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc, tma::bulk_store,
+};
 use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
 use std::cmp::Ordering;
@@ -125,6 +127,11 @@ impl KernelGenerator for NormForwardKernelGenerator {
 
                 with_leader_of_warp(0, || {
                     builder.load_pipeline.init();
+                    builder.load_slots_base.zero_bulk(
+                        tuning_config.num_smem_staging_slots
+                            * tuning_config.rows_per_tile
+                            * config.max_row_size as u32,
+                    )
                 });
 
                 if tuning_config.cluster_size > 1 {
@@ -385,7 +392,7 @@ impl<'a> Builder<'a> {
                     let dst = View2D {
                         base: self.load_slots_base.offset(
                             stage.index()
-                                * size_of::<bf16>() as u32
+                                * self.tuning_config.rows_per_tile
                                 * self.config.max_row_size as u32,
                         ),
                         inner_len: Val::new(self.config.max_row_size as u32),
@@ -468,19 +475,21 @@ impl<'a> Builder<'a> {
                     let stage = self.load_pipeline.consumer_wait(pipeline_state);
                     let reduction_slot_idx = i % 2;
 
-                    let x = self.layout.load_aligned_unchecked(
-                        View2D {
-                            base: self.load_slots_base.offset(
-                                size_of::<bf16>() as u32
-                                    * stage.index()
-                                    * self.config.max_row_size as u32,
-                            ),
-                            inner_len: Val::new(self.config.max_row_size as u32),
-                            outer_len: Val::new(self.tuning_config.rows_per_tile),
-                            outer_stride: Val::new(self.config.max_row_size as u32),
-                        },
-                        thread_idx,
+                    // Staging slots are only filled up to the actual row size, so
+                    // elements beyond it must be zeroed to not pollute the reduction.
+                    let slot_base = self.load_slots_base.offset(
+                        stage.index()
+                            * self.tuning_config.rows_per_tile
+                            * self.config.max_row_size as u32,
                     );
+                    let x = (0..self.tuning_config.rows_per_tile)
+                        .map(|row_idx| {
+                            self.layout.as_1d().load_aligned_unchecked(
+                                slot_base.offset(row_idx * self.config.max_row_size as u32),
+                                thread_idx,
+                            )
+                        })
+                        .collect::<Vec<_>>();
 
                     let y = match self.config.norm_type {
                         NormType::RmsNorm => {
@@ -534,7 +543,10 @@ impl<'a> Builder<'a> {
                                 );
                             }
 
-                            let r_inv = (global_sums_of_squares + 1e-6f32).rsqrt();
+                            let r_inv = (global_sums_of_squares
+                                * self.args.get(self.params.recip_actual_row_size)
+                                + 1e-6f32)
+                                .rsqrt();
 
                             // Store r_inv
                             if_(thread_idx.eq(0), || {
@@ -775,6 +787,12 @@ pub struct BuiltKernel {
     kernel: Kernel,
     #[serde(skip)]
     loaded: LoadedKernelCache,
+}
+
+impl BuiltKernel {
+    pub fn config(&self) -> &super::Config {
+        &self.config
+    }
 }
 
 impl HasCubin for BuiltKernel {

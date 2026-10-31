@@ -411,8 +411,7 @@ impl ChunkedThreadLayout2D {
                         .total_tensor_cols
                         .div_ceil(format.block_size() as u32);
                     let sf_in_bounds = sf_col.lt(n_sf_cols);
-                    let should_store_sf =
-                        (lane_id() & !((1 << amax_reduction_lanes as u32) - 1)).eq(0);
+                    let should_store_sf = (lane_id() & (amax_reduction_lanes as u32 - 1)).eq(0);
                     if_(sf_in_bounds & should_store_sf, || {
                         let index = block_scale::compute_scale_factor_index(
                             format,
@@ -431,7 +430,7 @@ impl ChunkedThreadLayout2D {
                         base: quantized_vals_view
                             .base
                             .offset(quantized_vals_view.outer_stride * row_idx as u32),
-                        len: quantized_vals_view.outer_len,
+                        len: quantized_vals_view.inner_len,
                     },
                     quantized_vals.unwrap().downcast::<Q>().unwrap(),
                     thread_idx,

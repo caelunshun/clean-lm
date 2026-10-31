@@ -67,7 +67,7 @@ impl<T> Param<T> {
 pub enum ParamAbi {
     /// A single launch argument.
     Scalar,
-    /// A Tile IR array: a pointer, then each dynamic dimension, then
+    /// A Tile IR array. a pointer, then each dynamic dimension, then
     /// each dynamic stride. `None` entries are dynamic.
     Array {
         shape: Vec<Option<i64>>,

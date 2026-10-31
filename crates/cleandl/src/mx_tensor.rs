@@ -139,6 +139,22 @@ impl MxTensor {
         &self.scale_factors
     }
 
+    pub fn scale_factors_mut(&mut self) -> &mut Tensor {
+        &mut self.scale_factors
+    }
+
+    pub fn values_and_scale_factors_mut(&mut self) -> (&mut Tensor, &mut Tensor) {
+        (&mut self.values, &mut self.scale_factors)
+    }
+
+    /// Whether the scale factor tensor contains padding beyond the logical blocks,
+    /// due to the 128x4 tile layout.
+    pub fn has_scale_factor_padding(&self) -> bool {
+        let rows = self.shape[self.dim.non_block_dimension_2d()];
+        let blocks = self.shape[self.dim.block_dimension_2d()].div_ceil(self.format.block_size());
+        !rows.is_multiple_of(128) || !blocks.is_multiple_of(4)
+    }
+
     pub fn format(&self) -> MxFormat {
         self.format
     }

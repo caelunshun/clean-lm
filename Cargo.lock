@@ -2449,6 +2449,7 @@ dependencies = [
  "half",
  "nvvm-ir",
  "nvvm-sys",
+ "serde",
  "skycuda",
  "thiserror 2.0.21",
 ]
@@ -2470,6 +2471,7 @@ name = "nvvm-sys"
 version = "0.1.0"
 dependencies = [
  "libloading 0.9.0",
+ "serde",
  "thiserror 2.0.21",
 ]
 

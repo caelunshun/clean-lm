@@ -75,7 +75,7 @@ pub fn compute_scale_factor_index(
     col: Val<u32>,
     ncols: Val<u32>,
 ) -> Val<u32> {
-    ((row / 128) * ncols + (col / 4)) * 128 * 4
+    ((row / 128) * ncols.div_ceil(4) + (col / 4)) * 128 * 4
         + (row % 32) * 16
         + ((row % 128) / 32) * 4
         + (col % 4)

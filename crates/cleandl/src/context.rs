@@ -1,5 +1,6 @@
 use crate::disk_cache::DiskCache;
 use bytemuck::Pod;
+use kernel_generator::Arch;
 use parking_lot::ReentrantMutex;
 use serde::Serialize;
 use skycuda::{
@@ -154,6 +155,24 @@ impl Context {
 
     pub fn cublaslt(&self) -> &CublasLtHandle {
         &self.0.cublaslt
+    }
+
+    pub fn nvvm_arch(&self) -> Arch {
+        match (
+            self.cuda().compute_capability_major(),
+            self.cuda().compute_capability_minor(),
+        ) {
+            (8, 0) | (8, 6) => Arch::Compute80,
+            (8, 7) => Arch::Compute87,
+            (8, 9) => Arch::Compute89,
+            (9, 0) => Arch::Compute90a,
+            (10, 0) => Arch::Compute100a,
+            (10, 3) => Arch::Compute103a,
+            (11, 0) => Arch::Compute110a,
+            (12, 0) => Arch::Compute120a,
+            (12, 1) => Arch::Compute121a,
+            (maj, min) => Arch::Other(format!("compute_{}", maj * 10 + min)),
+        }
     }
 }
 

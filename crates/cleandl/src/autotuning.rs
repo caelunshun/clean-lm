@@ -10,7 +10,7 @@ pub fn measure_kernel(
     cx: &Context,
 ) -> anyhow::Result<Duration> {
     const MIN_WARMUP_DURATION: Duration = Duration::from_millis(250);
-    const MIN_MEASURE_DURATION: Duration = Duration::from_millis(150);
+    const MIN_MEASURE_DURATION: Duration = Duration::from_millis(500);
     const ESTIMATE_MEASUREMENTS: u32 = 5;
 
     let stream = cx.default_compute_stream();
