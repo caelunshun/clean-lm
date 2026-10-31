@@ -590,6 +590,7 @@ dependencies = [
  "float4",
  "float8",
  "half",
+ "kernel-build-util",
  "kernel-generator",
  "parking_lot",
  "postcard",
@@ -601,7 +602,6 @@ dependencies = [
  "serde_json",
  "skycuda",
  "skycuda-cublaslt",
- "skycuda-cudnn",
  "skytens-core",
  "thread_local",
  "tracing",
@@ -3565,23 +3565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "skycuda-cudnn"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "skycuda",
- "skycuda-cudnn-sys",
-]
-
-[[package]]
-name = "skycuda-cudnn-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "cc",
-]
-
-[[package]]
 name = "skytens-core"
 version = "0.1.0"
 source = "git+https://github.com/caelunshun/skykern#8dacc2289f51f1afe52c6d57e081e774e77f162d"
@@ -4712,3 +4695,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "skycuda-cudnn"
+version = "0.1.0"

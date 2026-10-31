@@ -11,7 +11,6 @@ rand_xoshiro = "0.8"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 skycuda = { git = "https://github.com/caelunshun/skycuda" }
-skycuda-cudnn = { git = "https://github.com/caelunshun/skycuda" }
 skycuda-cublaslt = { git = "https://github.com/caelunshun/skycuda" }
 skytens-core = { git = "https://github.com/caelunshun/skykern" }
 rayon = "1"
@@ -27,6 +26,7 @@ typetag = "0.2"
 tracing = "0.1"
 bumpalo = "3.20"
 kernel-generator = { path = "../kernel-generator" }
+kernel-build-util = { path = "../kernel-build-util" }
 float8 = { version = "0.7.0", features = ["bytemuck"] }
 float4 = "0.2.0"
 

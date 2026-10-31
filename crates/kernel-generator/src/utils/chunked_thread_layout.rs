@@ -8,7 +8,7 @@ use nvvm_builder::{
     ValueType, Var, Vector, bf16, cluster_block_rank,
     cp_async::{self, CopyOpts},
     fence_sync_restrict_acquire, fence_sync_restrict_release, if_, if_else, lane_id, mbarrier,
-    shfl_sync_bfly, tma, vote_all, vote_any, with_leader_of_warp,
+    shfl_sync_bfly, tma, vote_any, with_leader_of_warp,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -28,7 +28,7 @@ impl ChunkedThreadLayout1D {
         let chunk_size = (0..=(1 << elements_per_thread.ilog2()).min(Self::MAX_CHUNK_SIZE))
             .rev()
             .find(|x| elements_per_thread.is_multiple_of(*x as usize))
-            .unwrap() as usize;
+            .unwrap();
 
         Self {
             chunk_size,

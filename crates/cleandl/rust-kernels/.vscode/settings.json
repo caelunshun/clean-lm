@@ -1,8 +1,0 @@
-{
-    "rust-analyzer.cargo.target": "nvptx64-nvidia-cuda",
-    "rust-analyzer.cargo.extraEnv": {
-        "RUSTFLAGS": "-C target-cpu=sm_100a -C target-feature=+ptx93"
-    },
-    "rust-analyzer.cargo.allTargets": false,
-    "rust-analyzer.server.path": "/home/caelunshun/dev/rust-nvptx/src/tools/rust-analyzer/target/release/rust-analyzer"
-}

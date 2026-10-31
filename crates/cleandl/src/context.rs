@@ -11,14 +11,13 @@ use skycuda::{
     stream::Stream,
 };
 use skycuda_cublaslt::CublasLtHandle;
-use skycuda_cudnn::CudnnHandle;
+// use skycuda_cudnn::CudnnHandle;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex},
 };
-use thread_local::ThreadLocal;
 
 #[derive(Debug, Clone)]
 pub struct Context(Arc<Inner>);
@@ -44,8 +43,8 @@ impl Context {
             memset_stream: cuda.create_stream()?,
             cuda,
             resource_cache: ReentrantMutex::new(RefCell::new(HashMap::new())),
-            default_cudnn_contexts: ThreadLocal::new(),
-            stream_cudnn_contexts: PerStreamResource::new(),
+            // default_cudnn_contexts: ThreadLocal::new(),
+            // stream_cudnn_contexts: PerStreamResource::new(),
             device_memory_pool,
             host_pinned_memory_pool,
             disk_cache: DiskCache::new()?,
@@ -130,20 +129,20 @@ impl Context {
         Ok(resource)
     }
 
-    /// cuDNN handle bound to the default compute stream, for graph construction.
-    pub fn cudnn(&self) -> anyhow::Result<&CudnnHandle> {
-        self.0
-            .default_cudnn_contexts
-            .get_or_try(|| CudnnHandle::new(&self.0.default_compute_stream))
-            .map_err(From::from)
-    }
+    // /// cuDNN handle bound to the default compute stream, for graph construction.
+    // pub fn cudnn(&self) -> anyhow::Result<&CudnnHandle> {
+    //     self.0
+    //         .default_cudnn_contexts
+    //         .get_or_try(|| CudnnHandle::new(&self.0.default_compute_stream))
+    //         .map_err(From::from)
+    // }
 
-    /// cuDNN handle bound to the given stream, for graph execution.
-    pub fn cudnn_on(&self, stream: &Stream) -> anyhow::Result<Arc<CudnnHandle>> {
-        self.0
-            .stream_cudnn_contexts
-            .get_or_create(stream, || CudnnHandle::new(stream).map_err(From::from))
-    }
+    // /// cuDNN handle bound to the given stream, for graph execution.
+    // pub fn cudnn_on(&self, stream: &Stream) -> anyhow::Result<Arc<CudnnHandle>> {
+    //     self.0
+    //         .stream_cudnn_contexts
+    //         .get_or_create(stream, || CudnnHandle::new(stream).map_err(From::from))
+    // }
 
     pub fn disk_cache(&self) -> &DiskCache {
         &self.0.disk_cache
@@ -170,8 +169,8 @@ struct Inner {
     h2d_copy_stream: Stream,
     d2h_copy_stream: Stream,
     memset_stream: Stream,
-    default_cudnn_contexts: ThreadLocal<CudnnHandle>,
-    stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
+    // default_cudnn_contexts: ThreadLocal<CudnnHandle>,
+    // stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
     disk_cache: DiskCache,
     enable_autotuning: bool,
