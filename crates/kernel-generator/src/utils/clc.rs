@@ -82,13 +82,12 @@ impl ClcScheduler {
                     .response_bufs
                     .offset(CLC_RESPONSE_WORDS as u32 * slot_idx);
                 let produced_bar = self.response_produced_bars.get(slot_idx);
-
-                if_(is_leader_cta, || {
-                    with_leader(|| {
-                        produced_bar
-                            .cluster()
-                            .relaxed()
-                            .arrive_expect_tx((CLC_RESPONSE_WORDS * size_of::<u32>()) as u32);
+                with_leader(|| {
+                    produced_bar
+                        .cluster()
+                        .relaxed()
+                        .arrive_expect_tx((CLC_RESPONSE_WORDS * size_of::<u32>()) as u32);
+                    if_(is_leader_cta, || {
                         clc::ResponseBuf::at(response_buf).try_cancel_multicast(produced_bar);
                     });
                 });

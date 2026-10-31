@@ -55,7 +55,11 @@ impl BlockScaledFormat {
             BlockScaledFormat::Nvfp4 => {
                 let scales = scales.downcast::<F8E4M3>().unwrap();
 
-                let descales = scales.convert::<bf16>(ConvertOpts::default()).rcp_approx();
+                let scales = scales.convert::<bf16>(ConvertOpts::default());
+                let descales = scales.eq(0.0f32).select(
+                    Val::<Vector<bf16>>::zero_shaped(scales.lanes()),
+                    scales.rcp_approx(),
+                );
 
                 (vals * descales)
                     .convert::<F4E2M1>(ConvertOpts::default().rounding(Rounding::Rn).satfinite())
@@ -68,7 +72,7 @@ impl BlockScaledFormat {
 /// Computes the index within the scale factors tensor of the given block coordinate
 /// (row, col) [here assumes rowwise block scales; input coordinates need swapped if colwise].
 pub fn compute_scale_factor_index(
-    format: BlockScaledFormat,
+    _format: BlockScaledFormat,
     row: Val<u32>,
     col: Val<u32>,
     ncols: Val<u32>,

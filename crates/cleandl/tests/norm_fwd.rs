@@ -7,10 +7,11 @@ use cleandl::{
         Executor,
         norm_fwd::{Args, NormFwdExecutor, Output},
     },
+    mx_tensor::{MxDim, MxFormat, MxTensor},
     tensor::Tensor,
 };
 use common::{
-    abs_rel_tolerance, assert_all_close, bf16_to_f32, dequantize_mxfp8, download,
+    DequantizedMx, abs_rel_tolerance, assert_all_close, bf16_to_f32, dequantize_mx, download,
     download_bf16_as_f32, random_bf16_tensor, random_bf16_vec, random_vec, seeded_rng,
     test_context,
 };
@@ -29,7 +30,16 @@ const SHAPES: &[&[usize]] = &[
     &[200, 2048],
     &[129, 4096],
     &[64, 8192],
-    &[131072, 2048],
+];
+
+/// Input shapes for colwise outputs, whose row counts must be multiples of 32.
+const COLWISE_SHAPES: &[&[usize]] = &[
+    &[32, 128],
+    &[2, 16, 256],
+    &[96, 1056],
+    &[256, 2048],
+    &[4096, 2048],
+    &[128, 4096],
 ];
 
 /// (has_scale, has_bias) combinations to test.
@@ -96,8 +106,8 @@ impl Case {
     }
 }
 
-fn for_each_case(mut f: impl FnMut(&Case) -> anyhow::Result<()>) {
-    for shape in SHAPES {
+fn for_each_case(shapes: &[&[usize]], mut f: impl FnMut(&Case) -> anyhow::Result<()>) {
+    for shape in shapes {
         for &(has_scale, has_bias) in AFFINE_VARIANTS {
             let case = Case {
                 shape: Shape::new(shape.iter().copied()),
@@ -192,7 +202,7 @@ fn check_r_inv(
 #[test]
 fn rms_norm_bf16_matches_reference() {
     let cx = test_context();
-    for_each_case(|case| {
+    for_each_case(SHAPES, |case| {
         let (output, reference) = run_case(case, OutputTypes::Bf16, &cx)?;
         let y = output.y_bf16.as_ref().expect("bf16 output");
         assert_eq!(y.shape(), case.shape);
@@ -209,54 +219,176 @@ fn rms_norm_bf16_matches_reference() {
     });
 }
 
+/// Finds a block whose scale factor violates `scale_ok(amax, scale)`, where `amax` is
+/// computed from the unquantized values. Blocks of all zeros are skipped.
+fn find_bad_block(
+    dequantized: &DequantizedMx,
+    expected: &[f32],
+    dim: MxDim,
+    block_size: usize,
+    scale_ok: impl Fn(f32, f32) -> bool + Sync,
+) -> Option<String> {
+    let (rows, cols) = (dequantized.rows, dequantized.cols);
+    let (block_rows, block_cols) = match dim {
+        MxDim::Rowwise => (1, block_size),
+        MxDim::Colwise => (block_size, 1),
+    };
+    (0..rows / block_rows)
+        .into_par_iter()
+        .find_map_first(|block_row| {
+            (0..cols / block_cols).find_map(|block_col| {
+                let (r0, c0) = (block_row * block_rows, block_col * block_cols);
+                let amax = (r0..r0 + block_rows)
+                    .flat_map(|r| (c0..c0 + block_cols).map(move |c| r * cols + c))
+                    .fold(0.0f32, |m, i| m.max(expected[i].abs()));
+                let scale = dequantized.element_scales[r0 * cols + c0];
+                (amax != 0.0 && !scale_ok(amax, scale)).then(|| {
+                    format!(
+                        "block at ({r0}, {c0}) has scale {scale}, which is invalid for amax {amax}"
+                    )
+                })
+            })
+        })
+}
+
+fn check_mxfp8(
+    label: &str,
+    y: &MxTensor,
+    reference: &Reference,
+    cx: &Context,
+) -> anyhow::Result<()> {
+    assert_eq!(y.format(), MxFormat::Mxfp8);
+    let dequantized = dequantize_mx(y, cx)?;
+    let expected = bf16_to_f32(&reference.y);
+
+    // E4M3 has 3 mantissa bits (relative rounding error <= 2^-4), plus one bf16 ulp of
+    // difference in the unquantized value; subnormal steps are 2^-9 times the block scale.
+    assert_all_close(
+        &format!("{label} (dequantized)"),
+        &dequantized.values,
+        &expected,
+        |i, e| {
+            e.abs() * (2f32.powi(-4) + 2f32.powi(-7))
+                + dequantized.element_scales[i] * 2f32.powi(-9)
+        },
+    );
+
+    // Each block's scale must avoid saturation (scale >= amax / 448) without
+    // wasting range (scale < 2 * amax / 448). Allow slack for bf16 rounding.
+    let bad_block = find_bad_block(&dequantized, &expected, y.mx_dim(), 32, |amax, scale| {
+        let ideal = amax / 448.0;
+        scale >= ideal * 0.98 && scale < ideal * 2.0 * 1.02
+    });
+    if let Some(message) = bad_block {
+        panic!("{label}: {message}");
+    }
+    Ok(())
+}
+
+fn check_nvfp4(
+    label: &str,
+    y: &MxTensor,
+    reference: &Reference,
+    cx: &Context,
+) -> anyhow::Result<()> {
+    assert_eq!(y.format(), MxFormat::Nvfp4);
+    let dequantized = dequantize_mx(y, cx)?;
+    let expected = bf16_to_f32(&reference.y);
+
+    // E2M1 rounding error is at most half a step: 0.25 below 2, 0.5 in [2, 4) and 1 in
+    // [4, 6] (in units of the block scale), bounded by |x| / 4 + scale / 4. This also covers
+    // clipping at 6 when the E4M3 scale rounds down (|x| / scale <= 6 / (1 - 2^-4)).
+    assert_all_close(
+        &format!("{label} (dequantized)"),
+        &dequantized.values,
+        &expected,
+        |i, e| e.abs() * (2f32.powi(-2) + 2f32.powi(-7)) + dequantized.element_scales[i] * 0.25,
+    );
+
+    // Each block's scale must be amax / 6, rounded to E4M3 (relative error <= 2^-4, or half
+    // a subnormal step of 2^-9). Allow slack for bf16 rounding.
+    let bad_block = find_bad_block(
+        &dequantized,
+        &expected,
+        MxDim::Rowwise,
+        16,
+        |amax, scale| {
+            let ideal = amax / 6.0;
+            (scale - ideal).abs() <= ideal * (2f32.powi(-4) + 2f32.powi(-6)) + 2f32.powi(-10)
+        },
+    );
+    if let Some(message) = bad_block {
+        panic!("{label}: {message}");
+    }
+    Ok(())
+}
+
 #[test]
 fn rms_norm_mxfp8_rowwise_matches_reference() {
     let cx = test_context();
-    for_each_case(|case| {
+    for_each_case(SHAPES, |case| {
         let (output, reference) = run_case(case, OutputTypes::Mxfp8Rowwise, &cx)?;
-        assert!(output.y_bf16.is_none() && output.y_mxfp8_colwise.is_none());
+        assert!(
+            output.y_bf16.is_none()
+                && output.y_mxfp8_colwise.is_none()
+                && output.y_nvfp4_rowwise.is_none()
+        );
         let y = output
             .y_mxfp8_rowwise
             .as_ref()
             .expect("mxfp8 rowwise output");
         assert_eq!(y.shape(), Shape::from([case.num_rows(), case.row_size()]));
+        assert_eq!(y.mx_dim(), MxDim::Rowwise);
+        check_mxfp8(&format!("{} y", case.label()), y, &reference, &cx)?;
+        check_r_inv(case, &output, &reference, &cx)
+    });
+}
 
-        let dequantized = dequantize_mxfp8(y, &cx)?;
-        let expected = bf16_to_f32(&reference.y);
+#[test]
+fn rms_norm_mxfp8_rowwise_and_colwise_matches_reference() {
+    let cx = test_context();
+    for_each_case(COLWISE_SHAPES, |case| {
+        let (output, reference) = run_case(case, OutputTypes::Mxfp8RowwiseAndColwise, &cx)?;
+        assert!(output.y_bf16.is_none() && output.y_nvfp4_rowwise.is_none());
+        let shape = Shape::from([case.num_rows(), case.row_size()]);
 
-        // E4M3 has 3 mantissa bits (relative rounding error <= 2^-4), plus one bf16 ulp of
-        // difference in the unquantized value; subnormal steps are 2^-9 times the block scale.
-        assert_all_close(
-            &format!("{} y (dequantized)", case.label()),
-            &dequantized.values,
-            &expected,
-            |i, e| {
-                e.abs() * (2f32.powi(-4) + 2f32.powi(-7))
-                    + dequantized.element_scales[i] * 2f32.powi(-9)
-            },
+        let y_row = output
+            .y_mxfp8_rowwise
+            .as_ref()
+            .expect("mxfp8 rowwise output");
+        assert_eq!(y_row.shape(), shape);
+        assert_eq!(y_row.mx_dim(), MxDim::Rowwise);
+        check_mxfp8(&format!("{} y_row", case.label()), y_row, &reference, &cx)?;
+
+        let y_col = output
+            .y_mxfp8_colwise
+            .as_ref()
+            .expect("mxfp8 colwise output");
+        assert_eq!(y_col.shape(), shape);
+        assert_eq!(y_col.mx_dim(), MxDim::Colwise);
+        check_mxfp8(&format!("{} y_col", case.label()), y_col, &reference, &cx)?;
+
+        check_r_inv(case, &output, &reference, &cx)
+    });
+}
+
+#[test]
+fn rms_norm_nvfp4_rowwise_matches_reference() {
+    let cx = test_context();
+    for_each_case(SHAPES, |case| {
+        let (output, reference) = run_case(case, OutputTypes::Nvfp4Rowwise, &cx)?;
+        assert!(
+            output.y_bf16.is_none()
+                && output.y_mxfp8_rowwise.is_none()
+                && output.y_mxfp8_colwise.is_none()
         );
-
-        // Each block's scale must avoid saturation (scale >= amax / 448) without
-        // wasting range (scale < 2 * amax / 448). Allow slack for bf16 rounding.
-        let block_size = 32;
-        let bad_block = expected
-            .par_chunks_exact(block_size)
-            .enumerate()
-            .find_map_first(|(block_idx, block)| {
-                let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-                let scale = dequantized.element_scales[block_idx * block_size];
-                let ideal = amax / 448.0;
-                (amax != 0.0 && !(scale >= ideal * 0.98 && scale < ideal * 2.0 * 1.02)).then(|| {
-                    format!(
-                        "block {block_idx} has scale {scale}, but amax {amax} implies [{ideal}, {})",
-                        ideal * 2.0
-                    )
-                })
-            });
-        if let Some(message) = bad_block {
-            panic!("{}: {message}", case.label());
-        }
-
+        let y = output
+            .y_nvfp4_rowwise
+            .as_ref()
+            .expect("nvfp4 rowwise output");
+        assert_eq!(y.shape(), Shape::from([case.num_rows(), case.row_size()]));
+        assert_eq!(y.mx_dim(), MxDim::Rowwise);
+        check_nvfp4(&format!("{} y", case.label()), y, &reference, &cx)?;
         check_r_inv(case, &output, &reference, &cx)
     });
 }

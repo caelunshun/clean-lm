@@ -118,7 +118,18 @@ pub fn decode_ue8m0(bits: u8) -> f32 {
     }
 }
 
-/// Host copy of a dequantized 2D MXFP8 tensor.
+/// Decodes an FP4 E2M1 value from the low 4 bits of `bits`.
+pub fn decode_e2m1(bits: u8) -> f32 {
+    const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let magnitude = MAGNITUDES[(bits & 0x7) as usize];
+    if bits & 0x8 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Host copy of a dequantized 2D block-scaled tensor.
 pub struct DequantizedMx {
     pub rows: usize,
     pub cols: usize,
@@ -128,13 +139,24 @@ pub struct DequantizedMx {
     pub element_scales: Vec<f32>,
 }
 
-pub fn dequantize_mxfp8(tensor: &MxTensor, cx: &Context) -> anyhow::Result<DequantizedMx> {
-    anyhow::ensure!(tensor.format() == MxFormat::Mxfp8);
+/// Dequantizes an MXFP8 or NVFP4 tensor. NVFP4 values are packed two per byte,
+/// with the lower-indexed element in the low nibble; no global scale is applied.
+pub fn dequantize_mx(tensor: &MxTensor, cx: &Context) -> anyhow::Result<DequantizedMx> {
     let (rows, cols) = (tensor.shape()[0], tensor.shape()[1]);
-    let block_size = tensor.format().block_size();
+    let format = tensor.format();
+    let block_size = format.block_size();
 
     let values = download_bytes(tensor.values(), cx)?;
     let scale_factors = download_bytes(tensor.scale_factors(), cx)?;
+
+    let decode_value = |idx: usize| match format {
+        MxFormat::Mxfp8 => F8E4M3::from_bits(values[idx]).to_f32(),
+        MxFormat::Nvfp4 => decode_e2m1(values[idx / 2] >> (4 * (idx % 2))),
+    };
+    let decode_scale = |bits: u8| match format {
+        MxFormat::Mxfp8 => decode_ue8m0(bits),
+        MxFormat::Nvfp4 => F8E4M3::from_bits(bits).to_f32(),
+    };
 
     let mut out = DequantizedMx {
         rows,
@@ -159,8 +181,8 @@ pub fn dequantize_mxfp8(tensor: &MxTensor, cx: &Context) -> anyhow::Result<Dequa
                         mx_scale_factor_index(c, r / block_size, rows.div_ceil(block_size)),
                     ),
                 };
-                let scale = decode_ue8m0(scale_factors[sf_idx]);
-                values_row[c] = F8E4M3::from_bits(values[value_idx]).to_f32() * scale;
+                let scale = decode_scale(scale_factors[sf_idx]);
+                values_row[c] = decode_value(value_idx) * scale;
                 scales_row[c] = scale;
             }
         });

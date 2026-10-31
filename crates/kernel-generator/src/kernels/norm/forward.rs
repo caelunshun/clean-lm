@@ -17,7 +17,9 @@ use kernel_build_util::{
     ArgBundle, Kernel, LoadedKernelCache, Param, PtrArg,
     nvvm::{Args, KernelBuilder},
 };
-use nvvm_builder::{mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc};
+use nvvm_builder::{
+    Scalar, ValueType, mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc,
+};
 use serde::{Deserialize, Serialize};
 use skycuda::stream::Stream;
 use std::cmp::Ordering;
@@ -30,7 +32,12 @@ impl KernelGenerator for NormForwardKernelGenerator {
     type BuiltKernel = BuiltKernel;
 
     fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
-        config.max_row_size = config.max_row_size.next_power_of_two().max(128);
+        // NVFP4 values are packed in pairs, so each thread must hold at least two elements.
+        let min_row_size = match config.output_types {
+            OutputTypes::Nvfp4Rowwise => 256,
+            _ => 128,
+        };
+        config.max_row_size = config.max_row_size.next_power_of_two().max(min_row_size);
 
         if config.max_row_size > MAX_SUPPORTED_ROW_SIZE {
             return Err(Error::Unsupported("row size > 8192"));
@@ -135,6 +142,10 @@ impl KernelGenerator for NormForwardKernelGenerator {
                 }
 
                 builder.build();
+
+                if tuning_config.cluster_size > 1 {
+                    cluster_sync();
+                }
             },
         );
 
@@ -171,6 +182,27 @@ impl KernelGenerator for NormForwardKernelGenerator {
         assert!(args.row_size > 0, "row size must be nonzero");
         if args.num_rows == 0 {
             return Ok(());
+        }
+        match config.output_types {
+            OutputTypes::Bf16 => {}
+            OutputTypes::Mxfp8Rowwise => assert!(
+                args.row_size
+                    .is_multiple_of(BlockScaledFormat::Mxfp8.block_size() as u32),
+                "MXFP8 output requires the row size to be a multiple of the block size"
+            ),
+            OutputTypes::Mxfp8RowwiseAndColwise => assert!(
+                args.row_size
+                    .is_multiple_of(BlockScaledFormat::Mxfp8.block_size() as u32)
+                    && args
+                        .num_rows
+                        .is_multiple_of(BlockScaledFormat::Mxfp8.block_size() as u32),
+                "MXFP8 rowwise and colwise output requires the row size and row count to be multiples of the block size"
+            ),
+            OutputTypes::Nvfp4Rowwise => assert!(
+                args.row_size
+                    .is_multiple_of(BlockScaledFormat::Nvfp4.block_size() as u32),
+                "NVFP4 output requires the row size to be a multiple of the block size"
+            ),
         }
 
         let mut bundle = ArgBundle::new();
@@ -236,10 +268,12 @@ impl KernelGenerator for NormForwardKernelGenerator {
             _ => panic!("output buffers do not match config.output_types"),
         }
 
-        let num_tiles = args.num_rows.div_ceil(tuning_config.rows_per_tile);
-        let num_schedule_units = num_tiles.div_ceil(tuning_config.tiles_per_schedule_unit);
-        let grid_x =
-            num_schedule_units.div_ceil(tuning_config.cluster_size) * tuning_config.cluster_size;
+        let num_cluster_tiles = args
+            .num_rows
+            .div_ceil(tuning_config.rows_per_cluster_tile());
+        let num_cluster_schedule_units =
+            num_cluster_tiles.div_ceil(tuning_config.tiles_per_schedule_unit);
+        let grid_x = num_cluster_schedule_units * tuning_config.cluster_size;
 
         unsafe {
             let loaded = kernel.loaded.get_or_load(&kernel.kernel, stream.device())?;
@@ -251,7 +285,12 @@ impl KernelGenerator for NormForwardKernelGenerator {
 }
 
 /// Arguments for [`NormForwardKernelGenerator`]. Tensors are row-major
-/// with `row_stride` elements between rows.
+/// with `row_stride` elements between rows, except for colwise outputs, which
+/// are column-major with `num_rows` elements between columns.
+///
+/// Block-scaled outputs require the row size to be a multiple of the block size;
+/// colwise outputs additionally require this of the row count. NVFP4 outputs
+/// are quantized without a global (per-tensor) scale.
 pub struct ExecArgs<'a> {
     pub x: PtrArg<'a, bf16>,
     pub num_rows: u32,
@@ -359,6 +398,23 @@ impl<'a> Builder<'a> {
         });
     }
 
+    fn cluster_tile_idx(
+        &self,
+        schedule_unit: Val<u32>,
+        tile_in_schedule_unit: Val<u32>,
+    ) -> Val<u32> {
+        (schedule_unit / self.tuning_config.cluster_size)
+            * self.tuning_config.tiles_per_schedule_unit
+            + tile_in_schedule_unit
+    }
+
+    /// Index of the CTA-local tile processed in the given iteration.
+    fn tile_idx(&self, schedule_unit: Val<u32>, tile_in_schedule_unit: Val<u32>) -> Val<u32> {
+        self.cluster_tile_idx(schedule_unit, tile_in_schedule_unit)
+            * self.tuning_config.cluster_size
+            + schedule_unit % self.tuning_config.cluster_size
+    }
+
     fn build_idle_warp(&self) {
         loop_(|l| {
             let (has_next, _, _, _) = self.clc.get_next_block_idx();
@@ -375,10 +431,12 @@ impl<'a> Builder<'a> {
 
         loop_(|l| {
             for_range(
-                current_schedule_unit * self.tuning_config.tiles_per_schedule_unit,
-                (current_schedule_unit + 1) * self.tuning_config.tiles_per_schedule_unit,
-                |tile| {
-                    let first_row_in_tile = tile * self.tuning_config.rows_per_tile;
+                0,
+                self.tuning_config.tiles_per_schedule_unit,
+                |tile_in_schedule_unit| {
+                    let first_row_in_tile = self
+                        .tile_idx(current_schedule_unit.into_val(), tile_in_schedule_unit)
+                        * self.tuning_config.rows_per_tile;
 
                     let stage = self.load_pipeline.producer_acquire(pipeline_state);
 
@@ -461,10 +519,16 @@ impl<'a> Builder<'a> {
 
         loop_(|l| {
             for_range(
-                current_schedule_unit * self.tuning_config.tiles_per_schedule_unit,
-                (current_schedule_unit + 1) * self.tuning_config.tiles_per_schedule_unit,
-                |tile| {
-                    let first_row_in_tile = tile * self.tuning_config.rows_per_tile;
+                0,
+                self.tuning_config.tiles_per_schedule_unit,
+                |tile_in_schedule_unit| {
+                    let cluster_tile = self
+                        .cluster_tile_idx(current_schedule_unit.into_val(), tile_in_schedule_unit);
+                    let first_row_in_cluster_tile =
+                        cluster_tile * self.tuning_config.rows_per_cluster_tile();
+                    let first_row_in_tile = self
+                        .tile_idx(current_schedule_unit.into_val(), tile_in_schedule_unit)
+                        * self.tuning_config.rows_per_tile;
                     let stage = self.load_pipeline.consumer_wait(pipeline_state);
                     let reduction_slot_idx = i % 2;
 
@@ -604,46 +668,83 @@ impl<'a> Builder<'a> {
                                 thread_idx,
                             );
                         }
-                        OutputParams::Mxfp8Rowwise { y_row, y_row_sf }
-                        | OutputParams::Mxfp8RowwiseAndColwise {
-                            y_row, y_row_sf, ..
-                        } => {
-                            self.layout
-                                .store_aligned_rowwise_block_scaled::<F8E4M3, UE8M0>(
-                                    BlockScaledFormat::Mxfp8,
-                                    View2D::<_, Global> {
-                                        base: self.args.get(y_row).offset(
-                                            first_row_in_tile
-                                                * self.args.get(self.params.row_stride),
-                                        ),
-                                        inner_len: self.args.get(self.params.actual_row_size),
-                                        outer_len: valid_rows_in_tile,
-                                        outer_stride: self.args.get(self.params.row_stride),
-                                    },
-                                    ViewPosWithinTensor2D {
-                                        row_offset: first_row_in_tile,
-                                        col_offset: Val::new(0),
-                                        total_tensor_rows: self.args.get(self.params.num_rows),
-                                        total_tensor_cols: self
-                                            .args
-                                            .get(self.params.actual_row_size),
-                                    },
-                                    self.args.get(y_row_sf),
-                                    &y,
-                                    thread_idx,
-                                );
-
-                            if self.config.output_types == OutputTypes::Mxfp8RowwiseAndColwise {
-                                let (resharded_layout, resharded_vals) =
-                                    match resharding_in_progress {
-                                        Some(reshard) => reshard.finish_resharding(),
-                                        None => (self.layout, y),
-                                    };
-
-                                todo!()
-                            }
+                        OutputParams::Mxfp8Rowwise { y_row, y_row_sf } => {
+                            self.store_rowwise_block_scaled(
+                                BlockScaledFormat::Mxfp8,
+                                y_row,
+                                y_row_sf,
+                                first_row_in_tile,
+                                valid_rows_in_tile,
+                                &y,
+                                thread_idx,
+                            );
                         }
-                        OutputParams::Nvfp4Rowwise { .. } => todo!(),
+                        OutputParams::Mxfp8RowwiseAndColwise {
+                            y_row,
+                            y_row_sf,
+                            y_col,
+                            y_col_sf,
+                        } => {
+                            self.store_rowwise_block_scaled(
+                                BlockScaledFormat::Mxfp8,
+                                y_row,
+                                y_row_sf,
+                                first_row_in_tile,
+                                valid_rows_in_tile,
+                                &y,
+                                thread_idx,
+                            );
+
+                            let (resharded_layout, resharded_vals) = match resharding_in_progress {
+                                Some(reshard) => reshard.finish_resharding(),
+                                None => (self.layout, y),
+                            };
+
+                            // After resharding, each CTA holds all rows of the cluster tile
+                            // for a contiguous range of columns.
+                            let cols_per_cta = resharded_layout.num_elements_per_row() as u32;
+                            let first_col = if self.tuning_config.cluster_size > 1 {
+                                cluster_block_rank() * cols_per_cta
+                            } else {
+                                Val::new(0)
+                            };
+                            let num_rows = self.args.get(self.params.num_rows);
+                            let row_size = self.args.get(self.params.actual_row_size);
+                            resharded_layout.store_aligned_colwise_block_scaled::<F8E4M3, UE8M0>(
+                                BlockScaledFormat::Mxfp8,
+                                View2D::<_, Global> {
+                                    base: self
+                                        .args
+                                        .get(y_col)
+                                        .offset(first_col * num_rows + first_row_in_cluster_tile),
+                                    inner_len: num_rows
+                                        .saturating_sub(first_row_in_cluster_tile)
+                                        .min(self.tuning_config.rows_per_cluster_tile()),
+                                    outer_len: row_size.saturating_sub(first_col).min(cols_per_cta),
+                                    outer_stride: num_rows,
+                                },
+                                ViewPosWithinTensor2D {
+                                    row_offset: first_row_in_cluster_tile,
+                                    col_offset: first_col,
+                                    total_tensor_rows: num_rows,
+                                    total_tensor_cols: row_size,
+                                },
+                                self.args.get(y_col_sf),
+                                &resharded_vals,
+                                thread_idx,
+                            );
+                        }
+                        OutputParams::Nvfp4Rowwise { y_row, y_row_sf } => {
+                            self.store_rowwise_block_scaled(
+                                BlockScaledFormat::Nvfp4,
+                                y_row,
+                                y_row_sf,
+                                first_row_in_tile,
+                                valid_rows_in_tile,
+                                &y,
+                                thread_idx,
+                            );
+                        }
                     }
 
                     stage.release();
@@ -666,6 +767,41 @@ impl<'a> Builder<'a> {
     }
 }
 
+impl Builder<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn store_rowwise_block_scaled<Q: ValueType + Scalar, SF: ValueType + Scalar>(
+        &self,
+        format: BlockScaledFormat,
+        y_row: Param<Ptr<Q, Global>>,
+        y_row_sf: Param<Ptr<SF, Global>>,
+        first_row_in_tile: Val<u32>,
+        valid_rows_in_tile: Val<u32>,
+        y: &[Val<Vector<bf16>>],
+        thread_idx: Val<u32>,
+    ) {
+        let row_stride = self.args.get(self.params.row_stride);
+        let row_size = self.args.get(self.params.actual_row_size);
+        self.layout.store_aligned_rowwise_block_scaled::<Q, SF>(
+            format,
+            View2D::<_, Global> {
+                base: self.args.get(y_row).offset(first_row_in_tile * row_stride),
+                inner_len: row_size,
+                outer_len: valid_rows_in_tile,
+                outer_stride: row_stride,
+            },
+            ViewPosWithinTensor2D {
+                row_offset: first_row_in_tile,
+                col_offset: Val::new(0),
+                total_tensor_rows: self.args.get(self.params.num_rows),
+                total_tensor_cols: row_size,
+            },
+            self.args.get(y_row_sf),
+            y,
+            thread_idx,
+        );
+    }
+}
+
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 struct TuningConfig {
     occupancy: u32,
@@ -684,6 +820,10 @@ const NUM_AUX_THREADS: u32 = 128;
 impl TuningConfig {
     fn threads_per_block(&self) -> u32 {
         NUM_AUX_THREADS + self.num_worker_threads
+    }
+
+    fn rows_per_cluster_tile(&self) -> u32 {
+        self.rows_per_tile * self.cluster_size
     }
 
     /// Launch-time per-thread register limit; register allocation granularity is 8 per thread.
@@ -740,17 +880,37 @@ impl TuningConfig {
             const FIXED_SMEM: usize = 1024; // mbarriers, reduction scratchpad, etc.
             let smem_capacity = smem_capacity_per_sm / occupancy - FIXED_SMEM;
 
-            for rows_per_tile in [1usize, 2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 48, 64] {
+            let num_worker_threads = 8 / occupancy * 32;
+            let min_elements_per_thread = match config.output_types {
+                OutputTypes::Nvfp4Rowwise => 2,
+                _ => 1,
+            };
+            if config.max_row_size < num_worker_threads * min_elements_per_thread {
+                continue;
+            }
+
+            for rows_per_tile in [1usize, 2, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64] {
                 let cluster_size = match config.output_types {
                     OutputTypes::Mxfp8RowwiseAndColwise => {
-                        if !rows_per_tile.is_power_of_two() {
-                            continue;
+                        let block_size = BlockScaledFormat::Mxfp8.block_size();
+                        if rows_per_tile >= block_size {
+                            if !rows_per_tile.is_multiple_of(block_size) {
+                                continue;
+                            }
+                            1
+                        } else {
+                            if !block_size.is_multiple_of(rows_per_tile) {
+                                continue;
+                            }
+                            block_size / rows_per_tile
                         }
-                        BlockScaledFormat::Mxfp8.block_size() / rows_per_tile
                     }
                     _ => 1,
                 };
                 if cluster_size > max_cluster_size(arch) {
+                    continue;
+                }
+                if config.max_row_size / cluster_size < num_worker_threads {
                     continue;
                 }
 
@@ -760,7 +920,7 @@ impl TuningConfig {
                 }
 
                 let reshard_buffer_bytes = if cluster_size > 1 {
-                    staging_slot_bytes_per_row
+                    rows_per_tile * config.max_row_size * size_of::<bf16>()
                 } else {
                     0
                 };
@@ -774,8 +934,8 @@ impl TuningConfig {
 
                     let config = TuningConfig {
                         occupancy: occupancy as u32,
-                        num_worker_warps: 8 / occupancy as u32,
-                        num_worker_threads: 8 / occupancy as u32 * 32,
+                        num_worker_warps: num_worker_threads as u32 / 32,
+                        num_worker_threads: num_worker_threads as u32,
                         num_smem_staging_slots: num_smem_staging_slots as u32,
                         cluster_size: cluster_size as u32,
                         rows_per_tile: rows_per_tile as u32,

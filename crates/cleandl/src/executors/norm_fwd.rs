@@ -9,7 +9,7 @@ use crate::{
     mx_tensor::{MxDim, MxFormat, MxTensor},
     tensor::{Tensor, TensorView},
 };
-use anyhow::{bail, ensure};
+use anyhow::ensure;
 use kernel_build_util::PtrArg;
 use kernel_generator::{
     Arch,
@@ -83,7 +83,9 @@ impl NormFwdExecutor {
                 ensure_divisible("row size", row_size, MxFormat::Mxfp8.block_size())?;
                 ensure_divisible("row count", num_rows, MxFormat::Mxfp8.block_size())?;
             }
-            OutputTypes::Nvfp4Rowwise => bail!("NVFP4 norm output is not supported"),
+            OutputTypes::Nvfp4Rowwise => {
+                ensure_divisible("row size", row_size, MxFormat::Nvfp4.block_size())?;
+            }
         }
 
         Ok((num_rows, row_size))
@@ -92,6 +94,7 @@ impl NormFwdExecutor {
 
 fn alloc_mx_output(
     shape: [usize; 2],
+    format: MxFormat,
     dim: MxDim,
     stream: &Stream,
     pool: &DeviceMemoryPool,
@@ -100,7 +103,7 @@ fn alloc_mx_output(
     // Soundness: the kernel writes all values and all non-padding scale factors;
     // padding scale factors are zeroed.
     let mut tensor =
-        unsafe { MxTensor::new_uninit_with_pool(shape, MxFormat::Mxfp8, dim, stream, cx, pool)? };
+        unsafe { MxTensor::new_uninit_with_pool(shape, format, dim, stream, cx, pool)? };
     if tensor.has_scale_factor_padding() {
         stream.fill(tensor.scale_factors_mut().storage_mut(), 0u8)?;
     }
@@ -126,6 +129,7 @@ impl Executor for NormFwdExecutor {
             y_bf16: None,
             y_mxfp8_rowwise: None,
             y_mxfp8_colwise: None,
+            y_nvfp4_rowwise: None,
             r_inv: None,
         };
         match self.kernel.config().output_types {
@@ -136,6 +140,7 @@ impl Executor for NormFwdExecutor {
             OutputTypes::Mxfp8Rowwise => {
                 output.y_mxfp8_rowwise = Some(alloc_mx_output(
                     [num_rows, row_size],
+                    MxFormat::Mxfp8,
                     MxDim::Rowwise,
                     stream,
                     pool,
@@ -145,6 +150,7 @@ impl Executor for NormFwdExecutor {
             OutputTypes::Mxfp8RowwiseAndColwise => {
                 output.y_mxfp8_rowwise = Some(alloc_mx_output(
                     [num_rows, row_size],
+                    MxFormat::Mxfp8,
                     MxDim::Rowwise,
                     stream,
                     pool,
@@ -152,13 +158,23 @@ impl Executor for NormFwdExecutor {
                 )?);
                 output.y_mxfp8_colwise = Some(alloc_mx_output(
                     [num_rows, row_size],
+                    MxFormat::Mxfp8,
                     MxDim::Colwise,
                     stream,
                     pool,
                     cx,
                 )?);
             }
-            OutputTypes::Nvfp4Rowwise => unreachable!("rejected during validation"),
+            OutputTypes::Nvfp4Rowwise => {
+                output.y_nvfp4_rowwise = Some(alloc_mx_output(
+                    [num_rows, row_size],
+                    MxFormat::Nvfp4,
+                    MxDim::Rowwise,
+                    stream,
+                    pool,
+                    cx,
+                )?);
+            }
         }
         if args.write_r_inv {
             let r_inv_shape = x_shape.remove(x_shape.num_dims() - 1);
@@ -170,21 +186,22 @@ impl Executor for NormFwdExecutor {
             y_bf16,
             y_mxfp8_rowwise,
             y_mxfp8_colwise,
+            y_nvfp4_rowwise,
             r_inv,
         } = &mut output;
 
-        let y = match (y_bf16, y_mxfp8_rowwise, y_mxfp8_colwise) {
-            (Some(y), None, None) => OutputBuffers::Bf16 {
+        let y = match (y_bf16, y_mxfp8_rowwise, y_mxfp8_colwise, y_nvfp4_rowwise) {
+            (Some(y), None, None, None) => OutputBuffers::Bf16 {
                 y: PtrArg::new_mut(y.storage_mut()),
             },
-            (None, Some(y_row), None) => {
+            (None, Some(y_row), None, None) => {
                 let (values, scale_factors) = y_row.values_and_scale_factors_mut();
                 OutputBuffers::Mxfp8Rowwise {
                     y_row: PtrArg::new_mut(values.storage_mut()),
                     y_row_sf: PtrArg::new_mut(scale_factors.storage_mut()),
                 }
             }
-            (None, Some(y_row), Some(y_col)) => {
+            (None, Some(y_row), Some(y_col), None) => {
                 let (row_values, row_scale_factors) = y_row.values_and_scale_factors_mut();
                 let (col_values, col_scale_factors) = y_col.values_and_scale_factors_mut();
                 OutputBuffers::Mxfp8RowwiseAndColwise {
@@ -192,6 +209,13 @@ impl Executor for NormFwdExecutor {
                     y_row_sf: PtrArg::new_mut(row_scale_factors.storage_mut()),
                     y_col: PtrArg::new_mut(col_values.storage_mut()),
                     y_col_sf: PtrArg::new_mut(col_scale_factors.storage_mut()),
+                }
+            }
+            (None, None, None, Some(y_row)) => {
+                let (values, scale_factors) = y_row.values_and_scale_factors_mut();
+                OutputBuffers::Nvfp4Rowwise {
+                    y_row: PtrArg::new_mut(values.storage_mut()),
+                    y_row_sf: PtrArg::new_mut(scale_factors.storage_mut()),
                 }
             }
             _ => unreachable!(),
@@ -244,7 +268,7 @@ impl ResourceKey for ConfigWrapper {
         #[typetag::serde]
         impl DiskCacheKey for DiskKey {}
 
-        const VERSION: u32 = 0;
+        const VERSION: u32 = 2;
 
         let kernel: norm::forward::BuiltKernel = cx.disk_cache().get_or_create(
             &DiskKey {
@@ -276,11 +300,13 @@ pub struct Args<'a> {
 }
 
 /// Outputs of [`NormFwdExecutor`]. Which `y_*` fields are present depends on
-/// the config's `output_types`. `y_bf16` has the same shape as `x`; MXFP8 outputs have
+/// the config's `output_types`. `y_bf16` has the same shape as `x`; block-scaled outputs have
 /// shape `[num_rows, row_size]`; `r_inv` has the shape of `x` without its last dimension.
+/// NVFP4 outputs have no global (per-tensor) scale.
 pub struct Output {
     pub y_bf16: Option<Tensor>,
     pub y_mxfp8_rowwise: Option<MxTensor>,
     pub y_mxfp8_colwise: Option<MxTensor>,
+    pub y_nvfp4_rowwise: Option<MxTensor>,
     pub r_inv: Option<Tensor>,
 }
