@@ -1,7 +1,8 @@
+use kernel_build_util::nvvm;
 use nvvm_builder::{
-    ModuleBuilder, PtxasOptions,
+    Cubin, ModuleBuilder, PtxasOptions,
     nvvm_sys::{Arch, CompileOptions, OptLevel},
-    tools::{PtxasOptLevel, ptxas},
+    tools::PtxasOptLevel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,13 +47,10 @@ pub struct Config {
     pub max_row_size: usize,
 }
 
-fn compile_kernel_to_cubin(module: ModuleBuilder, arch: Arch) -> crate::error::Result<Vec<u8>> {
-    let built = module.finish()?;
-    let compiled = built.compile(&CompileOptions::new(arch).opt_level(OptLevel::O3))?;
-    let cubin = ptxas(
-        compiled.ptx().unwrap(),
+fn compile_kernel_to_cubin(module: ModuleBuilder, arch: Arch) -> crate::error::Result<Cubin> {
+    Ok(nvvm::compile(
+        module,
+        &CompileOptions::new(arch).opt_level(OptLevel::O3),
         &PtxasOptions::new().opt_level(PtxasOptLevel::O3),
-    )?
-    .bytes;
-    Ok(cubin)
+    )?)
 }

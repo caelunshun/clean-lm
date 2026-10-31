@@ -3,6 +3,8 @@ pub enum Error {
     #[error(transparent)]
     Cuda(#[from] skycuda::error::Error),
     #[error(transparent)]
+    KernelBuild(#[from] kernel_build_util::Error),
+    #[error(transparent)]
     BuildError(#[from] nvvm_builder::BuildError),
     #[error(transparent)]
     CompileError(#[from] nvvm_builder::CompileError),

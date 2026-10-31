@@ -2070,10 +2070,13 @@ dependencies = [
 name = "kernel-build-util"
 version = "0.1.0"
 dependencies = [
+ "boxcar",
  "derive-where",
  "nvvm-builder",
  "serde",
  "skycuda",
+ "thiserror 2.0.21",
+ "tileir",
  "tileir-builder",
 ]
 
@@ -2083,6 +2086,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "derive-where",
+ "kernel-build-util",
  "nvvm-builder",
  "serde",
  "skycuda",

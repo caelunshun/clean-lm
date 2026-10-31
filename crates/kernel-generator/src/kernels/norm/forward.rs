@@ -10,9 +10,12 @@ use crate::{
         block_scale::BlockScaledFormat,
         chunked_thread_layout::{ChunkedThreadLayout2D, Resharder},
         clc::ClcScheduler,
-        params::{DynParamsBuilder, dtype},
         view::{View1D, View2D, ViewPosWithinTensor2D},
     },
+};
+use kernel_build_util::{
+    ArgBundle, Kernel, LoadedKernelCache, Param, PtrArg,
+    nvvm::{Args, KernelBuilder},
 };
 use nvvm_builder::{mbarrier::Pipeline, prelude::*, setmaxnreg_dec, setmaxnreg_inc};
 use serde::{Deserialize, Serialize};
@@ -23,7 +26,7 @@ pub struct NormForwardKernelGenerator;
 
 impl KernelGenerator for NormForwardKernelGenerator {
     type Config = super::Config;
-    type ExecArgs<'a> = ();
+    type ExecArgs<'a> = ExecArgs<'a>;
     type BuiltKernel = BuiltKernel;
 
     fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
@@ -35,46 +38,43 @@ impl KernelGenerator for NormForwardKernelGenerator {
 
         let mut module = ModuleBuilder::new("norm_fwd");
 
-        let mut params = DynParamsBuilder::new();
-        params.add(Param::X, dtype::<Ptr<bf16, Global>>());
-        params.add(Param::ActualRowSize, dtype::<u32>());
-        params.add(Param::RecipActualRowSize, dtype::<f32>());
-        params.add(Param::NumRows, dtype::<u32>());
-        params.add(Param::RowStride, dtype::<u32>());
-        params.add(Param::RInv, dtype::<Ptr<f32, Global>>());
-
-        if config.has_bias {
-            params.add(Param::Bias, dtype::<Ptr<bf16, Global>>());
-        }
-        if config.has_scale {
-            params.add(Param::Scale, dtype::<Ptr<bf16, Global>>());
-        }
-
-        match config.output_types {
-            OutputTypes::Bf16 => {
-                params.add(Param::YBf16, dtype::<Ptr<bf16, Global>>());
-            }
-            OutputTypes::Mxfp8Rowwise => {
-                params.add(Param::YMxfp8Row, dtype::<Ptr<F8E4M3, Global>>());
-                params.add(Param::YMxfp8RowSf, dtype::<Ptr<UE8M0, Global>>());
-            }
-            OutputTypes::Mxfp8RowwiseAndColwise => {
-                params.add(Param::YMxfp8Row, dtype::<Ptr<F8E4M3, Global>>());
-                params.add(Param::YMxfp8RowSf, dtype::<Ptr<UE8M0, Global>>());
-                params.add(Param::YMxfp8Col, dtype::<Ptr<F8E4M3, Global>>());
-                params.add(Param::YMxfp8ColSf, dtype::<Ptr<UE8M0, Global>>());
-            }
-            OutputTypes::Nvfp4Rowwise => {
-                params.add(Param::YNvfp4Row, dtype::<Ptr<F4E2M1, Global>>());
-                params.add(Param::YNvfp4RowSf, dtype::<Ptr<F8E4M3, Global>>());
-            }
+        let mut kb = KernelBuilder::new();
+        let params = Params {
+            x: kb.param("x"),
+            actual_row_size: kb.param("actual_row_size"),
+            recip_actual_row_size: kb.param("recip_actual_row_size"),
+            num_rows: kb.param("num_rows"),
+            row_stride: kb.param("row_stride"),
+            r_inv: kb.param("r_inv"),
+            bias: config.has_bias.then(|| kb.param("bias")),
+            scale: config.has_scale.then(|| kb.param("scale")),
+            y: match config.output_types {
+                OutputTypes::Bf16 => OutputParams::Bf16 {
+                    y: kb.param("y_bf16"),
+                },
+                OutputTypes::Mxfp8Rowwise => OutputParams::Mxfp8Rowwise {
+                    y_row: kb.param("y_mxfp8_row"),
+                    y_row_sf: kb.param("y_mxfp8_row_sf"),
+                },
+                OutputTypes::Mxfp8RowwiseAndColwise => OutputParams::Mxfp8RowwiseAndColwise {
+                    y_row: kb.param("y_mxfp8_row"),
+                    y_row_sf: kb.param("y_mxfp8_row_sf"),
+                    y_col: kb.param("y_mxfp8_col"),
+                    y_col_sf: kb.param("y_mxfp8_col_sf"),
+                },
+                OutputTypes::Nvfp4Rowwise => OutputParams::Nvfp4Rowwise {
+                    y_row: kb.param("y_nvfp4_row"),
+                    y_row_sf: kb.param("y_nvfp4_row_sf"),
+                },
+            },
         };
 
         let tuning_config = TuningConfig::decide(&config, &arch)?;
 
         tracing::debug!(?config, ?tuning_config, "selected tuning config");
 
-        module.kernel_dyn(
+        let spec = kb.define(
+            &mut module,
             "norm_fwd",
             KernelOpts::new()
                 .cluster_dims([tuning_config.cluster_size, 1, 1])
@@ -87,10 +87,7 @@ impl KernelGenerator for NormForwardKernelGenerator {
                         / size_of::<u32>() as u32
                         / (128 + tuning_config.num_worker_threads),
                 ),
-            &params.param_dtypes(),
             |args| {
-                params.bind(args);
-
                 let mut smem = SharedCarve::dynamic();
 
                 const CLC_STAGES: usize = 3;
@@ -120,8 +117,11 @@ impl KernelGenerator for NormForwardKernelGenerator {
                         Resharder::init(tuning_config.cluster_size, &layout, &mut smem, 4)
                     }),
                     layout,
-                    params: &params,
+                    params,
+                    args,
                 };
+
+                args.set_dynamic_smem_bytes(smem.size());
 
                 with_leader_of_warp(0, || {
                     builder.load_pipeline.init();
@@ -137,42 +137,188 @@ impl KernelGenerator for NormForwardKernelGenerator {
             },
         );
 
-        let cubin = compile_kernel_to_cubin(module, arch)?;
+        let kernel = spec.finish(compile_kernel_to_cubin(module, arch)?)?;
 
         Ok(BuiltKernel {
             config,
             tuning_config,
-            cubin,
+            params,
+            kernel,
+            loaded: LoadedKernelCache::default(),
         })
     }
 
     unsafe fn execute_kernel<'a>(
         &self,
-        kernel: &BuiltKernel,
-        args: Self::ExecArgs<'a>,
-        stream: &Stream,
+        kernel: &'a BuiltKernel,
+        args: ExecArgs<'a>,
+        stream: &'a Stream,
     ) -> Result<()> {
-        todo!()
+        let BuiltKernel {
+            config,
+            tuning_config,
+            params,
+            ..
+        } = kernel;
+
+        assert!(
+            args.row_size as usize <= config.max_row_size,
+            "row size {} exceeds the kernel's max row size {}",
+            args.row_size,
+            config.max_row_size
+        );
+        assert!(args.row_size > 0, "row size must be nonzero");
+        if args.num_rows == 0 {
+            return Ok(());
+        }
+
+        let mut bundle = ArgBundle::new();
+        bundle.set(params.x, args.x);
+        bundle.set(params.actual_row_size, args.row_size);
+        bundle.set(params.recip_actual_row_size, 1.0 / args.row_size as f32);
+        bundle.set(params.num_rows, args.num_rows);
+        bundle.set(params.row_stride, args.row_stride);
+        bundle.set(params.r_inv, args.r_inv.unwrap_or_else(PtrArg::null));
+
+        match (params.scale, args.scale) {
+            (Some(param), Some(scale)) => bundle.set(param, scale),
+            (None, None) => {}
+            _ => panic!("scale must be passed iff config.has_scale is set"),
+        }
+        match (params.bias, args.bias) {
+            (Some(param), Some(bias)) => bundle.set(param, bias),
+            (None, None) => {}
+            _ => panic!("bias must be passed iff config.has_bias is set"),
+        }
+
+        match (params.y, args.y) {
+            (OutputParams::Bf16 { y }, OutputBuffers::Bf16 { y: y_buf }) => bundle.set(y, y_buf),
+            (
+                OutputParams::Mxfp8Rowwise { y_row, y_row_sf },
+                OutputBuffers::Mxfp8Rowwise {
+                    y_row: y_row_buf,
+                    y_row_sf: y_row_sf_buf,
+                },
+            ) => {
+                bundle.set(y_row, y_row_buf);
+                bundle.set(y_row_sf, y_row_sf_buf);
+            }
+            (
+                OutputParams::Mxfp8RowwiseAndColwise {
+                    y_row,
+                    y_row_sf,
+                    y_col,
+                    y_col_sf,
+                },
+                OutputBuffers::Mxfp8RowwiseAndColwise {
+                    y_row: y_row_buf,
+                    y_row_sf: y_row_sf_buf,
+                    y_col: y_col_buf,
+                    y_col_sf: y_col_sf_buf,
+                },
+            ) => {
+                bundle.set(y_row, y_row_buf);
+                bundle.set(y_row_sf, y_row_sf_buf);
+                bundle.set(y_col, y_col_buf);
+                bundle.set(y_col_sf, y_col_sf_buf);
+            }
+            (
+                OutputParams::Nvfp4Rowwise { y_row, y_row_sf },
+                OutputBuffers::Nvfp4Rowwise {
+                    y_row: y_row_buf,
+                    y_row_sf: y_row_sf_buf,
+                },
+            ) => {
+                bundle.set(y_row, y_row_buf);
+                bundle.set(y_row_sf, y_row_sf_buf);
+            }
+            _ => panic!("output buffers do not match config.output_types"),
+        }
+
+        let num_tiles = args.num_rows.div_ceil(tuning_config.rows_per_tile);
+        let num_schedule_units = num_tiles.div_ceil(tuning_config.tiles_per_schedule_unit);
+        let grid_x =
+            num_schedule_units.div_ceil(tuning_config.cluster_size) * tuning_config.cluster_size;
+
+        unsafe {
+            let loaded = kernel.loaded.get_or_load(&kernel.kernel, stream.device())?;
+            loaded.launch(bundle, (grid_x, 1, 1), stream)?;
+        }
+
+        Ok(())
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Param {
-    X,
-    Scale,
-    Bias,
-    YBf16,
-    YMxfp8Row,
-    YMxfp8RowSf,
-    YMxfp8Col,
-    YMxfp8ColSf,
-    YNvfp4Row,
-    YNvfp4RowSf,
-    RInv,
-    ActualRowSize,
-    RecipActualRowSize,
-    NumRows,
-    RowStride,
+/// Arguments for [`NormForwardKernelGenerator`]. Tensors are row-major
+/// with `row_stride` elements between rows.
+pub struct ExecArgs<'a> {
+    pub x: PtrArg<'a, bf16>,
+    pub num_rows: u32,
+    /// Must not exceed the kernel's `max_row_size`.
+    pub row_size: u32,
+    pub row_stride: u32,
+    /// Per-row reciprocal of the RMS (or standard deviation), written if present.
+    pub r_inv: Option<PtrArg<'a, f32>>,
+    /// Must be present iff `has_scale` is set in the config.
+    pub scale: Option<PtrArg<'a, bf16>>,
+    /// Must be present iff `has_bias` is set in the config.
+    pub bias: Option<PtrArg<'a, bf16>>,
+    /// Must match `output_types` in the config.
+    pub y: OutputBuffers<'a>,
+}
+
+pub enum OutputBuffers<'a> {
+    Bf16 {
+        y: PtrArg<'a, bf16>,
+    },
+    Mxfp8Rowwise {
+        y_row: PtrArg<'a, F8E4M3>,
+        y_row_sf: PtrArg<'a, UE8M0>,
+    },
+    Mxfp8RowwiseAndColwise {
+        y_row: PtrArg<'a, F8E4M3>,
+        y_row_sf: PtrArg<'a, UE8M0>,
+        y_col: PtrArg<'a, F8E4M3>,
+        y_col_sf: PtrArg<'a, UE8M0>,
+    },
+    Nvfp4Rowwise {
+        y_row: PtrArg<'a, F4E2M1>,
+        y_row_sf: PtrArg<'a, F8E4M3>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+struct Params {
+    x: Param<Ptr<bf16, Global>>,
+    actual_row_size: Param<u32>,
+    recip_actual_row_size: Param<f32>,
+    num_rows: Param<u32>,
+    row_stride: Param<u32>,
+    r_inv: Param<Ptr<f32, Global>>,
+    bias: Option<Param<Ptr<bf16, Global>>>,
+    scale: Option<Param<Ptr<bf16, Global>>>,
+    y: OutputParams,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+enum OutputParams {
+    Bf16 {
+        y: Param<Ptr<bf16, Global>>,
+    },
+    Mxfp8Rowwise {
+        y_row: Param<Ptr<F8E4M3, Global>>,
+        y_row_sf: Param<Ptr<UE8M0, Global>>,
+    },
+    Mxfp8RowwiseAndColwise {
+        y_row: Param<Ptr<F8E4M3, Global>>,
+        y_row_sf: Param<Ptr<UE8M0, Global>>,
+        y_col: Param<Ptr<F8E4M3, Global>>,
+        y_col_sf: Param<Ptr<UE8M0, Global>>,
+    },
+    Nvfp4Rowwise {
+        y_row: Param<Ptr<F4E2M1, Global>>,
+        y_row_sf: Param<Ptr<F8E4M3, Global>>,
+    },
 }
 
 struct Builder<'a> {
@@ -183,7 +329,8 @@ struct Builder<'a> {
     clc: ClcScheduler,
     resharder: Option<Resharder<bf16>>,
     layout: ChunkedThreadLayout2D,
-    params: &'a DynParamsBuilder<Param>,
+    params: Params,
+    args: &'a Args,
 }
 
 impl<'a> Builder<'a> {
@@ -247,16 +394,16 @@ impl<'a> Builder<'a> {
                     };
                     let src = View2D {
                         base: self
-                            .params
-                            .get(Param::X)
-                            .offset(first_row_in_tile * self.params.get::<u32>(Param::RowStride)),
-                        inner_len: self.params.get(Param::ActualRowSize),
+                            .args
+                            .get(self.params.x)
+                            .offset(first_row_in_tile * self.args.get(self.params.row_stride)),
+                        inner_len: self.args.get(self.params.actual_row_size),
                         outer_len: (self
-                            .params
-                            .get::<u32>(Param::NumRows)
+                            .args
+                            .get(self.params.num_rows)
                             .saturating_sub(first_row_in_tile))
-                        .max(self.tuning_config.rows_per_tile),
-                        outer_stride: self.params.get(Param::RowStride),
+                        .min(self.tuning_config.rows_per_tile),
+                        outer_stride: self.args.get(self.params.row_stride),
                     };
 
                     with_leader(|| {
@@ -291,20 +438,20 @@ impl<'a> Builder<'a> {
         let thread_idx = thread_idx_x() - 128;
 
         // Load scale and bias, if needed.
-        let scale = self.config.has_scale.then(|| {
+        let scale = self.params.scale.map(|scale| {
             self.layout.as_1d().load_aligned_or_zero(
                 View1D::<bf16, Global> {
-                    base: self.params.get(Param::Scale),
-                    len: self.params.get(Param::ActualRowSize),
+                    base: self.args.get(scale),
+                    len: self.args.get(self.params.actual_row_size),
                 },
                 thread_idx,
             )
         });
-        let bias = self.config.has_scale.then(|| {
+        let bias = self.params.bias.map(|bias| {
             self.layout.as_1d().load_aligned_or_zero(
                 View1D::<bf16, Global> {
-                    base: self.params.get(Param::Bias),
-                    len: self.params.get(Param::ActualRowSize),
+                    base: self.args.get(bias),
+                    len: self.args.get(self.params.actual_row_size),
                 },
                 thread_idx,
             )
@@ -394,8 +541,8 @@ impl<'a> Builder<'a> {
                                 for row_idx in 0..self.tuning_config.rows_per_tile {
                                     let row_r_inv = r_inv.get(row_idx as usize);
                                     let coord = first_row_in_tile + row_idx;
-                                    if_(coord.lt(self.params.get(Param::NumRows)), || {
-                                        let dst = self.params.get::<Ptr<f32, Global>>(Param::RInv);
+                                    if_(coord.lt(self.args.get(self.params.num_rows)), || {
+                                        let dst = self.args.get(self.params.r_inv);
                                         if_(!dst.is_null(), || {
                                             dst.offset(coord).store(row_r_inv);
                                         });
@@ -432,47 +579,51 @@ impl<'a> Builder<'a> {
                         .map(|resharder| resharder.initiate_resharding(&y, thread_idx));
 
                     let valid_rows_in_tile = (self
-                        .params
-                        .get::<u32>(Param::NumRows)
+                        .args
+                        .get(self.params.num_rows)
                         .saturating_sub(first_row_in_tile))
-                    .max(self.tuning_config.rows_per_tile);
+                    .min(self.tuning_config.rows_per_tile);
 
-                    match self.config.output_types {
-                        OutputTypes::Bf16 => {
+                    match self.params.y {
+                        OutputParams::Bf16 { y: y_param } => {
                             self.layout.store_aligned(
                                 View2D::<_, Global> {
-                                    base: self.params.get(Param::YBf16).offset(
-                                        first_row_in_tile
-                                            * self.params.get::<u32>(Param::RowStride),
+                                    base: self.args.get(y_param).offset(
+                                        first_row_in_tile * self.args.get(self.params.row_stride),
                                     ),
-                                    inner_len: self.params.get(Param::ActualRowSize),
+                                    inner_len: self.args.get(self.params.actual_row_size),
                                     outer_len: valid_rows_in_tile,
-                                    outer_stride: self.params.get(Param::RowStride),
+                                    outer_stride: self.args.get(self.params.row_stride),
                                 },
                                 &y,
                                 thread_idx,
                             );
                         }
-                        OutputTypes::Mxfp8Rowwise | OutputTypes::Mxfp8RowwiseAndColwise => {
+                        OutputParams::Mxfp8Rowwise { y_row, y_row_sf }
+                        | OutputParams::Mxfp8RowwiseAndColwise {
+                            y_row, y_row_sf, ..
+                        } => {
                             self.layout
                                 .store_aligned_rowwise_block_scaled::<F8E4M3, UE8M0>(
                                     BlockScaledFormat::Mxfp8,
                                     View2D::<_, Global> {
-                                        base: self.params.get(Param::YMxfp8Row).offset(
+                                        base: self.args.get(y_row).offset(
                                             first_row_in_tile
-                                                * self.params.get::<u32>(Param::RowStride),
+                                                * self.args.get(self.params.row_stride),
                                         ),
-                                        inner_len: self.params.get(Param::ActualRowSize),
+                                        inner_len: self.args.get(self.params.actual_row_size),
                                         outer_len: valid_rows_in_tile,
-                                        outer_stride: self.params.get(Param::RowStride),
+                                        outer_stride: self.args.get(self.params.row_stride),
                                     },
                                     ViewPosWithinTensor2D {
                                         row_offset: first_row_in_tile,
                                         col_offset: Val::new(0),
-                                        total_tensor_rows: self.params.get(Param::NumRows),
-                                        total_tensor_cols: self.params.get(Param::ActualRowSize),
+                                        total_tensor_rows: self.args.get(self.params.num_rows),
+                                        total_tensor_cols: self
+                                            .args
+                                            .get(self.params.actual_row_size),
                                     },
-                                    self.params.get(Param::YMxfp8RowSf),
+                                    self.args.get(y_row_sf),
                                     &y,
                                     thread_idx,
                                 );
@@ -487,7 +638,7 @@ impl<'a> Builder<'a> {
                                 todo!()
                             }
                         }
-                        OutputTypes::Nvfp4Rowwise => todo!(),
+                        OutputParams::Nvfp4Rowwise { .. } => todo!(),
                     }
 
                     stage.release();
@@ -620,11 +771,14 @@ impl TuningConfig {
 pub struct BuiltKernel {
     config: super::Config,
     tuning_config: TuningConfig,
-    cubin: Vec<u8>,
+    params: Params,
+    kernel: Kernel,
+    #[serde(skip)]
+    loaded: LoadedKernelCache,
 }
 
 impl HasCubin for BuiltKernel {
     fn cubin(&self) -> &[u8] {
-        &self.cubin
+        self.kernel.cubin()
     }
 }

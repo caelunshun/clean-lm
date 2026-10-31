@@ -12,6 +12,7 @@ skycuda = { git = "https://github.com/caelunshun/skycuda" }
 derive-where = "1.7.0"
 clap = { version = "4.6.7", features = ["derive"], optional = true }
 tracing = "0.1.44"
+kernel-build-util = { version = "0.1.0", path = "../kernel-build-util" }
 # z3 = { version = "0.21.1", features = ["gh-release"] }
 
 [features]

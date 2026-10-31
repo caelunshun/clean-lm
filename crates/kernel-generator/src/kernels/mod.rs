@@ -17,9 +17,9 @@ pub trait KernelGenerator: Sized {
     /// the kernel generator's expectations.
     unsafe fn execute_kernel<'a>(
         &self,
-        kernel: &Self::BuiltKernel,
+        kernel: &'a Self::BuiltKernel,
         args: Self::ExecArgs<'a>,
-        stream: &Stream,
+        stream: &'a Stream,
     ) -> Result<()>;
 }
 
