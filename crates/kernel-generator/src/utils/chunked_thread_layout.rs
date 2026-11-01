@@ -8,7 +8,7 @@ use nvvm_builder::{
     Val, ValueType, Var, Vector, bf16, cluster_block_rank,
     cp_async::{self, CopyOpts},
     fence_sync_restrict_acquire, fence_sync_restrict_release, if_, if_else, lane_id, mbarrier,
-    shfl_sync_bfly, tma, vote_any, with_leader_of_warp,
+    shfl_sync_bfly, tma, with_leader_of_warp,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -73,8 +73,7 @@ impl ChunkedThreadLayout1D {
             let entire_chunk_in_bounds = (col + self.chunk_size as u32).le(view.len);
             let any_element_in_bounds = col.lt(view.len);
 
-            let needs_elementwise_load =
-                vote_any(u32::MAX, !entire_chunk_in_bounds & any_element_in_bounds);
+            let needs_elementwise_load = !entire_chunk_in_bounds & any_element_in_bounds;
 
             let chunk_data = Var::new(Val::<Vector<T>>::zero_shaped(self.chunk_size));
 
@@ -175,8 +174,7 @@ impl ChunkedThreadLayout1D {
         }
     }
 
-    /// Stores values with bounds checks. Stores fall back to elementwise
-    /// stores if any lane in the warp is partially out of bounds.
+    /// Stores values with bounds checks.
     /// View must still be aligned (this is not checked at runtime).
     ///
     /// Packed `F4E2M1` values are stored in pairs, so for that type the view length
@@ -200,10 +198,8 @@ impl ChunkedThreadLayout1D {
             let base_element_in_bounds = offset.lt(view.len);
             let is_partial = !entire_chunk_in_bounds & base_element_in_bounds;
 
-            let needs_elementwise_store = vote_any(u32::MAX, is_partial);
-
             if_else(
-                needs_elementwise_store,
+                is_partial,
                 || {
                     for i in (0..self.chunk_size).step_by(granule) {
                         let offset = offset + i as u32;
@@ -328,6 +324,7 @@ impl ChunkedThreadLayout2D {
         }
     }
 
+    #[allow(unused)]
     pub fn store_aligned_unchecked<T: ValueType + Scalar, S: AddrSpace>(
         &self,
         view: View2D<T, S>,
