@@ -4,6 +4,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use skycuda::stream::Stream;
 
 pub mod norm;
+pub mod matmul_tcgen05;
 
 pub trait KernelGenerator: Sized {
     type Config: Eq + Serialize + DeserializeOwned;
