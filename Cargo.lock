@@ -844,7 +844,7 @@ dependencies = [
 [[package]]
 name = "cudarc"
 version = "0.19.9"
-source = "git+https://github.com/caelunshun/cudarc?branch=cuda-13-4#bc94241ed25dc9bf661542d5861b6b684dfeeb96"
+source = "git+https://github.com/caelunshun/cudarc?branch=cuda-13-5#da6ab36b0c3ea0caa6e5be63576124e906d50c16"
 dependencies = [
  "libloading 0.9.0",
 ]
