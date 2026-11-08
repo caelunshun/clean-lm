@@ -1141,3 +1141,30 @@ fn chained_ops() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The executor rejects bound views whose layout differs from the lowered one.
+#[test]
+fn rejects_mismatched_views() -> anyhow::Result<()> {
+    let cx = test_context();
+    let stream = cx.default_compute_stream();
+    let (m, n) = (16, 64);
+    let case = Case::new();
+    let xs = case.gb.input("x", F32, [n, m])?.transposed(0, 1)?;
+    case.pointwise(|p| p.output(p.input(xs)? + 1.0, F32))?;
+    let built = case.finish(&cx)?;
+    let executor = built.op.build_executor(&cx, built.graph().info(), None)?;
+
+    // A packed [m, n] view instead of the transposed one.
+    let x = Tensor::new_zeroed([m, n], F32, stream, &cx)?;
+    let mut out = Tensor::new_zeroed([m, n], F32, stream, &cx)?;
+    let dims = DimValues::new();
+    let mut io = OpIo {
+        inputs: vec![Bound::Ro(TensorRef::Plain(x.view()))],
+        outputs: vec![TensorRefMut::Plain(out.view_mut())],
+        scratch: None,
+        dims: &dims,
+    };
+    let err = executor.execute(&mut io, stream, &cx).unwrap_err();
+    assert!(format!("{err:#}").contains("expected shape"), "{err:#}");
+    Ok(())
+}

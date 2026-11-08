@@ -8,9 +8,10 @@ use super::{
 use crate::{
     execgraph::{
         Bound, TensorRef, TensorRefMut,
-        sym::{DimValues, Monomial},
+        sym::{DimValues, Monomial, SymLayout},
     },
     mx_tensor::{MxDim, MxFormat},
+    tensor::VirtTensorView,
 };
 use anyhow::{bail, ensure};
 use kernel_build_util::{
@@ -287,21 +288,56 @@ impl Params {
             };
             match input {
                 Bound::Ro(TensorRef::Plain(view)) => {
+                    check_view(
+                        &format!("operand {k}"),
+                        view.virt(),
+                        view.storage().len(),
+                        &plan.input_layouts[k],
+                        dims,
+                    )?;
                     param.bind(args, view.storage(), &shape, &strides)
                 }
                 Bound::Rw(TensorRefMut::Plain(view)) => {
+                    check_view(
+                        &format!("operand {k}"),
+                        view.virt(),
+                        view.storage().len(),
+                        &plan.input_layouts[k],
+                        dims,
+                    )?;
                     param.bind(args, view.storage(), &shape, &strides)
                 }
                 _ => bail!("pointwise operand {k} must be a plain tensor"),
             }
         }
 
+        let plan_shapes = &plan.output_shapes;
         for (i, ((output, params), plan)) in outputs
             .iter_mut()
             .zip(&self.outputs)
             .zip(&plan.outputs)
             .enumerate()
         {
+            let expected = plan_shapes[i].eval(dims)?;
+            match &*output {
+                TensorRefMut::Plain(view) => {
+                    ensure!(
+                        view.shape() == expected && view.is_packed_row_major(),
+                        "pointwise output {i}: expected a packed tensor of shape {expected:?}, got shape {:?} with strides {:?}",
+                        view.shape(),
+                        view.strides()
+                    );
+                    ensure!(
+                        view.virt().required_bytes() <= view.storage().len(),
+                        "pointwise output {i}: view exceeds its storage"
+                    );
+                }
+                TensorRefMut::Mx(view) => ensure!(
+                    view.shape() == expected,
+                    "pointwise output {i}: expected shape {expected:?}, got {:?}",
+                    view.shape()
+                ),
+            }
             match (params, plan, output) {
                 (
                     OutputParams::Elementwise(param),
@@ -365,6 +401,33 @@ impl Params {
         }
         Ok(())
     }
+}
+
+/// Checks that a bound view has the layout the kernel was lowered for. The kernel
+/// addresses the view from the start of its storage slice, which is the view's
+/// first element by the [`TensorView`](crate::tensor::TensorView) contract.
+fn check_view(
+    what: &str,
+    virt: &VirtTensorView,
+    storage_len: usize,
+    layout: &SymLayout,
+    dims: &DimValues,
+) -> anyhow::Result<()> {
+    let (shape, strides, _) = layout.eval(dims)?;
+    let strides_match =
+        (0..shape.num_dims()).all(|i| shape[i] == 1 || virt.strides()[i] == strides[i]);
+    ensure!(
+        virt.shape() == shape && strides_match,
+        "pointwise {what}: expected shape {shape:?} with strides {strides:?}, got shape {:?} with strides {:?}",
+        virt.shape(),
+        virt.strides()
+    );
+    ensure!(
+        virt.required_bytes() <= storage_len,
+        "pointwise {what}: view needs {} bytes but its storage slice has {storage_len}",
+        virt.required_bytes()
+    );
+    Ok(())
 }
 
 /// A traced value.

@@ -69,6 +69,11 @@ pub struct Plan {
     /// Per input, the stride along each entry of [`InputFacts::axes`].
     pub inputs: Vec<Vec<Monomial>>,
     pub outputs: Vec<OutputPlan>,
+    /// Layouts the bound operands must have; the kernel addresses them from the
+    /// start of their storage.
+    pub input_layouts: Vec<SymLayout>,
+    /// Shapes of the (packed) outputs.
+    pub output_shapes: Vec<SymShape>,
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +449,7 @@ pub fn lower(ir: &PwIr, operands: &[OperandDesc<'_>], dims: &SymDims) -> anyhow:
         .map(|&a| (a, groups.iter().position(|g| g.contains(&a))))
         .collect();
 
+    let output_shapes: Vec<SymShape> = specs.iter().map(|spec| spec.shape.clone()).collect();
     Ok(Lowering {
         output_specs: specs,
         facts: Facts {
@@ -456,6 +462,8 @@ pub fn lower(ir: &PwIr, operands: &[OperandDesc<'_>], dims: &SymDims) -> anyhow:
             sizes,
             inputs: input_plans,
             outputs: output_plans,
+            input_layouts: operands.iter().map(|op| op.layout.clone()).collect(),
+            output_shapes,
         },
     })
 }
