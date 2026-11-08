@@ -11,10 +11,10 @@
 //! })?[..] else { unreachable!() };
 //! ```
 
-mod codegen;
+pub(crate) mod codegen;
 pub mod ir;
 mod lower;
-mod mx;
+pub(crate) mod mx;
 
 use crate::{
     context::Context,

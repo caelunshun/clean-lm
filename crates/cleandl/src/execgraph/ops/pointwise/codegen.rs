@@ -65,20 +65,20 @@ macro_rules! array_params {
 
         impl ArrayParam {
             #[track_caller]
-            fn declare(kb: &mut KernelBuilder, name: String, ty: ElementType, opts: ArrayOpts) -> Self {
+            pub(crate) fn declare(kb: &mut KernelBuilder, name: String, ty: ElementType, opts: ArrayOpts) -> Self {
                 match ty {
                     $($et => Self::$variant(kb.array::<$ty>(name, opts)),)*
                     _ => panic!("unsupported array element type {ty:?}"),
                 }
             }
 
-            fn get(self, args: &Args) -> DynArray {
+            pub(crate) fn get(self, args: &Args) -> DynArray {
                 match self {
                     $(Self::$variant(p) => args.get_array(p),)*
                 }
             }
 
-            fn bind<'a, M: DeviceVisibleMemory + 'a>(
+            pub(crate) fn bind<'a, M: DeviceVisibleMemory + 'a>(
                 self,
                 args: &mut ArgBundle<'a>,
                 memory: &'a M,
@@ -92,7 +92,7 @@ macro_rules! array_params {
                 }
             }
 
-            fn bind_mut<'a, M: DeviceVisibleMemoryMut + 'a>(
+            pub(crate) fn bind_mut<'a, M: DeviceVisibleMemoryMut + 'a>(
                 self,
                 args: &mut ArgBundle<'a>,
                 memory: &'a mut M,
