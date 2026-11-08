@@ -12,8 +12,8 @@ use skytens_core::{
 /// A quantized tensor and its block scales. Currently, it must be two-dimensional.
 ///
 /// The blocks run along either the rows or the columns; the stride of
-/// the block dimension must be 1. The stride of the other dimension must equal
-/// the inner size rounded to the next multiple of the block size.
+/// the block dimension must be 1, and its size must be a multiple of the block size.
+/// The stride of the other dimension equals the size of the block dimension.
 ///
 /// Scale factors are stored in the 128x4 tiled format with partition-swizzling, as read
 /// by CUTLASS, cuBLASlt, etc.
@@ -65,11 +65,11 @@ impl MxTensor {
             unsafe { pool.alloc_uninit_on(layout.scale_factors.required_bytes(), stream)? };
 
         Ok(Self {
+            strides: layout.values.strides(),
             values: Tensor::from_parts(layout.values, values_storage, cx),
             scale_factors: Tensor::from_parts(layout.scale_factors, scale_factors_storage, cx),
             format,
             shape,
-            strides: layout.strides,
             dim,
         })
     }
@@ -91,7 +91,7 @@ impl MxTensor {
             scale_factors,
             format,
             shape,
-            strides: layout.strides,
+            strides: layout.values.strides(),
             dim,
         })
     }
@@ -214,7 +214,7 @@ impl<'a> MxTensorView<'a> {
             scale_factors,
             format,
             shape,
-            strides: layout.strides,
+            strides: layout.values.strides(),
             dim,
         })
     }
@@ -276,7 +276,7 @@ impl<'a> MxTensorViewMut<'a> {
             scale_factors,
             format,
             shape,
-            strides: layout.strides,
+            strides: layout.values.strides(),
             dim,
         })
     }
@@ -339,8 +339,6 @@ pub struct MxLayout {
     /// Scale factors, of shape `[next_multiple_of(rows, 128), next_multiple_of(blocks, 4)]`
     /// in the block-scaled orientation.
     pub scale_factors: VirtTensorView,
-    /// Logical strides recorded by [`MxTensor::strides`].
-    pub strides: Strides,
 }
 
 impl MxLayout {
@@ -350,10 +348,11 @@ impl MxLayout {
             shape.num_dims() == 2,
             "block-scaled tensors must be 2D, got shape {shape:?}"
         );
-
-        let mut strides = Strides::new([1, 1]);
-        strides[dim.non_block_dimension_2d()] =
-            shape[dim.block_dimension_2d()].next_multiple_of(format.block_size());
+        ensure!(
+            shape[dim.block_dimension_2d()].is_multiple_of(format.block_size()),
+            "block dimension of shape {shape:?} must be a multiple of the {format:?} block size {}",
+            format.block_size()
+        );
 
         let values = match dim {
             MxDim::Rowwise => VirtTensorView::new(shape, format.values_type()),
@@ -371,7 +370,6 @@ impl MxLayout {
         Ok(Self {
             values,
             scale_factors,
-            strides,
         })
     }
 

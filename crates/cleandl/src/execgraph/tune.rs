@@ -1,5 +1,6 @@
 use crate::{context::Context, disk_cache::DiskCacheKey, execgraph::jit};
 use anyhow::ensure;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use skycuda::stream::Stream;
 use std::time::Duration;
@@ -79,77 +80,122 @@ impl<'a> Tuner<'a> {
         self.mode
     }
 
-    /// `candidates[0]` must be the heuristic default. Returns the chosen candidate.
+    /// `candidates[0]` must be the heuristic default. Returns the chosen candidate
+    /// and its prepared state.
     ///
-    /// `run` submits one execution of a candidate on the stream. Any compilation
-    /// should happen before calling this, as measurement holds the context's GPU lock.
-    pub fn tune<C: Serialize + DeserializeOwned + Clone>(
+    /// `prepare` compiles or otherwise sets up a candidate. It runs outside the GPU
+    /// lock, only for candidates that will be used: just the chosen one if tuning
+    /// isn't needed, else all of them in parallel. `run` submits one execution of a
+    /// prepared candidate on the stream.
+    pub fn tune<C, P>(
         &self,
         key: &TuneKey,
         candidates: Vec<C>,
-        mut run: impl FnMut(&C, &Stream) -> anyhow::Result<()>,
-    ) -> anyhow::Result<C> {
+        prepare: impl Fn(&C) -> anyhow::Result<P> + Sync,
+        mut run: impl FnMut(&P, &Stream) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(C, P)>
+    where
+        C: Serialize + DeserializeOwned + Clone + Send + Sync,
+        P: Send,
+    {
         ensure!(!candidates.is_empty(), "{}: no tuning candidates", key.op);
-        if self.mode == Autotune::Off || candidates.len() == 1 {
-            return Ok(candidates.into_iter().next().unwrap());
-        }
 
-        if let Some(cached) = self.cached(key, &candidates)? {
-            return Ok(cached);
-        }
-        if self.mode == Autotune::CachedOnly {
+        let chosen = if self.mode == Autotune::Off || candidates.len() == 1 {
+            Some(0)
+        } else if let Some(cached) = self.cached(key, &candidates)? {
+            Some(cached)
+        } else if self.mode == Autotune::CachedOnly {
             tracing::warn!(
                 "{}: no cached tuning result for {}; using the default candidate",
                 key.op,
                 key.payload
             );
-            return Ok(candidates.into_iter().next().unwrap());
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(chosen) = chosen {
+            let candidate = candidates.into_iter().nth(chosen).unwrap();
+            let prepared = prepare(&candidate)?;
+            return Ok((candidate, prepared));
         }
 
-        let best = {
-            let _gpu_guard = self.cx.gpu_lock().lock();
-            let mut best: Option<(usize, Duration)> = None;
-            for (i, candidate) in candidates.iter().enumerate() {
-                let label = serde_json::to_string(candidate)?;
-                match measure(|stream| run(candidate, stream), self.cx) {
-                    Ok(time) => {
-                        tracing::debug!("{} candidate {label}: {time:.1?}", key.op);
-                        if best.is_none_or(|(_, best_time)| time < best_time) {
-                            best = Some((i, time));
-                        }
-                    }
-                    Err(e) => tracing::warn!("{} candidate {label} failed: {e:#}", key.op),
+        let mut prepared: Vec<(usize, P)> = candidates
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, candidate)| match prepare(candidate) {
+                Ok(prepared) => Some((i, prepared)),
+                Err(e) => {
+                    tracing::warn!(
+                        "{} candidate {} failed to prepare: {e:#}",
+                        key.op,
+                        candidate_label(candidate)
+                    );
+                    None
                 }
+            })
+            .collect();
+        ensure!(
+            !prepared.is_empty(),
+            "{}: all tuning candidates failed to prepare",
+            key.op
+        );
+
+        let gpu_guard = self.cx.gpu_lock().lock();
+
+        // Another thread may have tuned the same key while we were preparing.
+        if let Some(cached) = self.cached(key, &candidates)?
+            && let Some(pos) = prepared.iter().position(|(i, _)| *i == cached)
+        {
+            drop(gpu_guard);
+            let (_, prepared) = prepared.swap_remove(pos);
+            return Ok((candidates[cached].clone(), prepared));
+        }
+
+        let mut best: Option<(usize, Duration)> = None;
+        for (pos, (i, prepared)) in prepared.iter().enumerate() {
+            let label = candidate_label(&candidates[*i]);
+            match measure(|stream| run(prepared, stream), self.cx) {
+                Ok(time) => {
+                    tracing::debug!("{} candidate {label}: {time:.1?}", key.op);
+                    if best.is_none_or(|(_, best_time)| time < best_time) {
+                        best = Some((pos, time));
+                    }
+                }
+                Err(e) => tracing::warn!("{} candidate {label} failed: {e:#}", key.op),
             }
-            best
-        };
-        let Some((best, time)) = best else {
+        }
+        drop(gpu_guard);
+
+        let Some((best_pos, time)) = best else {
             anyhow::bail!("{}: all tuning candidates failed", key.op);
         };
-
+        let (best, prepared) = prepared.swap_remove(best_pos);
         let winner = candidates[best].clone();
         tracing::debug!(
             "{}: chose {} ({time:.1?}) for {}",
             key.op,
-            serde_json::to_string(&winner)?,
+            candidate_label(&winner),
             key.payload
         );
-        self.cx.disk_cache().insert(key, &winner)?;
-        Ok(winner)
+        if let Err(e) = self.cx.disk_cache().insert(key, &winner) {
+            tracing::warn!("{}: failed to cache tuning result: {e:#}", key.op);
+        }
+        Ok((winner, prepared))
     }
 
-    /// Returns the cached winner, if it is still among the candidates.
-    fn cached<C: Serialize + DeserializeOwned + Clone>(
+    /// Returns the index of the cached winner, if it is still among the candidates.
+    fn cached<C: Serialize>(
         &self,
         key: &TuneKey,
         candidates: &[C],
-    ) -> anyhow::Result<Option<C>> {
+    ) -> anyhow::Result<Option<usize>> {
         let Some(cached) = self.cx.disk_cache().get::<_, serde_json::Value>(key)? else {
             return Ok(None);
         };
-        for candidate in candidates {
+        for (i, candidate) in candidates.iter().enumerate() {
             if serde_json::to_value(candidate)? == cached {
-                return Ok(Some(candidate.clone()));
+                return Ok(Some(i));
             }
         }
         tracing::warn!(
@@ -158,6 +204,10 @@ impl<'a> Tuner<'a> {
         );
         Ok(None)
     }
+}
+
+fn candidate_label(candidate: &impl Serialize) -> String {
+    serde_json::to_string(candidate).unwrap_or_else(|e| format!("<unserializable: {e}>"))
 }
 
 /// Measures the average runtime of the submitted work, assuming exclusive access to the GPU.

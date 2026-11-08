@@ -624,6 +624,7 @@ dependencies = [
  "skycuda-cublaslt",
  "skytens-core",
  "slotmap",
+ "tempfile",
  "thread_local",
  "tileir",
  "tileir-builder",

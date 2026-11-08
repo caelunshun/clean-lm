@@ -4,6 +4,7 @@
 use bytemuck::Pod;
 use cleandl::{
     context::Context,
+    disk_cache::DiskCache,
     mx_tensor::{MxDim, MxFormat, MxTensor},
     par_random::par_fill_from_distr,
     tensor::{Tensor, TensorElement},
@@ -19,14 +20,32 @@ use skycuda::{
     host_pinned_memory_pool::HostPinnedMemoryPoolOptions,
 };
 use skytens_core::shape::Shape;
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
+/// Context whose disk cache lives in a per-process temporary directory.
 pub fn test_context() -> Context {
-    Context::new(
+    static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+    let dir = CACHE_DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("cache-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create cache dir")
+            .keep()
+    });
+    test_context_in(dir)
+}
+
+pub fn test_context_in(cache_dir: &Path) -> Context {
+    Context::with_disk_cache(
         0,
         DeviceMemoryPoolOptions::default(),
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
+        DiskCache::new_in(cache_dir).expect("failed to open disk cache"),
     )
     .expect("failed to create CUDA context")
 }

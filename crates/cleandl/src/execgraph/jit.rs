@@ -15,13 +15,15 @@ const FORMAT_VERSION: u32 = 1;
 
 /// Compiles (or fetches from the disk cache) a TileIR kernel, loading it once per context.
 ///
-/// `key` describes the op-specific configuration that determines the kernel body.
+/// `name` and `key` (together with the key's type) must uniquely identify the kernel
+/// body within a context: kernels are loaded once per such identity, and `define` is
+/// not called again for it.
 /// `define` must define exactly one kernel in the module, via `KernelBuilder::define`.
 /// It is traced on the first request per context; the disk cache is keyed on the
 /// resulting bytecode, so changes to the kernel body never hit stale cubins.
-pub fn get_or_compile_kernel(
+pub fn get_or_compile_kernel<K: Serialize>(
     cx: &Context,
-    key: &impl Serialize,
+    key: &K,
     name: &str,
     define: impl FnOnce(&mut ModuleBuilder) -> KernelSpec,
 ) -> anyhow::Result<Arc<LoadedKernel>> {
@@ -30,9 +32,9 @@ pub fn get_or_compile_kernel(
 
 /// Like [`get_or_compile_kernel`], with extra `tileiras` options. The target arch is
 /// always set from the context's device.
-pub fn get_or_compile_kernel_with_options(
+pub fn get_or_compile_kernel_with_options<K: Serialize>(
     cx: &Context,
-    key: &impl Serialize,
+    key: &K,
     name: &str,
     options: TileirasOptions,
     define: impl FnOnce(&mut ModuleBuilder) -> KernelSpec,
@@ -41,7 +43,8 @@ pub fn get_or_compile_kernel_with_options(
     let config = serde_json::to_value(key)?;
     let tileiras_args = options.to_args();
 
-    let local_key = serde_json::to_string(&(name, &config, &tileiras_args))?;
+    let local_key =
+        serde_json::to_string(&(name, std::any::type_name::<K>(), &config, &tileiras_args))?;
     if let Some(kernel) = cx.jit_kernels().get(&local_key) {
         return Ok(kernel);
     }

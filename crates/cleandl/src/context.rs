@@ -17,7 +17,7 @@ use std::{
     any::{Any, TypeId},
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,20 @@ impl Context {
         device_index: u32,
         device_memory_options: DeviceMemoryPoolOptions,
         host_pinned_memory_options: HostPinnedMemoryPoolOptions,
+    ) -> anyhow::Result<Self> {
+        Self::with_disk_cache(
+            device_index,
+            device_memory_options,
+            host_pinned_memory_options,
+            DiskCache::new()?,
+        )
+    }
+
+    pub fn with_disk_cache(
+        device_index: u32,
+        device_memory_options: DeviceMemoryPoolOptions,
+        host_pinned_memory_options: HostPinnedMemoryPoolOptions,
+        disk_cache: DiskCache,
     ) -> anyhow::Result<Self> {
         let cuda = Device::from_index(device_index)?;
 
@@ -47,8 +61,8 @@ impl Context {
             // stream_cudnn_contexts: PerStreamResource::new(),
             device_memory_pool,
             host_pinned_memory_pool,
-            disk_cache: DiskCache::new()?,
-            gpu_lock: parking_lot::Mutex::new(()),
+            disk_cache,
+            gpu_lock: device_gpu_lock(device_index),
             jit_kernels: Default::default(),
             cublaslt,
         })))
@@ -150,7 +164,7 @@ impl Context {
     }
 
     /// Held while measuring GPU work that requires exclusive access to the device,
-    /// such as autotuning.
+    /// such as autotuning. Shared by all contexts on the same device; not reentrant.
     pub fn gpu_lock(&self) -> &parking_lot::Mutex<()> {
         &self.0.gpu_lock
     }
@@ -182,6 +196,17 @@ impl Context {
     }
 }
 
+fn device_gpu_lock(device_index: u32) -> Arc<parking_lot::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<u32, Arc<parking_lot::Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(device_index)
+        .or_default()
+        .clone()
+}
+
 type Resource = Arc<dyn Any + Send + Sync>;
 type ResourceKeyEncoded = (TypeId, Vec<u8>);
 
@@ -198,7 +223,7 @@ struct Inner {
     // stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
     disk_cache: DiskCache,
-    gpu_lock: parking_lot::Mutex<()>,
+    gpu_lock: Arc<parking_lot::Mutex<()>>,
     jit_kernels: JitKernelCache,
     cublaslt: CublasLtHandle,
 }
