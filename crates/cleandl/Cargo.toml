@@ -34,6 +34,7 @@ tileir-builder = { git = "https://github.com/caelunshun/tileir-rs" }
 smallvec = "1.16.5"
 tileir = { git = "https://github.com/caelunshun/tileir-rs" }
 blake3 = "1.8.7"
+flash-attention-rs = { git = "https://github.com/caelunshun/flash-attention-rs", version = "0.1.0", default-features = false }
 
 [dev-dependencies]
 float-cmp = "0.10"

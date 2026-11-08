@@ -26,12 +26,12 @@ use std::cmp::Ordering;
 
 pub struct NormForwardKernelGenerator;
 
-impl KernelGenerator for NormForwardKernelGenerator {
-    type Config = super::Config;
-    type ExecArgs<'a> = ExecArgs<'a>;
-    type BuiltKernel = BuiltKernel;
+impl NormForwardKernelGenerator {
+    pub fn is_supported(config: super::Config, arch: &Arch) -> bool {
+        Self::validate(config, arch).is_ok()
+    }
 
-    fn generate_kernel(&self, mut config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
+    fn validate(mut config: super::Config, arch: &Arch) -> Result<(super::Config, TuningConfig)> {
         // NVFP4 values are packed in pairs, so each thread must hold at least two elements.
         let min_row_size = match config.output_types {
             OutputTypes::Nvfp4Rowwise => 256,
@@ -42,6 +42,21 @@ impl KernelGenerator for NormForwardKernelGenerator {
         if config.max_row_size > MAX_SUPPORTED_ROW_SIZE {
             return Err(Error::Unsupported("row size > 8192"));
         }
+        if config.norm_type == NormType::LayerNorm {
+            return Err(Error::Unsupported("layer norm is not implemented"));
+        }
+        let tuning_config = TuningConfig::decide(&config, arch)?;
+        Ok((config, tuning_config))
+    }
+}
+
+impl KernelGenerator for NormForwardKernelGenerator {
+    type Config = super::Config;
+    type ExecArgs<'a> = ExecArgs<'a>;
+    type BuiltKernel = BuiltKernel;
+
+    fn generate_kernel(&self, config: Self::Config, arch: Arch) -> Result<BuiltKernel> {
+        let (config, tuning_config) = Self::validate(config, &arch)?;
 
         let mut module = ModuleBuilder::new("norm_fwd");
 
@@ -52,6 +67,7 @@ impl KernelGenerator for NormForwardKernelGenerator {
             recip_actual_row_size: kb.param("recip_actual_row_size"),
             num_rows: kb.param("num_rows"),
             row_stride: kb.param("row_stride"),
+            eps: kb.param("eps"),
             r_inv: kb.param("r_inv"),
             bias: config.has_bias.then(|| kb.param("bias")),
             scale: config.has_scale.then(|| kb.param("scale")),
@@ -75,8 +91,6 @@ impl KernelGenerator for NormForwardKernelGenerator {
                 },
             },
         };
-
-        let tuning_config = TuningConfig::decide(&config, &arch)?;
 
         tracing::debug!(?config, ?tuning_config, "selected tuning config");
 
@@ -211,6 +225,7 @@ impl KernelGenerator for NormForwardKernelGenerator {
         bundle.set(params.recip_actual_row_size, 1.0 / args.row_size as f32);
         bundle.set(params.num_rows, args.num_rows);
         bundle.set(params.row_stride, args.row_stride);
+        bundle.set(params.eps, args.eps);
         bundle.set(params.r_inv, args.r_inv.unwrap_or_else(PtrArg::null));
 
         match (params.scale, args.scale) {
@@ -297,6 +312,8 @@ pub struct ExecArgs<'a> {
     /// Must not exceed the kernel's `max_row_size`.
     pub row_size: u32,
     pub row_stride: u32,
+    /// Added to the mean square (or variance) before taking the reciprocal square root.
+    pub eps: f32,
     /// Per-row reciprocal of the RMS (or standard deviation), written if present.
     pub r_inv: Option<PtrArg<'a, f32>>,
     /// Must be present iff `has_scale` is set in the config.
@@ -334,6 +351,7 @@ struct Params {
     recip_actual_row_size: Param<f32>,
     num_rows: Param<u32>,
     row_stride: Param<u32>,
+    eps: Param<f32>,
     r_inv: Param<Ptr<f32, Global>>,
     bias: Option<Param<Ptr<bf16, Global>>>,
     scale: Option<Param<Ptr<bf16, Global>>>,
@@ -602,8 +620,8 @@ impl<'a> Builder<'a> {
 
                             let r_inv = (global_sums_of_squares
                                 * self.args.get(self.params.recip_actual_row_size)
-                                + 1e-6f32)
-                                .rsqrt();
+                                + self.args.get(self.params.eps))
+                            .rsqrt();
 
                             // Store r_inv
                             if_(thread_idx.eq(0), || {

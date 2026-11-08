@@ -27,3 +27,6 @@ lto = "thin"
 skycuda = { path = "../skycuda" }
 skycuda-cudnn = { path = "../skycuda/skycuda-cudnn" }
 skycuda-cublaslt = { path = "../skycuda/skycuda-cublaslt" }
+
+[patch.'https://github.com/caelunshun/nvvm-rs']
+nvvm-builder = { path = "../nvvm-rs/crates/nvvm-builder" }
