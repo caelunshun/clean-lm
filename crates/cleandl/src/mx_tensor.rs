@@ -398,7 +398,7 @@ fn has_scale_factor_padding(shape: Shape, format: MxFormat, dim: MxDim) -> bool 
     !rows.is_multiple_of(128) || !blocks.is_multiple_of(4)
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MxFormat {
     Mxfp8,
     Nvfp4,
@@ -432,7 +432,7 @@ impl MxFormat {
 }
 
 /// Whether a tensor is block-scaled along its rows or along its columns.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MxDim {
     Rowwise,
     Colwise,
