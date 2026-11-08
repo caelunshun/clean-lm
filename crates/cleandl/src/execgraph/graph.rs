@@ -359,7 +359,7 @@ impl GraphBuilder {
 
         let specs = op
             .infer_outputs(&state.info)
-            .with_context(|| format!("{name}"))?;
+            .with_context(|| name.clone())?;
         let mut outputs = Vec::with_capacity(specs.len());
         for (i, spec) in specs.into_iter().enumerate() {
             let tensor = state

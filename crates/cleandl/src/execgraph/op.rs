@@ -8,15 +8,18 @@ use super::{
 use crate::{
     context::Context,
     mx_tensor::{MxDim, MxFormat, MxLayout, MxTensorView, MxTensorViewMut},
-    tensor::{TensorView, TensorViewMut},
+    tensor::{TensorView, TensorViewMut, VirtTensorView},
 };
-use anyhow::bail;
+use anyhow::{Context as _, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use skycuda::{
-    device_memory::DeviceMemory, device_memory_pool::DeviceMemoryPool,
-    memory_slice::MemorySliceMut, stream::Stream,
+    device_memory::DeviceMemory,
+    device_memory_pool::DeviceMemoryPool,
+    memory_slice::{MemorySlice, MemorySliceMut},
+    stream::Stream,
 };
 use skytens_core::data_type::ElementType;
+use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
@@ -214,7 +217,7 @@ impl BuildCx<'_> {
     ) -> anyhow::Result<R> {
         let mut buffers = HintBuffers::new(self)?;
         buffers.ensure_scratch(scratch_bytes, self)?;
-        let mut io = buffers.io(scratch_bytes, self.cx)?;
+        let mut io = buffers.io(scratch_bytes, self)?;
         f(&mut io)
     }
 
@@ -230,8 +233,18 @@ impl BuildCx<'_> {
         C: Serialize + DeserializeOwned + Clone + Send + Sync,
         E: Executor,
     {
-        let _ = (key, candidates, prepare);
-        todo!()
+        let mut buffers: Option<HintBuffers> = None;
+        self.tuner
+            .tune(key, candidates, prepare, |executor, stream| {
+                let buffers = match &mut buffers {
+                    Some(buffers) => buffers,
+                    None => buffers.insert(HintBuffers::new(self)?),
+                };
+                let scratch_bytes = executor.scratch_bytes(&buffers.dims);
+                buffers.ensure_scratch(scratch_bytes, self)?;
+                let mut io = buffers.io(scratch_bytes, self)?;
+                executor.execute(&mut io, stream, self.cx)
+            })
     }
 }
 
@@ -272,6 +285,7 @@ impl<'a> OpIo<'a> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum TensorRef<'a> {
     Plain(TensorView<'a>),
     Mx(MxTensorView<'a>),
@@ -334,6 +348,7 @@ impl<'a> From<MxTensorView<'a>> for TensorRef<'a> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum TensorRefMut<'a> {
     Plain(TensorViewMut<'a>),
     Mx(MxTensorViewMut<'a>),
@@ -398,6 +413,7 @@ impl<'a> Bound<'a> {
     }
 
     #[track_caller]
+    #[allow(clippy::should_implement_trait)]
     pub fn as_mut(&mut self) -> &mut TensorRefMut<'a> {
         match self {
             Bound::Rw(t) => t,
@@ -406,21 +422,277 @@ impl<'a> Bound<'a> {
     }
 }
 
-struct HintBuffers;
+/// Device memory of one graph buffer, borrowed for one operator execution.
+pub(crate) enum Mem<'a> {
+    Ro(MemorySlice<&'a DeviceMemory>),
+    Rw(MemorySliceMut<&'a mut DeviceMemory>),
+}
 
-impl HintBuffers {
-    fn new(_bcx: &BuildCx<'_>) -> anyhow::Result<Self> {
-        todo!()
+pub(crate) type MemMap<'a> = HashMap<BufferId, Mem<'a>>;
+
+/// Distinct buffers used by an op, and whether each is written.
+pub(crate) fn op_buffer_access(
+    graph: &GraphInfo,
+    operands: &[SymTensorId],
+    access: &[Access],
+    outputs: &[SymTensorId],
+) -> Vec<(BufferId, bool)> {
+    let mut buffers: Vec<(BufferId, bool)> = Vec::new();
+    let tensors = operands
+        .iter()
+        .zip(access)
+        .map(|(&t, &a)| (t, a == Access::ReadWrite))
+        .chain(outputs.iter().map(|&t| (t, true)));
+    for (tensor, write) in tensors {
+        for buffer in graph.tensor(tensor).buffers() {
+            match buffers.iter_mut().find(|(b, _)| *b == buffer) {
+                Some((_, w)) => *w |= write,
+                None => buffers.push((buffer, write)),
+            }
+        }
     }
+    buffers
+}
 
-    fn ensure_scratch(&mut self, _bytes: usize, _bcx: &BuildCx<'_>) -> anyhow::Result<()> {
-        todo!()
+/// Evaluates a plain tensor's layout, returning its view and byte offset into the buffer.
+fn eval_plain(
+    layout: &SymLayout,
+    ty: ElementType,
+    dims: &DimValues,
+) -> anyhow::Result<(VirtTensorView, usize)> {
+    let (shape, strides, offset) = layout.eval(dims)?;
+    let virt = VirtTensorView::with_strides(shape, strides, ty);
+    if shape.element_count() == 0 {
+        return Ok((virt, 0));
     }
+    let offset_bits = offset
+        .checked_mul(ty.bits_per_element())
+        .ok_or_else(|| anyhow!("tensor offset overflows"))?;
+    ensure!(
+        offset_bits.is_multiple_of(8),
+        "tensor offset of {offset} {ty:?} elements is not byte-aligned"
+    );
+    Ok((virt, offset_bits / 8))
+}
 
-    fn io(&mut self, _scratch_bytes: usize, _cx: &Context) -> anyhow::Result<OpIo<'_>> {
-        bail!("todo")
+fn check_fits(virt: &VirtTensorView, offset: usize, len: usize) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(virt.required_bytes())
+        .ok_or_else(|| anyhow!("tensor extent overflows"))?;
+    ensure!(
+        end <= len,
+        "tensor with shape {:?} and strides {:?} at byte offset {offset} needs {end} bytes, but its buffer has {len}",
+        virt.shape(),
+        virt.strides()
+    );
+    Ok(())
+}
+
+fn view_ro<'a>(
+    mem: MemorySlice<&'a DeviceMemory>,
+    virt: VirtTensorView,
+    offset: usize,
+    cx: &Context,
+) -> anyhow::Result<TensorView<'a>> {
+    check_fits(&virt, offset, mem.len())?;
+    let (start, end) = (mem.offset() + offset, mem.offset() + mem.len());
+    Ok(TensorView::from_parts(
+        virt,
+        mem.into_inner().slice(start..end),
+        cx,
+    ))
+}
+
+fn view_rw<'a>(
+    mem: MemorySliceMut<&'a mut DeviceMemory>,
+    virt: VirtTensorView,
+    offset: usize,
+    cx: &Context,
+) -> anyhow::Result<TensorViewMut<'a>> {
+    check_fits(&virt, offset, mem.len())?;
+    let (start, end) = (mem.offset() + offset, mem.offset() + mem.len());
+    Ok(TensorViewMut::from_parts(
+        virt,
+        mem.into_inner().slice_mut(start..end),
+        cx,
+    ))
+}
+
+fn take_ro<'a>(mems: &MemMap<'a>, buffer: BufferId) -> MemorySlice<&'a DeviceMemory> {
+    match &mems[&buffer] {
+        Mem::Ro(mem) => *mem,
+        Mem::Rw(_) => unreachable!("buffer {buffer:?} is both read and written by one op"),
     }
 }
 
-#[allow(dead_code)]
-fn _assert_layout_helpers(_: MxLayout) {}
+fn take_rw<'a>(mems: &mut MemMap<'a>, buffer: BufferId) -> MemorySliceMut<&'a mut DeviceMemory> {
+    match mems.remove(&buffer) {
+        Some(Mem::Rw(mem)) => mem,
+        _ => unreachable!("buffer {buffer:?} is written through multiple operands"),
+    }
+}
+
+pub(crate) fn bind_ro<'a>(
+    tensor: &SymTensorData,
+    mems: &MemMap<'a>,
+    dims: &DimValues,
+    cx: &Context,
+) -> anyhow::Result<TensorRef<'a>> {
+    Ok(match tensor {
+        SymTensorData::Plain { buffer, layout, ty } => {
+            let (virt, offset) = eval_plain(layout, *ty, dims)?;
+            TensorRef::Plain(view_ro(take_ro(mems, *buffer), virt, offset, cx)?)
+        }
+        SymTensorData::BlockScaled {
+            values,
+            scales,
+            format,
+            dim,
+            shape,
+        } => {
+            let shape = shape.eval(dims)?;
+            let layout = MxLayout::new(shape, *format, *dim)?;
+            TensorRef::Mx(MxTensorView::from_parts(
+                view_ro(take_ro(mems, *values), layout.values, 0, cx)?,
+                view_ro(take_ro(mems, *scales), layout.scale_factors, 0, cx)?,
+                *format,
+                *dim,
+                shape,
+            )?)
+        }
+    })
+}
+
+pub(crate) fn bind_rw<'a>(
+    tensor: &SymTensorData,
+    mems: &mut MemMap<'a>,
+    dims: &DimValues,
+    cx: &Context,
+) -> anyhow::Result<TensorRefMut<'a>> {
+    Ok(match tensor {
+        SymTensorData::Plain { buffer, layout, ty } => {
+            let (virt, offset) = eval_plain(layout, *ty, dims)?;
+            TensorRefMut::Plain(view_rw(take_rw(mems, *buffer), virt, offset, cx)?)
+        }
+        SymTensorData::BlockScaled {
+            values,
+            scales,
+            format,
+            dim,
+            shape,
+        } => {
+            let shape = shape.eval(dims)?;
+            let layout = MxLayout::new(shape, *format, *dim)?;
+            TensorRefMut::Mx(MxTensorViewMut::from_parts(
+                view_rw(take_rw(mems, *values), layout.values, 0, cx)?,
+                view_rw(take_rw(mems, *scales), layout.scale_factors, 0, cx)?,
+                *format,
+                *dim,
+                shape,
+            )?)
+        }
+    })
+}
+
+/// Binds an op's operands and outputs to the buffers in `mems`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_io<'a>(
+    graph: &GraphInfo,
+    operands: &[SymTensorId],
+    access: &[Access],
+    outputs: &[SymTensorId],
+    mut mems: MemMap<'a>,
+    scratch: Option<MemorySliceMut<&'a mut DeviceMemory>>,
+    dims: &'a DimValues,
+    cx: &Context,
+) -> anyhow::Result<OpIo<'a>> {
+    let mut inputs = Vec::with_capacity(operands.len());
+    for (i, (&tensor, &access)) in operands.iter().zip(access).enumerate() {
+        let tensor = graph.tensor(tensor);
+        let bound = match access {
+            Access::ReadOnly => bind_ro(tensor, &mems, dims, cx).map(Bound::Ro),
+            Access::ReadWrite => bind_rw(tensor, &mut mems, dims, cx).map(Bound::Rw),
+        };
+        inputs.push(bound.with_context(|| format!("operand {i}"))?);
+    }
+    let outputs = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, &tensor)| {
+            bind_rw(graph.tensor(tensor), &mut mems, dims, cx)
+                .with_context(|| format!("output {i}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(OpIo {
+        inputs,
+        outputs,
+        scratch,
+        dims,
+    })
+}
+
+/// Zeroed, hint-sized buffers for one op, for autotuning.
+struct HintBuffers {
+    dims: DimValues,
+    buffers: Vec<(BufferId, bool, DeviceMemory)>,
+    scratch: Option<DeviceMemory>,
+}
+
+impl HintBuffers {
+    fn new(bcx: &BuildCx<'_>) -> anyhow::Result<Self> {
+        let dims = bcx.graph.hint_values();
+        let stream = bcx.cx.default_compute_stream();
+        let buffers = op_buffer_access(bcx.graph, bcx.operands, bcx.operand_access, bcx.outputs)
+            .into_iter()
+            .map(|(buffer, write)| {
+                let bytes = bcx.graph.buffer(buffer).bytes.eval(&dims)?;
+                Ok((buffer, write, bcx.pool.alloc_zeroed_on(bytes, stream)?))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self {
+            dims,
+            buffers,
+            scratch: None,
+        })
+    }
+
+    fn ensure_scratch(&mut self, bytes: usize, bcx: &BuildCx<'_>) -> anyhow::Result<()> {
+        if bytes > 0 && self.scratch.as_ref().is_none_or(|s| s.len() < bytes) {
+            self.scratch = Some(
+                bcx.pool
+                    .alloc_zeroed_on(bytes, bcx.cx.default_compute_stream())?,
+            );
+        }
+        Ok(())
+    }
+
+    fn io<'a>(&'a mut self, scratch_bytes: usize, bcx: &BuildCx<'_>) -> anyhow::Result<OpIo<'a>> {
+        let mems = self
+            .buffers
+            .iter_mut()
+            .map(|(buffer, write, mem)| {
+                let mem = if *write {
+                    Mem::Rw(mem.slice_mut(..))
+                } else {
+                    Mem::Ro(mem.slice(..))
+                };
+                (*buffer, mem)
+            })
+            .collect();
+        let scratch = match (&mut self.scratch, scratch_bytes) {
+            (_, 0) => None,
+            (Some(scratch), n) => Some(scratch.slice_mut(..n)),
+            (None, _) => bail!("scratch memory was not allocated"),
+        };
+        bind_io(
+            bcx.graph,
+            bcx.operands,
+            bcx.operand_access,
+            bcx.outputs,
+            mems,
+            scratch,
+            &self.dims,
+            bcx.cx,
+        )
+    }
+}
