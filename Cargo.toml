@@ -1,8 +1,8 @@
 [workspace]
 members = [
     "crates/cleandl", "crates/kernel-build-util",
-    "crates/kernel-generator",
-    "crates/kernel-generator/cli",
+    "crates/cleandl-specialized-kernels",
+    "crates/cleandl-specialized-kernels/cli",
     "crates/sky-1",
     "crates/skytokens",
 ]

@@ -199,6 +199,10 @@ impl MxFormat {
             MxFormat::Nvfp4 => ElementType::Float(FloatType::F8E4M3),
         }
     }
+
+    pub fn has_global_scale_factor(self) -> bool {
+        matches!(self, MxFormat::Nvfp4)
+    }
 }
 
 /// Whether a tensor is block-scaled along its rows or along its columns.

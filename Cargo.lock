@@ -603,7 +603,9 @@ dependencies = [
  "skycuda",
  "skycuda-cublaslt",
  "skytens-core",
+ "slotmap",
  "thread_local",
+ "tileir-builder 0.1.0 (git+https://github.com/caelunshun/tileir-rs)",
  "tracing",
  "typetag",
  "wide",
@@ -2076,8 +2078,8 @@ dependencies = [
  "serde",
  "skycuda",
  "thiserror 2.0.21",
- "tileir",
- "tileir-builder",
+ "tileir 0.1.0",
+ "tileir-builder 0.1.0",
 ]
 
 [[package]]
@@ -3854,6 +3856,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tileir"
+version = "0.1.0"
+source = "git+https://github.com/caelunshun/tileir-rs#a3ef937a717ea8015c326d0088b2f8fc9242a574"
+dependencies = [
+ "bitflags 2.13.2",
+ "boxcar",
+ "half",
+ "indexmap",
+ "slotmap",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tileir-builder"
 version = "0.1.0"
 dependencies = [
@@ -3861,7 +3877,19 @@ dependencies = [
  "half",
  "skycuda",
  "thiserror 2.0.21",
- "tileir",
+ "tileir 0.1.0",
+]
+
+[[package]]
+name = "tileir-builder"
+version = "0.1.0"
+source = "git+https://github.com/caelunshun/tileir-rs#a3ef937a717ea8015c326d0088b2f8fc9242a574"
+dependencies = [
+ "bytemuck",
+ "half",
+ "skycuda",
+ "thiserror 2.0.21",
+ "tileir 0.1.0 (git+https://github.com/caelunshun/tileir-rs)",
 ]
 
 [[package]]

@@ -7,8 +7,8 @@ edition = "2024"
 derive-where = { version = "1.7.0", features = ["serde"] }
 nvvm-builder = { path = "../../../nvvm-rs/crates/nvvm-builder" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-tileir-builder = { path = "../../../tileir-rs/crates/tileir-builder" }
+tileir-builder = { git = "https://github.com/caelunshun/tileir-rs" }
 skycuda = { git = "https://github.com/caelunshun/skycuda" }
 thiserror = "2.0.21"
 boxcar = "0.2.14"
-tileir = { path = "../../../tileir-rs/crates/tileir" }
+tileir = { git = "https://github.com/caelunshun/tileir-rs" }
