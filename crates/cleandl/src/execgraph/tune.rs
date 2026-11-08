@@ -3,7 +3,7 @@ use anyhow::ensure;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use skycuda::stream::Stream;
-use std::{cell::Cell, time::Duration};
+use std::time::Duration;
 
 /// Bump to invalidate all cached tuning results.
 const TUNER_VERSION: u32 = 1;
@@ -141,7 +141,12 @@ impl<'a> Tuner<'a> {
             key.op
         );
 
-        let gpu_guard = GpuLockGuard::lock(self.cx);
+        ensure!(
+            !self.cx.holds_gpu_lock(),
+            "{}: cannot measure while this thread holds the GPU lock (nested tuning?)",
+            key.op
+        );
+        let gpu_guard = self.cx.gpu_lock();
 
         // Another thread may have tuned the same key while we were preparing.
         if let Some(cached) = self.cached(key, &candidates)?
@@ -203,35 +208,6 @@ impl<'a> Tuner<'a> {
             key.op
         );
         Ok(None)
-    }
-}
-
-thread_local! {
-    static HOLDING_GPU_LOCK: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Holds [`Context::gpu_lock`], recording that this thread holds it so that
-/// non-reentrant callers can fail instead of deadlocking.
-pub(crate) struct GpuLockGuard<'a> {
-    _guard: parking_lot::MutexGuard<'a, ()>,
-}
-
-impl<'a> GpuLockGuard<'a> {
-    pub fn lock(cx: &'a Context) -> Self {
-        let guard = cx.gpu_lock().lock();
-        HOLDING_GPU_LOCK.set(true);
-        Self { _guard: guard }
-    }
-
-    /// Whether this thread holds the GPU lock through a [`GpuLockGuard`].
-    pub fn held() -> bool {
-        HOLDING_GPU_LOCK.get()
-    }
-}
-
-impl Drop for GpuLockGuard<'_> {
-    fn drop(&mut self) {
-        HOLDING_GPU_LOCK.set(false);
     }
 }
 

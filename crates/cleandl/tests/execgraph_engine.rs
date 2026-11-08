@@ -829,6 +829,16 @@ fn graph_validation_errors() -> anyhow::Result<()> {
     assert_eq!(e.to_string(), "failed to build op 0 (dummy)");
     assert_eq!(e.root_cause().to_string(), "requested failure");
 
+    // add_op1 with the wrong output count records nothing.
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [4usize, 64])?;
+    let e = err_string(gb.add_op1(Dummy::default()));
+    assert!(e.contains("expected 1 output(s), got 0"), "{e}");
+    gb.output(add_scalar(x, 1.0)?)?;
+    let graph = gb.finish()?;
+    assert_eq!(graph.num_ops(), 1);
+    ExecGraph::build(graph, &cx, off())?;
+
     // A failed add_op leaves the builder usable.
     let gb = GraphBuilder::new();
     let x = gb.input("x", F32, [4usize, 64])?;
@@ -1022,7 +1032,16 @@ fn hint_io_rejects_gpu_lock_reentry() -> anyhow::Result<()> {
                 vec![1u32, 2],
                 |&c| Ok(c),
                 |_, _| {
+                    if !self.seen.lock().is_empty() {
+                        return Ok(());
+                    }
                     let e = bcx.hint_io(0, |_| Ok(())).unwrap_err();
+                    self.seen.lock().push(e.to_string());
+                    let nested = bcx.tune_key(&(self.nonce, "nested"))?;
+                    let e = bcx
+                        .tuner
+                        .tune(&nested, vec![1u32, 2], |&c| Ok(c), |_, _| Ok(()))
+                        .unwrap_err();
                     self.seen.lock().push(e.to_string());
                     Ok(())
                 },
@@ -1055,5 +1074,7 @@ fn hint_io_rejects_gpu_lock_reentry() -> anyhow::Result<()> {
     let seen = seen.lock();
     assert!(!seen.is_empty());
     assert!(seen.iter().all(|e| e.contains("GPU lock")), "{seen:?}");
+    assert!(seen.iter().any(|e| e.contains("nested tuning")), "{seen:?}");
+    assert!(!cx.holds_gpu_lock());
     Ok(())
 }

@@ -4,7 +4,7 @@ use super::{
     bind::HintBuffers,
     graph::{BufferId, BufferInfo, SymTensorData, SymTensorId},
     sym::{DimValues, SymDims, SymLayout, SymShape},
-    tune::{Autotune, GpuLockGuard, TuneKey, Tuner},
+    tune::{Autotune, TuneKey, Tuner},
 };
 use crate::{
     context::Context,
@@ -227,18 +227,22 @@ impl BuildCx<'_> {
     /// inside a `run` closure of [`Tuner::tune`]); use [`Self::tune_with_io`] there.
     /// Buffers live for the duration of `f`, so concurrent builds calling this hold
     /// several sets at once; prefer [`Self::tune_with_io`] for large operators.
+    ///
+    /// Since `f` runs unlocked, it must submit GPU work only through [`Tuner::tune`]
+    /// (whose `run` closure executes under the lock); work submitted directly from
+    /// `f` may overlap other ops' measurements.
     pub fn hint_io<R>(
         &self,
         scratch_bytes: usize,
         f: impl FnOnce(&mut OpIo<'_>) -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
         ensure!(
-            !GpuLockGuard::held(),
+            !self.cx.holds_gpu_lock(),
             "{}: hint_io cannot be called while holding the GPU lock; use tune_with_io",
             self.op_name
         );
         let mut buffers = {
-            let _gpu = GpuLockGuard::lock(self.cx);
+            let _gpu = self.cx.gpu_lock();
             let mut buffers = HintBuffers::new(self)?;
             buffers.ensure_scratch(scratch_bytes, self)?;
             self.cx.default_compute_stream().block_on()?;
@@ -247,7 +251,7 @@ impl BuildCx<'_> {
         let result = buffers
             .io(scratch_bytes, self)
             .and_then(|mut io| f(&mut io));
-        let _gpu = GpuLockGuard::lock(self.cx);
+        let _gpu = self.cx.gpu_lock();
         drop(buffers);
         result
     }
@@ -285,7 +289,7 @@ impl BuildCx<'_> {
                 run(prepared, &mut io, stream)
             });
         if buffers.is_some() {
-            let _gpu = GpuLockGuard::lock(self.cx);
+            let _gpu = self.cx.gpu_lock();
             drop(buffers);
         }
         result

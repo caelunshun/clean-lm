@@ -340,6 +340,14 @@ impl GraphBuilder {
 
     /// Records an operator and returns handles to its outputs.
     pub fn add_op(&self, op: impl Operator) -> anyhow::Result<Vec<SymTensor<'_>>> {
+        self.add_op_impl(op, None)
+    }
+
+    fn add_op_impl(
+        &self,
+        op: impl Operator,
+        expected_outputs: Option<usize>,
+    ) -> anyhow::Result<Vec<SymTensor<'_>>> {
         let mut state = self.state.borrow_mut();
         let op_index = state.ops.len();
         let name = op.name().to_owned();
@@ -366,6 +374,13 @@ impl GraphBuilder {
         let specs = op
             .infer_outputs(&state.info)
             .with_context(|| name.clone())?;
+        if let Some(expected) = expected_outputs {
+            ensure!(
+                specs.len() == expected,
+                "{name}: expected {expected} output(s), got {}",
+                specs.len()
+            );
+        }
         let (num_tensors, num_buffers) = (state.info.tensors.len(), state.info.buffers.len());
         let mut outputs = Vec::with_capacity(specs.len());
         for (i, spec) in specs.into_iter().enumerate() {
@@ -389,14 +404,7 @@ impl GraphBuilder {
 
     /// Like [`Self::add_op`] for operators with exactly one output.
     pub fn add_op1(&self, op: impl Operator) -> anyhow::Result<SymTensor<'_>> {
-        let name = op.name().to_owned();
-        let outputs = self.add_op(op)?;
-        ensure!(
-            outputs.len() == 1,
-            "{name}: expected one output, got {}",
-            outputs.len()
-        );
-        Ok(outputs[0])
+        Ok(self.add_op_impl(op, Some(1))?[0])
     }
 
     /// Marks a tensor as a graph output, returned by [`ExecGraph::execute`](super::ExecGraph::execute)
@@ -421,6 +429,16 @@ impl GraphBuilder {
     }
 
     /// Validates the graph and returns its immutable description.
+    ///
+    /// Inferability of dynamic dimensions is checked conservatively, but some
+    /// failures are only detected at execution (still before any GPU work):
+    /// - A dimension inferable only through an input stride is unbound when that
+    ///   stride's dimension has size 1 or the input is empty, since such strides are
+    ///   not matched; this is an error if the dimension appears in a shape.
+    /// - A stride that is a product of several dimensions not otherwise inferable
+    ///   (e.g. `a * b`) is accepted if they appear in no shape, but determines neither,
+    ///   so execution fails unless that stride's dimension has size 1 or the input is
+    ///   empty (in which case they are bound to their hints).
     pub fn finish(self) -> anyhow::Result<Graph> {
         let state = self.state.into_inner();
         let graph = Graph {

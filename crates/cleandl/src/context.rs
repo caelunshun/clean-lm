@@ -14,6 +14,7 @@ use skycuda_cublaslt::CublasLtHandle;
 // use skycuda_cudnn::CudnnHandle;
 use std::{
     any::{Any, TypeId},
+    cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -170,8 +171,28 @@ impl Context {
 
     /// Held while measuring GPU work that requires exclusive access to the device,
     /// such as autotuning. Shared by all contexts on the same device; not reentrant.
-    pub fn gpu_lock(&self) -> &parking_lot::Mutex<()> {
-        &self.0.gpu_lock
+    ///
+    /// Panics if this thread already holds the lock for this device; check
+    /// [`Self::holds_gpu_lock`] first where nesting is possible.
+    #[track_caller]
+    pub fn gpu_lock(&self) -> GpuLockGuard<'_> {
+        let device = self.cuda().ordinal();
+        assert!(
+            !self.holds_gpu_lock(),
+            "GPU lock for device {device} is already held by this thread"
+        );
+        let guard = self.0.gpu_lock.lock();
+        HELD_GPU_LOCKS.with_borrow_mut(|held| held.push(device));
+        GpuLockGuard {
+            _guard: guard,
+            device,
+        }
+    }
+
+    /// Whether this thread holds [`Self::gpu_lock`] for this context's device.
+    pub fn holds_gpu_lock(&self) -> bool {
+        let device = self.cuda().ordinal();
+        HELD_GPU_LOCKS.with_borrow(|held| held.contains(&device))
     }
 
     pub(crate) fn jit_kernels(&self) -> &JitKernelCache {
@@ -198,6 +219,27 @@ impl Context {
             (12, 1) => Arch::Compute121a,
             (maj, min) => Arch::Other(format!("compute_{}", maj * 10 + min)),
         }
+    }
+}
+
+thread_local! {
+    /// Devices whose GPU lock this thread holds.
+    static HELD_GPU_LOCKS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Holds a device's [`Context::gpu_lock`].
+pub struct GpuLockGuard<'a> {
+    _guard: parking_lot::MutexGuard<'a, ()>,
+    device: u32,
+}
+
+impl Drop for GpuLockGuard<'_> {
+    fn drop(&mut self) {
+        HELD_GPU_LOCKS.with_borrow_mut(|held| {
+            if let Some(i) = held.iter().position(|&d| d == self.device) {
+                held.swap_remove(i);
+            }
+        });
     }
 }
 
@@ -232,6 +274,24 @@ struct Inner {
     gpu_lock: Arc<parking_lot::Mutex<()>>,
     jit_kernels: JitKernelCache,
     cublaslt: CublasLtHandle,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Pending stream-ordered frees must complete before the memory pool is destroyed,
+        // and synchronizing runs deferred host-memory releases that otherwise keep the
+        // streams (and the CUDA context) alive through event reference cycles.
+        for stream in [
+            &self.default_compute_stream,
+            &self.h2d_copy_stream,
+            &self.d2h_copy_stream,
+            &self.memset_stream,
+        ] {
+            if let Err(e) = stream.block_on() {
+                tracing::error!("failed to synchronize stream while dropping context: {e}");
+            }
+        }
+    }
 }
 
 pub trait ResourceKey: Serialize + 'static {

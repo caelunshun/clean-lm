@@ -4,7 +4,6 @@ use super::{
     graph::{BufferId, SymTensorData, SymTensorId},
     op::{Access, Bound, BuildCx, GraphInfo, OpIo, TensorRef, TensorRefMut, op_buffer_access},
     sym::{DimValues, SymLayout},
-    tune::GpuLockGuard,
 };
 use crate::{
     context::Context,
@@ -307,7 +306,7 @@ pub(crate) struct HintBuffers {
 impl HintBuffers {
     /// Must be called with the GPU lock held: zeroing runs on the default compute stream.
     pub fn new(bcx: &BuildCx<'_>) -> anyhow::Result<Self> {
-        debug_assert!(GpuLockGuard::held());
+        debug_assert!(bcx.cx.holds_gpu_lock());
         let dims = bcx.graph.hint_values();
         let stream = bcx.cx.default_compute_stream();
         let mut sizes = HashMap::new();
