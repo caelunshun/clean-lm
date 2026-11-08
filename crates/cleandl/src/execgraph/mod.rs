@@ -33,6 +33,7 @@ pub struct BuildOptions {
 
 /// A graph input bound at execution time. Mutable inputs must be given as [`Input::Rw`].
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Input<'a> {
     Ro(TensorRef<'a>),
     Rw(TensorRefMut<'a>),
@@ -88,6 +89,7 @@ impl<'a> From<&'a mut MxTensor> for Input<'a> {
 
 /// A graph output, owning its storage.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum GraphOutput {
     Plain(Tensor),
     Mx(MxTensor),
