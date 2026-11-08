@@ -4,7 +4,7 @@ pub mod tensor;
 pub mod autotuning;
 pub mod context;
 pub mod disk_cache;
+pub mod execgraph;
 pub mod executors;
 pub mod mx_tensor;
 pub mod par_random;
-pub mod execgraph;

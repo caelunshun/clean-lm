@@ -1,3 +1,4 @@
+use super::sym::{SymDim, SymDimId, SymShape};
 use crate::mx_tensor::MxFormat;
 use skytens_core::data_type::ElementType;
 use slotmap::{SlotMap, new_key_type};
@@ -9,11 +10,6 @@ new_key_type! {
 
 new_key_type! {
     pub struct SymTensorId;
-}
-
-new_key_type! {
-    /// Symbolic dimension: exact value not necessarily known at graph build time.
-    pub struct SymDimId;
 }
 
 pub struct ExecGraphBuilder {
@@ -59,29 +55,7 @@ pub struct SymTensor {
 }
 
 #[derive(Debug, Clone)]
-pub struct SymShape(Vec<Dim>);
-
-impl SymShape {
-    // TODO
-}
-
-#[derive(Debug, Clone)]
 pub enum TensorTy {
     Plain(ElementType),
     BlockScaled(MxFormat),
-}
-
-#[derive(Debug, Clone)]
-pub enum Dim {
-    /// Fixed-size dimension known at graph build time.
-    Fixed(usize),
-    /// Dynamic dimension known only at graph execution time.
-    Dynamic(SymDimId),
-}
-
-/// Stores guarantees about a dimension known ahead-of-time.
-#[derive(Debug, Clone)]
-pub struct SymDim {
-    /// Size is guaranteed to be a multiple of exp2(this value).
-    pub alignment_log2: u32,
 }
