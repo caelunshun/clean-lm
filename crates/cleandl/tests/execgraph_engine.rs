@@ -180,9 +180,10 @@ impl Executor for AddExecutor {
             );
             unsafe { self.kernel.launch(args, grid, stream)? };
         } else {
-            let x_ref = io.inputs[0].as_ref();
+            let x_ref = io.input_ro(0);
             let x = x_ref.plain();
-            let out = io.outputs[0].plain();
+            let (_, outputs, _) = io.split();
+            let out = outputs[0].plain();
             let out_strides = dims_i64(out.strides().dims());
             let mut args = ArgBundle::new();
             args.set(
@@ -356,7 +357,8 @@ fn dynamic_dims_unify_and_validate() -> anyhow::Result<()> {
     assert!(e.contains("alignment"), "{e}");
     // Wrong rank, type and count.
     let x_bad = upload(&host_iota(48, 1.0), [48], &cx);
-    assert!(run(&eg, &mut [(&x_bad).into(), (&yt).into()], &cx).is_err());
+    let e = err_string(run(&eg, &mut [(&x_bad).into(), (&yt).into()], &cx));
+    assert!(e.contains("x: expected rank 2"), "{e}");
     let x_bf16 = Tensor::new_zeroed([48, 40], BF16, cx.default_compute_stream(), &cx)?;
     let e = err_string(run(&eg, &mut [(&x_bf16).into(), (&yt).into()], &cx));
     assert!(e.contains("input x"), "{e}");
@@ -638,8 +640,10 @@ fn init_modes_scratch_and_mx() -> anyhow::Result<()> {
         MxDim::Rowwise,
         [Monomial::from(rows), 64.into()],
     )?;
-    assert!(m.transposed(0, 1).is_err());
-    assert!(m.reshaped([64usize * 128]).is_err());
+    let e = err_string(m.transposed(0, 1));
+    assert!(e.contains("cannot transpose a block-scaled tensor"), "{e}");
+    let e = err_string(m.reshaped([64usize * 128]));
+    assert!(e.contains("cannot reshape a block-scaled tensor"), "{e}");
     let shape = SymShape::new([Monomial::from(rows)]);
     let outs = gb.add_op(Dummy {
         operands: vec![Operand::read(x.id()), Operand::read(m.id())],
@@ -689,15 +693,17 @@ fn init_modes_scratch_and_mx() -> anyhow::Result<()> {
 
     // MX input with the wrong format or shape.
     let bad = MxTensor::new_zeroed([40, 64], MxFormat::Nvfp4, MxDim::Rowwise, stream, &cx)?;
-    assert!(
-        eg.execute_default(&mut [(&xt).into(), (&bad).into()], stream)
-            .is_err()
-    );
+    let e = err_string(eg.execute_default(&mut [(&xt).into(), (&bad).into()], stream));
+    assert!(e.contains("input m: expected BlockScaled"), "{e}");
     let bad = MxTensor::new_zeroed([41, 64], MxFormat::Mxfp8, MxDim::Rowwise, stream, &cx)?;
-    assert!(
-        eg.execute_default(&mut [(&xt).into(), (&bad).into()], stream)
-            .is_err()
-    );
+    let e = err_string(eg.execute_default(&mut [(&xt).into(), (&bad).into()], stream));
+    assert!(e.contains("m shape[0]"), "{e}");
+
+    // Empty block-scaled tensors are rejected before any work is enqueued.
+    let x0 = Tensor::new_zeroed([0, 8], F32, stream, &cx)?;
+    let m0 = MxTensor::new_zeroed([0, 64], MxFormat::Mxfp8, MxDim::Rowwise, stream, &cx)?;
+    let e = err_string(eg.execute_default(&mut [(&x0).into(), (&m0).into()], stream));
+    assert!(e.contains("block-scaled tensors must not be empty"), "{e}");
     Ok(())
 }
 
@@ -758,9 +764,12 @@ fn graph_validation_errors() -> anyhow::Result<()> {
         e.contains("without copying") && e.contains("strides [1, 6]"),
         "{e}"
     );
-    assert!(x.reshaped([5usize, 5]).is_err());
-    assert!(x.transposed(0, 2).is_err());
-    assert!(x.sliced(1, 4, 3).is_err());
+    let e = err_string(x.reshaped([5usize, 5]));
+    assert!(e.contains("cannot reshape tensor with layout"), "{e}");
+    let e = err_string(x.transposed(0, 2));
+    assert!(e.contains("out of range for rank 2"), "{e}");
+    let e = err_string(x.sliced(1, 4, 3));
+    assert!(e.contains("slice 4..7 out of range"), "{e}");
 
     // A dimension that can't be inferred from inputs.
     let gb = GraphBuilder::new();
@@ -775,7 +784,23 @@ fn graph_validation_errors() -> anyhow::Result<()> {
     // Duplicate input names.
     let gb = GraphBuilder::new();
     gb.input("x", F32, [4usize])?;
-    assert!(gb.input("x", F32, [4usize]).is_err());
+    let e = err_string(gb.input("x", F32, [4usize]));
+    assert!(e.contains("duplicate graph input name x"), "{e}");
+
+    // Dimensions only appearing in products are not inferable.
+    let gb = GraphBuilder::new();
+    let b = gb.dynamic_dim("b", 4, 0);
+    let s = gb.dynamic_dim("s", 4, 0);
+    gb.input("x", F32, [Monomial::new(1, [b, s]), 16.into()])?;
+    let e = err_string(gb.finish());
+    assert!(e.contains("cannot be inferred"), "{e}");
+    // ... unless the other factor is bound elsewhere.
+    let gb = GraphBuilder::new();
+    let b = gb.dynamic_dim("b", 4, 0);
+    let s = gb.dynamic_dim("s", 4, 0);
+    gb.input("x", F32, [Monomial::new(1, [b, s]), 16.into()])?;
+    gb.input("y", F32, [Monomial::from(b)])?;
+    gb.finish()?;
 
     // Build errors name the op.
     let gb = GraphBuilder::new();
@@ -791,6 +816,40 @@ fn graph_validation_errors() -> anyhow::Result<()> {
     assert!(
         e.contains("2 ops failed") && e.contains("op 1 (dummy)") && e.contains("requested failure"),
         "{e}"
+    );
+    // A single build error keeps its chain.
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [4usize, 4])?;
+    gb.add_op(Dummy {
+        operands: vec![Operand::read(x.id())],
+        fail_build: true,
+        ..Default::default()
+    })?;
+    let e = ExecGraph::build(gb.finish()?, &cx, off()).unwrap_err();
+    assert_eq!(e.to_string(), "failed to build op 0 (dummy)");
+    assert_eq!(e.root_cause().to_string(), "requested failure");
+
+    // A failed add_op leaves the builder usable.
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [4usize, 64])?;
+    let e = err_string(gb.add_op(Dummy {
+        outputs: vec![
+            OutputSpec::new(F32, SymShape::new([4.into()]), Init::Zero),
+            OutputSpec::new(BF16, SymShape::new([4.into()]), Init::Fill32(0)),
+        ],
+        ..Default::default()
+    }));
+    assert!(e.contains("dummy: output 1") && e.contains("32-bit"), "{e}");
+    gb.output(add_scalar(x, 1.0)?)?;
+    let eg = ExecGraph::build(gb.finish()?, &cx, off())?;
+    let xt = upload(&host_iota(4 * 64, 1.0), [4, 64], &cx);
+    let out = run(&eg, &mut [(&xt).into()], &cx)?;
+    assert_eq!(
+        download::<f32>(&out[0], &cx)?,
+        host_iota(4 * 64, 1.0)
+            .iter()
+            .map(|v| v + 1.0)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -821,5 +880,180 @@ fn execute_on_custom_pool_and_stream() -> anyhow::Result<()> {
         download::<f32>(&out.into_iter().next().unwrap().into_plain(), &cx)?,
         host.iter().map(|v| v - 1.0).collect::<Vec<_>>()
     );
+    Ok(())
+}
+
+#[test]
+fn diamond_liveness() -> anyhow::Result<()> {
+    let cx = test_context();
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [1usize])?;
+    let spec = |n: usize| OutputSpec::new(F32, SymShape::new([n.into()]), Init::Zero);
+    let dummy = |operands: Vec<SymTensor<'_>>, n: usize| Dummy {
+        operands: operands
+            .into_iter()
+            .map(|t| Operand::read(t.id()))
+            .collect(),
+        outputs: vec![spec(n)],
+        ..Default::default()
+    };
+    let (sa, sb, sc, sd) = (1usize << 16, 1 << 10, 1 << 12, 1 << 14);
+    let a = gb.add_op1(dummy(vec![x], sa))?;
+    let b = gb.add_op1(dummy(vec![a], sb))?;
+    let c = gb.add_op1(dummy(vec![b], sc))?;
+    // `a` must stay alive until this late consumer.
+    let d = gb.add_op1(dummy(vec![a, c], sd))?;
+    gb.output(d)?;
+    let eg = ExecGraph::build(gb.finish()?, &cx, off())?;
+
+    let pool = cx
+        .cuda()
+        .create_device_memory_pool(DeviceMemoryPoolOptions::default())?;
+    let stream = cx.default_compute_stream();
+    let xt = upload(&[0.0], [1], &cx);
+    let out = eg.execute(&mut [(&xt).into()], stream, &pool)?;
+    stream.block_on()?;
+    let peak = 4 * (sa + sb + sc).max(sa + sc + sd);
+    assert_eq!(pool.peak_allocated_bytes(), peak);
+    assert_eq!(pool.current_allocated_bytes(), 4 * sd);
+    drop(out);
+    Ok(())
+}
+
+#[test]
+fn stride_only_dims_and_atomic_validation() -> anyhow::Result<()> {
+    let cx = test_context();
+    let stream = cx.default_compute_stream();
+    let gb = GraphBuilder::new();
+    let rows = gb.dynamic_dim("rows", 16, 0);
+    let ld = gb.dynamic_dim("ld", 64, 0);
+    let layout = SymLayout::new(
+        SymShape::new([Monomial::from(rows), 32.into()]),
+        vec![ld.into(), 1.into()],
+        Default::default(),
+    );
+    let x = gb.input_with_layout("x", F32, layout)?;
+    gb.output(add_scalar(x, 1.0)?)?;
+    let eg = ExecGraph::build(gb.finish()?, &cx, off())?;
+    // With one row, `ld` has no equation; it doesn't affect addressing.
+    let host = host_iota(32, 1.0);
+    let xt = upload(&host, [1, 32], &cx);
+    let out = run(&eg, &mut [(&xt).into()], &cx)?;
+    assert_eq!(
+        download::<f32>(&out[0], &cx)?,
+        host.iter().map(|v| v + 1.0).collect::<Vec<_>>()
+    );
+
+    // Op 1's operand fails validation; op 0 must not have modified `x`.
+    let gb = GraphBuilder::new();
+    let rows = gb.dynamic_dim("rows", 128, 0);
+    let x = gb.input_mut("x", F32, [16usize, 64])?;
+    let m = gb.input_mx(
+        "m",
+        MxFormat::Mxfp8,
+        MxDim::Rowwise,
+        [Monomial::from(rows), 64.into()],
+    )?;
+    gb.add_op(AddScalar {
+        in_place: true,
+        ..AddScalar::new(x, 4.0)
+    })?;
+    gb.add_op(Dummy {
+        operands: vec![Operand::read(m.id())],
+        ..Default::default()
+    })?;
+    let eg = ExecGraph::build(gb.finish()?, &cx, off())?;
+    let host = host_iota(16 * 64, 1.0);
+    let mut xt = upload(&host, [16, 64], &cx);
+    let m0 = MxTensor::new_zeroed([0, 64], MxFormat::Mxfp8, MxDim::Rowwise, stream, &cx)?;
+    let e = err_string(eg.execute_default(&mut [(&mut xt).into(), (&m0).into()], stream));
+    assert!(
+        e.contains("op 1 (dummy)") && e.contains("must not be empty"),
+        "{e}"
+    );
+    assert_eq!(download::<f32>(&xt, &cx)?, host);
+    Ok(())
+}
+
+#[test]
+fn misaligned_input_storage() -> anyhow::Result<()> {
+    let cx = test_context();
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [4usize, 2])?;
+    gb.output(add_scalar(x, 1.0)?)?;
+    let eg = ExecGraph::build(gb.finish()?, &cx, off())?;
+    let host = host_iota(6 * 2, 1.0);
+    let full = upload(&host, [6, 2], &cx);
+    // One row in is 8 bytes: misaligned.
+    let e = err_string(run(&eg, &mut [full.sliced(0, 1..5).into()], &cx));
+    assert!(
+        e.contains("input x") && e.contains("16-byte aligned"),
+        "{e}"
+    );
+    let out = run(&eg, &mut [full.sliced(0, 2..6).into()], &cx)?;
+    assert_eq!(
+        download::<f32>(&out[0], &cx)?,
+        host[4..].iter().map(|v| v + 1.0).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[test]
+fn hint_io_rejects_gpu_lock_reentry() -> anyhow::Result<()> {
+    struct Reenter {
+        x: SymTensorId,
+        nonce: u64,
+        seen: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl Operator for Reenter {
+        fn name(&self) -> &str {
+            "reenter"
+        }
+        fn operands(&self) -> Vec<Operand> {
+            vec![Operand::read(self.x)]
+        }
+        fn infer_outputs(&self, _: &GraphInfo) -> anyhow::Result<Vec<OutputSpec>> {
+            Ok(vec![])
+        }
+        fn build(&self, bcx: &BuildCx<'_>) -> anyhow::Result<Box<dyn Executor>> {
+            let key = bcx.tune_key(&self.nonce)?;
+            let _ = bcx.tuner.tune(
+                &key,
+                vec![1u32, 2],
+                |&c| Ok(c),
+                |_, _| {
+                    let e = bcx.hint_io(0, |_| Ok(())).unwrap_err();
+                    self.seen.lock().push(e.to_string());
+                    Ok(())
+                },
+            );
+            // Outside the lock, hint_io works.
+            bcx.hint_io(0, |io| {
+                assert_eq!(io.input_ro(0).plain().shape(), Shape::new([4, 4]));
+                Ok(())
+            })?;
+            Ok(Box::new(DummyExecutor { scratch: None }))
+        }
+    }
+    let cx = test_context();
+    let gb = GraphBuilder::new();
+    let x = gb.input("x", F32, [4usize, 4])?;
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    gb.add_op(Reenter {
+        x: x.id(),
+        nonce: rand::random(),
+        seen: seen.clone(),
+    })?;
+    ExecGraph::build(
+        gb.finish()?,
+        &cx,
+        BuildOptions {
+            autotune: Autotune::Full,
+            pool: None,
+        },
+    )?;
+    let seen = seen.lock();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|e| e.contains("GPU lock")), "{seen:?}");
     Ok(())
 }

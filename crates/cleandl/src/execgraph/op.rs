@@ -1,25 +1,23 @@
 //! The interface between the execution graph engine and operator implementations.
 
 use super::{
+    bind::HintBuffers,
     graph::{BufferId, BufferInfo, SymTensorData, SymTensorId},
     sym::{DimValues, SymDims, SymLayout, SymShape},
-    tune::{Autotune, TuneKey, Tuner},
+    tune::{Autotune, GpuLockGuard, TuneKey, Tuner},
 };
 use crate::{
     context::Context,
-    mx_tensor::{MxDim, MxFormat, MxLayout, MxTensorView, MxTensorViewMut},
-    tensor::{TensorView, TensorViewMut, VirtTensorView},
+    mx_tensor::{MxDim, MxFormat, MxTensorView, MxTensorViewMut},
+    tensor::{TensorView, TensorViewMut},
 };
-use anyhow::{Context as _, anyhow, bail, ensure};
+use anyhow::ensure;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use skycuda::{
-    device_memory::DeviceMemory,
-    device_memory_pool::DeviceMemoryPool,
-    memory_slice::{MemorySlice, MemorySliceMut},
-    stream::Stream,
+    device_memory::DeviceMemory, device_memory_pool::DeviceMemoryPool,
+    memory_slice::MemorySliceMut, stream::Stream,
 };
 use skytens_core::data_type::ElementType;
-use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
@@ -77,6 +75,9 @@ impl From<ElementType> for TensorTy {
 }
 
 /// Initial contents of an output buffer, established before the operator runs.
+///
+/// With [`Init::Uninit`], the buffer's contents are undefined: the operator must
+/// write every element of the output before anything reads it (including itself).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Init {
     /// The operator overwrites every element of the output.
@@ -107,6 +108,11 @@ impl OutputSpec {
 }
 
 /// A node of the graph, as recorded during tracing.
+///
+/// Memory guarantees for operator authors: every buffer (graph-owned, graph input,
+/// or hint buffer) starts at a 16-byte aligned device address, so alignment proofs
+/// from [`SymLayout::offset_is_aligned`] and [`SymLayout::stride_is_aligned`] with
+/// `align_bytes <= 16` hold for the actual addresses of bound views.
 pub trait Operator: Send + Sync + 'static {
     /// Used in errors and profiling.
     fn name(&self) -> &str;
@@ -129,6 +135,9 @@ pub trait Executor: Send + Sync + 'static {
     }
 
     /// Submits the operator on `stream`. Must not allocate device memory.
+    ///
+    /// Outputs declared [`Init::Uninit`] and the scratch memory have undefined
+    /// contents: they must be written before they are read.
     fn execute(&self, io: &mut OpIo<'_>, stream: &Stream, cx: &Context) -> anyhow::Result<()>;
 }
 
@@ -209,20 +218,80 @@ impl BuildCx<'_> {
 
     /// Runs `f` on freshly allocated, zeroed buffers shaped like this operator's
     /// operands and outputs with all dimensions at their hints, plus `scratch_bytes`
-    /// of scratch memory. Work is allocated on the context's default compute stream.
+    /// of scratch memory.
+    ///
+    /// The buffers are allocated and zeroed on the context's default compute stream
+    /// while holding [`Context::gpu_lock`], and freed under it, so this never overlaps
+    /// another op's autotuning measurement. `f` runs without the lock and may call
+    /// [`Tuner::tune`]. Errors if called while this thread holds the GPU lock (e.g.
+    /// inside a `run` closure of [`Tuner::tune`]); use [`Self::tune_with_io`] there.
+    /// Buffers live for the duration of `f`, so concurrent builds calling this hold
+    /// several sets at once; prefer [`Self::tune_with_io`] for large operators.
     pub fn hint_io<R>(
         &self,
         scratch_bytes: usize,
         f: impl FnOnce(&mut OpIo<'_>) -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
-        let mut buffers = HintBuffers::new(self)?;
-        buffers.ensure_scratch(scratch_bytes, self)?;
-        let mut io = buffers.io(scratch_bytes, self)?;
-        f(&mut io)
+        ensure!(
+            !GpuLockGuard::held(),
+            "{}: hint_io cannot be called while holding the GPU lock; use tune_with_io",
+            self.op_name
+        );
+        let mut buffers = {
+            let _gpu = GpuLockGuard::lock(self.cx);
+            let mut buffers = HintBuffers::new(self)?;
+            buffers.ensure_scratch(scratch_bytes, self)?;
+            self.cx.default_compute_stream().block_on()?;
+            buffers
+        };
+        let result = buffers
+            .io(scratch_bytes, self)
+            .and_then(|mut io| f(&mut io));
+        let _gpu = GpuLockGuard::lock(self.cx);
+        drop(buffers);
+        result
     }
 
-    /// Tunes over candidates whose prepared state is an [`Executor`], measuring each
-    /// on hint-shaped buffers (allocated only if measurement is needed).
+    /// [`Tuner::tune`], with each run given hint-shaped buffers like [`Self::hint_io`]
+    /// and `scratch_bytes(prepared, hint_dims)` bytes of scratch.
+    ///
+    /// Buffers are allocated and zeroed lazily inside the tuner's locked measurement
+    /// region (during a candidate's warmup run, which is synchronized before timing
+    /// starts), so they exist only if measurement is needed, at most one tuning op
+    /// holds them at a time, and no build work overlaps another measurement.
+    pub fn tune_with_io<C, P>(
+        &self,
+        key: &TuneKey,
+        candidates: Vec<C>,
+        prepare: impl Fn(&C) -> anyhow::Result<P> + Sync,
+        scratch_bytes: impl Fn(&P, &DimValues) -> usize,
+        mut run: impl FnMut(&P, &mut OpIo<'_>, &Stream) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(C, P)>
+    where
+        C: Serialize + DeserializeOwned + Clone + Send + Sync,
+        P: Send,
+    {
+        let mut buffers: Option<HintBuffers> = None;
+        let result = self
+            .tuner
+            .tune(key, candidates, prepare, |prepared, stream| {
+                let buffers = match &mut buffers {
+                    Some(buffers) => buffers,
+                    None => buffers.insert(HintBuffers::new(self)?),
+                };
+                let scratch_bytes = scratch_bytes(prepared, &buffers.dims);
+                buffers.ensure_scratch(scratch_bytes, self)?;
+                let mut io = buffers.io(scratch_bytes, self)?;
+                run(prepared, &mut io, stream)
+            });
+        if buffers.is_some() {
+            let _gpu = GpuLockGuard::lock(self.cx);
+            drop(buffers);
+        }
+        result
+    }
+
+    /// [`Self::tune_with_io`] for candidates whose prepared state is an [`Executor`].
     pub fn tune_executor<C, E>(
         &self,
         key: &TuneKey,
@@ -233,18 +302,13 @@ impl BuildCx<'_> {
         C: Serialize + DeserializeOwned + Clone + Send + Sync,
         E: Executor,
     {
-        let mut buffers: Option<HintBuffers> = None;
-        self.tuner
-            .tune(key, candidates, prepare, |executor, stream| {
-                let buffers = match &mut buffers {
-                    Some(buffers) => buffers,
-                    None => buffers.insert(HintBuffers::new(self)?),
-                };
-                let scratch_bytes = executor.scratch_bytes(&buffers.dims);
-                buffers.ensure_scratch(scratch_bytes, self)?;
-                let mut io = buffers.io(scratch_bytes, self)?;
-                executor.execute(&mut io, stream, self.cx)
-            })
+        self.tune_with_io(
+            key,
+            candidates,
+            prepare,
+            |executor, dims| executor.scratch_bytes(dims),
+            |executor, io, stream| executor.execute(io, stream, self.cx),
+        )
     }
 }
 
@@ -263,6 +327,25 @@ impl<'a> OpIo<'a> {
     #[track_caller]
     pub fn input(&self, i: usize) -> TensorRef<'_> {
         self.inputs[i].as_ref()
+    }
+
+    /// A [`Access::ReadOnly`] operand. Not tied to the borrow of `self`, so it can be
+    /// held together with outputs and scratch.
+    #[track_caller]
+    pub fn input_ro(&self, i: usize) -> TensorRef<'a> {
+        self.inputs[i].ro().clone()
+    }
+
+    /// Operands, outputs and scratch, borrowed together.
+    #[allow(clippy::type_complexity)]
+    pub fn split(
+        &mut self,
+    ) -> (
+        &mut [Bound<'a>],
+        &mut [TensorRefMut<'a>],
+        Option<&mut MemorySliceMut<&'a mut DeviceMemory>>,
+    ) {
+        (&mut self.inputs, &mut self.outputs, self.scratch.as_mut())
     }
 
     /// A [`Access::ReadWrite`] operand.
@@ -405,6 +488,15 @@ pub enum Bound<'a> {
 }
 
 impl<'a> Bound<'a> {
+    /// A [`Access::ReadOnly`] operand, with the full lifetime of the binding.
+    #[track_caller]
+    pub fn ro(&self) -> &TensorRef<'a> {
+        match self {
+            Bound::Ro(t) => t,
+            Bound::Rw(_) => panic!("operand is read-write; use as_ref"),
+        }
+    }
+
     pub fn as_ref(&self) -> TensorRef<'_> {
         match self {
             Bound::Ro(t) => t.clone(),
@@ -421,14 +513,6 @@ impl<'a> Bound<'a> {
         }
     }
 }
-
-/// Device memory of one graph buffer, borrowed for one operator execution.
-pub(crate) enum Mem<'a> {
-    Ro(MemorySlice<&'a DeviceMemory>),
-    Rw(MemorySliceMut<&'a mut DeviceMemory>),
-}
-
-pub(crate) type MemMap<'a> = HashMap<BufferId, Mem<'a>>;
 
 /// Distinct buffers used by an op, and whether each is written.
 pub(crate) fn op_buffer_access(
@@ -452,247 +536,4 @@ pub(crate) fn op_buffer_access(
         }
     }
     buffers
-}
-
-/// Evaluates a plain tensor's layout, returning its view and byte offset into the buffer.
-fn eval_plain(
-    layout: &SymLayout,
-    ty: ElementType,
-    dims: &DimValues,
-) -> anyhow::Result<(VirtTensorView, usize)> {
-    let (shape, strides, offset) = layout.eval(dims)?;
-    let virt = VirtTensorView::with_strides(shape, strides, ty);
-    if shape.element_count() == 0 {
-        return Ok((virt, 0));
-    }
-    let offset_bits = offset
-        .checked_mul(ty.bits_per_element())
-        .ok_or_else(|| anyhow!("tensor offset overflows"))?;
-    ensure!(
-        offset_bits.is_multiple_of(8),
-        "tensor offset of {offset} {ty:?} elements is not byte-aligned"
-    );
-    Ok((virt, offset_bits / 8))
-}
-
-fn check_fits(virt: &VirtTensorView, offset: usize, len: usize) -> anyhow::Result<()> {
-    let end = offset
-        .checked_add(virt.required_bytes())
-        .ok_or_else(|| anyhow!("tensor extent overflows"))?;
-    ensure!(
-        end <= len,
-        "tensor with shape {:?} and strides {:?} at byte offset {offset} needs {end} bytes, but its buffer has {len}",
-        virt.shape(),
-        virt.strides()
-    );
-    Ok(())
-}
-
-fn view_ro<'a>(
-    mem: MemorySlice<&'a DeviceMemory>,
-    virt: VirtTensorView,
-    offset: usize,
-    cx: &Context,
-) -> anyhow::Result<TensorView<'a>> {
-    check_fits(&virt, offset, mem.len())?;
-    let (start, end) = (mem.offset() + offset, mem.offset() + mem.len());
-    Ok(TensorView::from_parts(
-        virt,
-        mem.into_inner().slice(start..end),
-        cx,
-    ))
-}
-
-fn view_rw<'a>(
-    mem: MemorySliceMut<&'a mut DeviceMemory>,
-    virt: VirtTensorView,
-    offset: usize,
-    cx: &Context,
-) -> anyhow::Result<TensorViewMut<'a>> {
-    check_fits(&virt, offset, mem.len())?;
-    let (start, end) = (mem.offset() + offset, mem.offset() + mem.len());
-    Ok(TensorViewMut::from_parts(
-        virt,
-        mem.into_inner().slice_mut(start..end),
-        cx,
-    ))
-}
-
-fn take_ro<'a>(mems: &MemMap<'a>, buffer: BufferId) -> MemorySlice<&'a DeviceMemory> {
-    match &mems[&buffer] {
-        Mem::Ro(mem) => *mem,
-        Mem::Rw(_) => unreachable!("buffer {buffer:?} is both read and written by one op"),
-    }
-}
-
-fn take_rw<'a>(mems: &mut MemMap<'a>, buffer: BufferId) -> MemorySliceMut<&'a mut DeviceMemory> {
-    match mems.remove(&buffer) {
-        Some(Mem::Rw(mem)) => mem,
-        _ => unreachable!("buffer {buffer:?} is written through multiple operands"),
-    }
-}
-
-pub(crate) fn bind_ro<'a>(
-    tensor: &SymTensorData,
-    mems: &MemMap<'a>,
-    dims: &DimValues,
-    cx: &Context,
-) -> anyhow::Result<TensorRef<'a>> {
-    Ok(match tensor {
-        SymTensorData::Plain { buffer, layout, ty } => {
-            let (virt, offset) = eval_plain(layout, *ty, dims)?;
-            TensorRef::Plain(view_ro(take_ro(mems, *buffer), virt, offset, cx)?)
-        }
-        SymTensorData::BlockScaled {
-            values,
-            scales,
-            format,
-            dim,
-            shape,
-        } => {
-            let shape = shape.eval(dims)?;
-            let layout = MxLayout::new(shape, *format, *dim)?;
-            TensorRef::Mx(MxTensorView::from_parts(
-                view_ro(take_ro(mems, *values), layout.values, 0, cx)?,
-                view_ro(take_ro(mems, *scales), layout.scale_factors, 0, cx)?,
-                *format,
-                *dim,
-                shape,
-            )?)
-        }
-    })
-}
-
-pub(crate) fn bind_rw<'a>(
-    tensor: &SymTensorData,
-    mems: &mut MemMap<'a>,
-    dims: &DimValues,
-    cx: &Context,
-) -> anyhow::Result<TensorRefMut<'a>> {
-    Ok(match tensor {
-        SymTensorData::Plain { buffer, layout, ty } => {
-            let (virt, offset) = eval_plain(layout, *ty, dims)?;
-            TensorRefMut::Plain(view_rw(take_rw(mems, *buffer), virt, offset, cx)?)
-        }
-        SymTensorData::BlockScaled {
-            values,
-            scales,
-            format,
-            dim,
-            shape,
-        } => {
-            let shape = shape.eval(dims)?;
-            let layout = MxLayout::new(shape, *format, *dim)?;
-            TensorRefMut::Mx(MxTensorViewMut::from_parts(
-                view_rw(take_rw(mems, *values), layout.values, 0, cx)?,
-                view_rw(take_rw(mems, *scales), layout.scale_factors, 0, cx)?,
-                *format,
-                *dim,
-                shape,
-            )?)
-        }
-    })
-}
-
-/// Binds an op's operands and outputs to the buffers in `mems`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_io<'a>(
-    graph: &GraphInfo,
-    operands: &[SymTensorId],
-    access: &[Access],
-    outputs: &[SymTensorId],
-    mut mems: MemMap<'a>,
-    scratch: Option<MemorySliceMut<&'a mut DeviceMemory>>,
-    dims: &'a DimValues,
-    cx: &Context,
-) -> anyhow::Result<OpIo<'a>> {
-    let mut inputs = Vec::with_capacity(operands.len());
-    for (i, (&tensor, &access)) in operands.iter().zip(access).enumerate() {
-        let tensor = graph.tensor(tensor);
-        let bound = match access {
-            Access::ReadOnly => bind_ro(tensor, &mems, dims, cx).map(Bound::Ro),
-            Access::ReadWrite => bind_rw(tensor, &mut mems, dims, cx).map(Bound::Rw),
-        };
-        inputs.push(bound.with_context(|| format!("operand {i}"))?);
-    }
-    let outputs = outputs
-        .iter()
-        .enumerate()
-        .map(|(i, &tensor)| {
-            bind_rw(graph.tensor(tensor), &mut mems, dims, cx)
-                .with_context(|| format!("output {i}"))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    Ok(OpIo {
-        inputs,
-        outputs,
-        scratch,
-        dims,
-    })
-}
-
-/// Zeroed, hint-sized buffers for one op, for autotuning.
-struct HintBuffers {
-    dims: DimValues,
-    buffers: Vec<(BufferId, bool, DeviceMemory)>,
-    scratch: Option<DeviceMemory>,
-}
-
-impl HintBuffers {
-    fn new(bcx: &BuildCx<'_>) -> anyhow::Result<Self> {
-        let dims = bcx.graph.hint_values();
-        let stream = bcx.cx.default_compute_stream();
-        let buffers = op_buffer_access(bcx.graph, bcx.operands, bcx.operand_access, bcx.outputs)
-            .into_iter()
-            .map(|(buffer, write)| {
-                let bytes = bcx.graph.buffer(buffer).bytes.eval(&dims)?;
-                Ok((buffer, write, bcx.pool.alloc_zeroed_on(bytes, stream)?))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Self {
-            dims,
-            buffers,
-            scratch: None,
-        })
-    }
-
-    fn ensure_scratch(&mut self, bytes: usize, bcx: &BuildCx<'_>) -> anyhow::Result<()> {
-        if bytes > 0 && self.scratch.as_ref().is_none_or(|s| s.len() < bytes) {
-            self.scratch = Some(
-                bcx.pool
-                    .alloc_zeroed_on(bytes, bcx.cx.default_compute_stream())?,
-            );
-        }
-        Ok(())
-    }
-
-    fn io<'a>(&'a mut self, scratch_bytes: usize, bcx: &BuildCx<'_>) -> anyhow::Result<OpIo<'a>> {
-        let mems = self
-            .buffers
-            .iter_mut()
-            .map(|(buffer, write, mem)| {
-                let mem = if *write {
-                    Mem::Rw(mem.slice_mut(..))
-                } else {
-                    Mem::Ro(mem.slice(..))
-                };
-                (*buffer, mem)
-            })
-            .collect();
-        let scratch = match (&mut self.scratch, scratch_bytes) {
-            (_, 0) => None,
-            (Some(scratch), n) => Some(scratch.slice_mut(..n)),
-            (None, _) => bail!("scratch memory was not allocated"),
-        };
-        bind_io(
-            bcx.graph,
-            bcx.operands,
-            bcx.operand_access,
-            bcx.outputs,
-            mems,
-            scratch,
-            &self.dims,
-            bcx.cx,
-        )
-    }
 }

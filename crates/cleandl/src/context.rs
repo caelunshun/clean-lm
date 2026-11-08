@@ -1,7 +1,6 @@
 use crate::{disk_cache::DiskCache, execgraph::jit::JitKernelCache};
 use bytemuck::Pod;
 use kernel_generator::Arch;
-use parking_lot::ReentrantMutex;
 use serde::Serialize;
 use skycuda::{
     device::Device,
@@ -15,7 +14,6 @@ use skycuda_cublaslt::CublasLtHandle;
 // use skycuda_cudnn::CudnnHandle;
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -56,7 +54,7 @@ impl Context {
             d2h_copy_stream: cuda.create_stream()?,
             memset_stream: cuda.create_stream()?,
             cuda,
-            resource_cache: ReentrantMutex::new(RefCell::new(HashMap::new())),
+            resource_cache: Default::default(),
             // default_cudnn_contexts: ThreadLocal::new(),
             // stream_cudnn_contexts: PerStreamResource::new(),
             device_memory_pool,
@@ -122,25 +120,32 @@ impl Context {
         &self.0.host_pinned_memory_pool
     }
 
+    /// Returns the cached resource for `key`, creating it if needed.
+    ///
+    /// Creation holds only a per-key lock, so different keys are created concurrently
+    /// and `create` may request other resources. Concurrent requests for the same key
+    /// wait for one creation; requesting the same key from its own `create` deadlocks.
+    /// Avoid requesting resources whose creation may autotune while holding
+    /// [`Self::gpu_lock`], since that inverts the lock order.
     pub fn get_or_create_resource<K: ResourceKey>(
         &self,
         key: K,
     ) -> anyhow::Result<Arc<K::Resource>> {
-        let cache = self.0.resource_cache.lock();
-
         let encoded_key = (TypeId::of::<K>(), postcard::to_allocvec(&key)?);
+        let slot = self
+            .0
+            .resource_cache
+            .lock()
+            .entry(encoded_key)
+            .or_default()
+            .clone();
 
-        let cache_guard = cache.borrow();
-        if let Some(resource) = cache_guard.get(&encoded_key) {
+        let mut slot = slot.lock();
+        if let Some(resource) = &*slot {
             return Ok(Arc::downcast(resource.clone()).ok().unwrap());
         }
-
-        // Allow reentrant get_or_create_resource calls in creation callback
-        drop(cache_guard);
-        let resource = key.create(self)?;
-        let resource = Arc::new(resource);
-
-        cache.borrow_mut().insert(encoded_key, resource.clone());
+        let resource = Arc::new(key.create(self)?);
+        *slot = Some(resource.clone());
         Ok(resource)
     }
 
@@ -208,6 +213,7 @@ fn device_gpu_lock(device_index: u32) -> Arc<parking_lot::Mutex<()>> {
 }
 
 type Resource = Arc<dyn Any + Send + Sync>;
+type ResourceSlot = Arc<parking_lot::Mutex<Option<Resource>>>;
 type ResourceKeyEncoded = (TypeId, Vec<u8>);
 
 #[derive(Debug)]
@@ -221,7 +227,7 @@ struct Inner {
     memset_stream: Stream,
     // default_cudnn_contexts: ThreadLocal<CudnnHandle>,
     // stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
-    resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
+    resource_cache: parking_lot::Mutex<HashMap<ResourceKeyEncoded, ResourceSlot>>,
     disk_cache: DiskCache,
     gpu_lock: Arc<parking_lot::Mutex<()>>,
     jit_kernels: JitKernelCache,
