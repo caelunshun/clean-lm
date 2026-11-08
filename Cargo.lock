@@ -584,6 +584,7 @@ dependencies = [
  "bumpalo",
  "bytemuck",
  "bytesize",
+ "cleandl-specialized-kernels",
  "directories",
  "faer",
  "float-cmp",
@@ -591,7 +592,6 @@ dependencies = [
  "float8",
  "half",
  "kernel-build-util",
- "kernel-generator",
  "parking_lot",
  "postcard",
  "rand 0.10.3",
@@ -605,10 +605,25 @@ dependencies = [
  "skytens-core",
  "slotmap",
  "thread_local",
- "tileir-builder 0.1.0 (git+https://github.com/caelunshun/tileir-rs)",
+ "tileir-builder",
  "tracing",
  "typetag",
  "wide",
+]
+
+[[package]]
+name = "cleandl-specialized-kernels"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "derive-where",
+ "kernel-build-util",
+ "nvvm-builder",
+ "serde",
+ "skycuda",
+ "skytens-core",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -2078,23 +2093,8 @@ dependencies = [
  "serde",
  "skycuda",
  "thiserror 2.0.21",
- "tileir 0.1.0",
- "tileir-builder 0.1.0",
-]
-
-[[package]]
-name = "kernel-generator"
-version = "0.1.0"
-dependencies = [
- "clap",
- "derive-where",
- "kernel-build-util",
- "nvvm-builder",
- "serde",
- "skycuda",
- "skytens-core",
- "thiserror 2.0.21",
- "tracing",
+ "tileir",
+ "tileir-builder",
 ]
 
 [[package]]
@@ -2103,8 +2103,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cleandl-specialized-kernels",
  "fs-err",
- "kernel-generator",
  "nvvm-builder",
  "tracing-subscriber",
 ]
@@ -3845,19 +3845,6 @@ dependencies = [
 [[package]]
 name = "tileir"
 version = "0.1.0"
-dependencies = [
- "bitflags 2.13.2",
- "boxcar",
- "half",
- "indexmap",
- "slotmap",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "tileir"
-version = "0.1.0"
 source = "git+https://github.com/caelunshun/tileir-rs#a3ef937a717ea8015c326d0088b2f8fc9242a574"
 dependencies = [
  "bitflags 2.13.2",
@@ -3872,24 +3859,13 @@ dependencies = [
 [[package]]
 name = "tileir-builder"
 version = "0.1.0"
-dependencies = [
- "bytemuck",
- "half",
- "skycuda",
- "thiserror 2.0.21",
- "tileir 0.1.0",
-]
-
-[[package]]
-name = "tileir-builder"
-version = "0.1.0"
 source = "git+https://github.com/caelunshun/tileir-rs#a3ef937a717ea8015c326d0088b2f8fc9242a574"
 dependencies = [
  "bytemuck",
  "half",
  "skycuda",
  "thiserror 2.0.21",
- "tileir 0.1.0 (git+https://github.com/caelunshun/tileir-rs)",
+ "tileir",
 ]
 
 [[package]]
