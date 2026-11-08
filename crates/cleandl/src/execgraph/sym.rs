@@ -939,8 +939,13 @@ impl Unifier {
         for (i, dim) in layout.shape.dims().iter().enumerate() {
             self.add_equation(format!("{label} shape[{i}]"), dim.clone(), shape[i]);
         }
-        for (i, stride) in layout.strides.iter().enumerate() {
-            self.add_equation(format!("{label} stride[{i}]"), stride.clone(), strides[i]);
+        // Strides of size-1 dims, and of tensors with no elements, never affect addressing.
+        if shape.element_count() != 0 {
+            for (i, stride) in layout.strides.iter().enumerate() {
+                if shape[i] != 1 {
+                    self.add_equation(format!("{label} stride[{i}]"), stride.clone(), strides[i]);
+                }
+            }
         }
         self.add_equation(
             format!("{label} offset"),
@@ -1748,5 +1753,64 @@ mod tests {
             }
         }
         assert!(checked > 1000);
+    }
+
+    #[test]
+    fn unify_ignores_meaningless_strides() {
+        let e = env();
+        let l =
+            SymLayout::contiguous_row_major(shape([m(e.b), m(e.s), m(64)]), BF16, &e.dims).unwrap();
+        let mut v = DimValues::new();
+        unify(
+            &l,
+            &Shape::new([1, 8, 64]),
+            &Strides::new([12345, 64, 1]),
+            0,
+            &mut v,
+            &e.dims,
+        )
+        .unwrap();
+        assert_eq!((v.get(e.b), v.get(e.s)), (Some(1), Some(8)));
+
+        let mut v = DimValues::new();
+        unify(
+            &l,
+            &Shape::new([0, 8, 64]),
+            &Strides::new([3, 3, 3]),
+            0,
+            &mut v,
+            &e.dims,
+        )
+        .unwrap();
+        assert_eq!((v.get(e.b), v.get(e.s)), (Some(0), Some(8)));
+
+        // Other strides, shapes and the offset remain strict.
+        let bad_stride = unify(
+            &l,
+            &Shape::new([1, 8, 64]),
+            &Strides::new([12345, 65, 1]),
+            0,
+            &mut DimValues::new(),
+            &e.dims,
+        );
+        assert!(bad_stride.is_err());
+        let bad_shape = unify(
+            &l,
+            &Shape::new([0, 8, 32]),
+            &Strides::new([3, 3, 3]),
+            0,
+            &mut DimValues::new(),
+            &e.dims,
+        );
+        assert!(bad_shape.is_err());
+        let bad_offset = unify(
+            &l,
+            &Shape::new([0, 8, 64]),
+            &Strides::new([3, 3, 3]),
+            1,
+            &mut DimValues::new(),
+            &e.dims,
+        );
+        assert!(bad_offset.is_err());
     }
 }
