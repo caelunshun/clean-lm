@@ -1,3 +1,4 @@
+mod bind;
 mod graph;
 pub mod jit;
 mod op;

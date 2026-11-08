@@ -794,6 +794,10 @@ impl SymLayout {
     }
 
     /// Whether the byte offset of the view is provably a multiple of `align_bytes`.
+    ///
+    /// This is relative to the start of the buffer. In execution graphs, every buffer
+    /// (including graph inputs) starts at a 16-byte aligned address, so for
+    /// `align_bytes <= 16` the proof also holds for the view's address.
     pub fn offset_is_aligned(
         &self,
         align_bytes: usize,
