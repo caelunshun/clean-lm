@@ -3,10 +3,11 @@ mod common;
 use cleandl::{
     context::Context,
     execgraph::{
-        Bound, Graph, GraphBuilder, GraphOutput, OpIo, SymTensor, SymTensorData, TensorRef,
-        TensorRefMut, TensorTy,
+        Bound, BuildOptions, ExecGraph, Graph, GraphBuilder, GraphOutput, Input, OpIo, SymTensor,
+        SymTensorData, TensorRef, TensorRefMut, TensorTy,
         ops::pointwise::{Pointwise, PwBuilder, PwOutput, Reduce},
         sym::{DimValues, Monomial, Unifier},
+        tune::Autotune,
     },
     mx_tensor::{MxDim, MxFormat, MxTensor},
     tensor::{Tensor, TensorView, VirtTensorView},
@@ -53,24 +54,42 @@ impl Case {
         Ok(outputs)
     }
 
-    fn finish(self) -> anyhow::Result<Built> {
+    fn finish(self, cx: &Context) -> anyhow::Result<Built> {
+        self.finish_with(cx, Autotune::Off)
+    }
+
+    fn finish_with(self, cx: &Context, autotune: Autotune) -> anyhow::Result<Built> {
         let mut ops = self.ops.into_inner();
         assert_eq!(ops.len(), 1, "cases have exactly one op");
+        let options = BuildOptions {
+            autotune,
+            ..Default::default()
+        };
         Ok(Built {
-            graph: self.gb.finish()?,
+            exec: ExecGraph::build(self.gb.finish()?, cx, options)?,
             op: ops.pop().unwrap(),
         })
     }
 }
 
 struct Built {
-    graph: Graph,
+    exec: ExecGraph,
     op: Pointwise,
 }
 
 impl Built {
+    fn graph(&self) -> &Graph {
+        self.exec.graph()
+    }
+
+    /// Runs the graph through the execution engine.
     fn run(&self, cx: &Context, inputs: &[TensorView<'_>]) -> anyhow::Result<Vec<GraphOutput>> {
-        self.run_direct(cx, inputs, None)
+        let mut inputs: Vec<Input<'_>> = inputs.iter().cloned().map(Input::from).collect();
+        let outputs = self
+            .exec
+            .execute_default(&mut inputs, cx.default_compute_stream())?;
+        cx.default_compute_stream().block_on()?;
+        Ok(outputs)
     }
 
     /// Runs the op's executor directly on views of `inputs`, with freshly allocated outputs.
@@ -81,12 +100,12 @@ impl Built {
         tile: Option<&[u32]>,
     ) -> anyhow::Result<Vec<GraphOutput>> {
         let stream = cx.default_compute_stream();
-        let info = self.graph.info();
+        let info = self.graph().info();
         let dims = self.bind_dims(inputs)?;
         let executor = self.op.build_executor(cx, info, tile)?;
 
         let mut outputs = Vec::new();
-        for (i, &id) in self.graph.outputs().iter().enumerate() {
+        for (i, &id) in self.graph().outputs().iter().enumerate() {
             let shape = info.shape(id).eval(&dims)?;
             outputs.push(match info.ty(id) {
                 TensorTy::Plain(ty) => GraphOutput::Plain(match &self.op.ir().outputs[i] {
@@ -133,9 +152,9 @@ impl Built {
     }
 
     fn bind_dims(&self, inputs: &[TensorView<'_>]) -> anyhow::Result<DimValues> {
-        let info = self.graph.info();
+        let info = self.graph().info();
         let mut unifier = Unifier::new();
-        for (input, tensor) in self.graph.inputs().iter().zip(inputs) {
+        for (input, tensor) in self.graph().inputs().iter().zip(inputs) {
             unifier.add_layout(
                 &input.name,
                 info.layout(input.tensor).unwrap(),
@@ -156,12 +175,12 @@ impl Built {
         inputs: &[TensorView<'a>],
         dims: &DimValues,
     ) -> anyhow::Result<TensorView<'a>> {
-        let info = self.graph.info();
+        let info = self.graph().info();
         let SymTensorData::Plain { buffer, layout, ty } = info.tensor(id) else {
             panic!("block-scaled operand")
         };
         let input = self
-            .graph
+            .graph()
             .inputs()
             .iter()
             .position(|input| match info.tensor(input.tensor) {
@@ -241,7 +260,7 @@ fn elementwise_broadcasting() -> anyhow::Result<()> {
         p.output(z, F32)?;
         p.output(y.abs().sqrt().max(x), F32)
     })?;
-    let built = case.finish()?;
+    let built = case.finish(&cx)?;
     let out = built.run(
         &cx,
         &[x.view(), bias.view(), col.reshaped([m, 1]), s.view()],
@@ -281,7 +300,7 @@ fn mixed_dtypes_and_outputs() -> anyhow::Result<()> {
         // Large magnitudes saturate to the largest finite E4M3 value.
         p.output(a * b * 300.0, E4M3)
     })?;
-    let out = case.finish()?.run(&cx, &[a.view(), b.view()])?;
+    let out = case.finish(&cx)?.run(&cx, &[a.view(), b.view()])?;
 
     let prod: Vec<f32> = ah.iter().zip(&bh).map(|(a, b)| a.to_f32() * b).collect();
     let sum: Vec<f32> = ah.iter().zip(&bh).map(|(a, b)| a.to_f32() + b).collect();
@@ -322,7 +341,7 @@ fn transposed_input_and_odd_sizes() -> anyhow::Result<()> {
         p.output(v.fma(2.0, 1.0), F32)
     })?;
     let out = case
-        .finish()?
+        .finish(&cx)?
         .run(&cx, &[x.view(), y.view(), z.reshaped([m, 1])])?;
 
     let mut expected = vec![0.0; b * m * n];
@@ -360,7 +379,7 @@ fn index_masks() -> anyhow::Result<()> {
         let even = (i % 2).eq(0) & !(j.lt(3));
         p.output(even.select(i * 1000 + j, -1).to_f32(), F32)
     })?;
-    let out = case.finish()?.run(&cx, &[x.view()])?;
+    let out = case.finish(&cx)?.run(&cx, &[x.view()])?;
 
     let mut causal = vec![0.0; m * n];
     let mut pattern = vec![0.0; m * n];
@@ -438,7 +457,7 @@ fn reductions() -> anyhow::Result<()> {
         p.output_reduce(x, Reduce::Min, &[0, 2])?;
         p.output_reduce(-x.abs() - 1.0, Reduce::Max, &[1])
     })?;
-    let out = case.finish()?.run(&cx, &[x.view()])?;
+    let out = case.finish(&cx)?.run(&cx, &[x.view()])?;
 
     type Check = (&'static [usize], Reduce, Box<dyn Fn(f32) -> f32>);
     let checks: [Check; 6] = [
@@ -476,7 +495,7 @@ fn reduction_of_transposed_input() -> anyhow::Result<()> {
         p.output_reduce(x, Reduce::Sum, &[0])?;
         p.output_reduce(x, Reduce::Min, &[1])
     })?;
-    let out = case.finish()?.run(&cx, &[x.view()])?;
+    let out = case.finish(&cx)?.run(&cx, &[x.view()])?;
 
     // x is [n, m]; the op sees its transpose [m, n].
     let sums = reduce_ref(&[n, m], &xh, &[1], Reduce::Sum);
@@ -503,7 +522,7 @@ fn partial_tiles_are_masked() -> anyhow::Result<()> {
         let x = p.input(xs)?;
         p.output(x + 1.0, F32)
     })?;
-    let built = case.finish()?;
+    let built = case.finish(&cx)?;
     let dims = built.bind_dims(&[x.view()])?;
 
     for tile in [[4u32, 256], [64, 64], [1, 4096]] {
@@ -513,7 +532,7 @@ fn partial_tiles_are_masked() -> anyhow::Result<()> {
             Tensor::from_slice(&vec![SENTINEL; m * n + extra], [m * n + extra], stream, &cx)?;
         let executor = built
             .op
-            .build_executor(&cx, built.graph.info(), Some(&tile))?;
+            .build_executor(&cx, built.graph().info(), Some(&tile))?;
         {
             let mut prefix = buffer.sliced_mut(0, ..m * n);
             let mut view = prefix.reshaped_mut([m, n]);
@@ -560,7 +579,7 @@ fn dynamic_dims() -> anyhow::Result<()> {
         p.output(x * p.input(bs)?, F32)?;
         p.output_reduce(x, Reduce::Sum, &[0])
     })?;
-    let built = case.finish()?;
+    let built = case.finish(&cx)?;
 
     let (b, bh) = random_tensor(Normal::new(0.0f32, 1.0)?, [n], &mut rng, &cx)?;
     for m in [37, 130, 1] {
@@ -751,7 +770,7 @@ fn mxfp8_outputs() -> anyhow::Result<()> {
             }
             Ok(())
         })?;
-        let out = case.finish()?.run(&cx, &[x.view()])?;
+        let out = case.finish(&cx)?.run(&cx, &[x.view()])?;
         let scaled: Vec<f32> = xh.iter().map(|v| v * 1.5).collect();
         for (o, &dim) in out.iter().zip(&dims_ok) {
             check_mx(
@@ -786,7 +805,7 @@ fn mxfp8_output_of_3d_iteration_space() -> anyhow::Result<()> {
         p.output_mx(v, MxFormat::Mxfp8, MxDim::Colwise)
     })?;
     let out = case
-        .finish()?
+        .finish(&cx)?
         .run(&cx, &[x.view(), bias.reshaped([m, 1])])?;
     let v: Vec<f32> = xh
         .iter()
@@ -842,7 +861,7 @@ fn nvfp4_outputs() -> anyhow::Result<()> {
             }
             Ok(())
         })?;
-        let out = case.finish()?.run(&cx, &[x.view()])?;
+        let out = case.finish(&cx)?.run(&cx, &[x.view()])?;
         for (o, &dim) in out.iter().zip(&dims_ok) {
             check_mx(
                 &format!("[{rows}, {cols}] {dim:?}"),
@@ -934,7 +953,9 @@ fn integer_inputs_and_more_output_types() -> anyhow::Result<()> {
         p.output(x * i * 0.01, ElementType::Float(FloatType::F16))?;
         p.output(x * 1000.0, ElementType::Float(FloatType::F8E5M2))
     })?;
-    let out = case.finish()?.run(&cx, &[i.view(), u.view(), x.view()])?;
+    let out = case
+        .finish(&cx)?
+        .run(&cx, &[i.view(), u.view(), x.view()])?;
     let plain = |k: usize| out[k].as_plain();
 
     let ints = download::<i32>(plain(0), &cx)?;
@@ -989,14 +1010,14 @@ fn all_tile_candidates_agree() -> anyhow::Result<()> {
         p.output_mx(v, MxFormat::Mxfp8, MxDim::Rowwise)?;
         p.output_mx(v, MxFormat::Mxfp8, MxDim::Colwise)
     })?;
-    let built = case.finish()?;
+    let built = case.finish(&cx)?;
     let v: Vec<f32> = xh
         .iter()
         .enumerate()
         .map(|(i, x)| x + bh[i % cols])
         .collect();
 
-    let candidates = built.op.tile_candidates(built.graph.info())?;
+    let candidates = built.op.tile_candidates(built.graph().info())?;
     assert!(candidates.len() > 1);
     for tile in &candidates {
         let out = built.run_direct(&cx, &[x.view(), bias.view()], Some(tile))?;
@@ -1040,5 +1061,83 @@ fn all_tile_candidates_agree() -> anyhow::Result<()> {
             &cx,
         )?;
     }
+    Ok(())
+}
+
+#[test]
+fn autotune_full_then_cached() -> anyhow::Result<()> {
+    let cx = test_context();
+    let mut rng = seeded_rng(14);
+    // A shape no other test uses, so no tuning result is cached yet.
+    let (m, n) = (123, 456);
+    let (x, xh) = random_tensor(Normal::new(0.0f32, 1.0)?, [m, n], &mut rng, &cx)?;
+    let (b, bh) = random_tensor(Normal::new(0.0f32, 1.0)?, [n], &mut rng, &cx)?;
+    let expected: Vec<f32> = xh
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| bf16_round((x - bh[i % n]).tanh()))
+        .collect();
+    let sums = reduce_ref(&[m, n], &xh, &[1], Reduce::Sum);
+
+    for autotune in [Autotune::Full, Autotune::CachedOnly] {
+        let case = Case::new();
+        let xs = case.gb.input("x", F32, [m, n])?;
+        let bs = case.gb.input("b", F32, [n])?;
+        case.pointwise(|p| {
+            let x = p.input(xs)?;
+            p.output((x - p.input(bs)?).tanh(), BF16)?;
+            p.output_reduce(x, Reduce::Sum, &[1])
+        })?;
+        let built = case.finish_with(&cx, autotune)?;
+        let out = built.run(&cx, &[x.view(), b.view()])?;
+        assert_all_close(
+            &format!("{autotune:?} tanh"),
+            &download_f32(&out[0], &cx)?,
+            &expected,
+            abs_rel_tolerance(0.0, 1.0 / 128.0),
+        );
+        assert_all_close(
+            &format!("{autotune:?} sums"),
+            &download_f32(&out[1], &cx)?,
+            &sums,
+            abs_rel_tolerance(1e-4, 1e-5),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn chained_ops() -> anyhow::Result<()> {
+    let cx = test_context();
+    let mut rng = seeded_rng(15);
+    let (m, n) = (40, 300);
+    let (x, xh) = random_tensor(Normal::new(0.0f32, 1.0)?, [m, n], &mut rng, &cx)?;
+
+    let gb = GraphBuilder::new();
+    let xs = gb.input("x", F32, [m, n])?;
+    let [y] = gb.pointwise(|p| p.output(p.input(xs)? * 2.0, BF16))?[..] else {
+        unreachable!()
+    };
+    let [z, sums] = gb.pointwise(|p| {
+        let v = p.input(y)?;
+        p.output(v + 1.0, F32)?;
+        p.output_reduce(v, Reduce::Sum, &[0])
+    })?[..] else {
+        unreachable!()
+    };
+    gb.output(z)?;
+    gb.output(sums)?;
+    let exec = ExecGraph::build(gb.finish()?, &cx, BuildOptions::default())?;
+    let out = exec.execute_default(&mut [x.view().into()], cx.default_compute_stream())?;
+
+    let y: Vec<f32> = xh.iter().map(|&x| bf16_round(x * 2.0)).collect();
+    let z: Vec<f32> = y.iter().map(|&y| y + 1.0).collect();
+    assert_all_close("z", &download_f32(&out[0], &cx)?, &z, |_, _| 0.0);
+    assert_all_close(
+        "sums",
+        &download_f32(&out[1], &cx)?,
+        &reduce_ref(&[m, n], &y, &[0], Reduce::Sum),
+        abs_rel_tolerance(1e-4, 1e-5),
+    );
     Ok(())
 }
