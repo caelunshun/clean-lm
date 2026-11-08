@@ -491,8 +491,6 @@ fn pow2_at_least(n: usize) -> u32 {
 /// Tile shapes to try, the heuristic default first. `hints` are the lowered axis sizes.
 pub fn tile_candidates(hints: &[usize], min_tile: &[u32]) -> Vec<Vec<u32>> {
     let rank = hints.len();
-    // The minimum tiles are reserved first; the remaining budget scales them up,
-    // innermost axis first.
     let make = |total: u32, inner_div: u32| -> Vec<u32> {
         let mut tile = min_tile.to_vec();
         let reserved: u32 = min_tile.iter().product();
@@ -511,7 +509,6 @@ pub fn tile_candidates(hints: &[usize], min_tile: &[u32]) -> Vec<Vec<u32>> {
         tile
     };
     let mut candidates: Vec<Vec<u32>> = Vec::new();
-    // Larger tiles measured slower for memory-bound kernels on sm_89.
     for (total, inner_div) in [
         (2048, 1),
         (1024, 1),

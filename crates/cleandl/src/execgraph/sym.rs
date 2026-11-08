@@ -949,8 +949,7 @@ struct Equation {
 }
 
 /// Infers values of symbolic dimensions from a set of equations
-/// `expr = value`, typically collected from concrete tensors matched against
-/// symbolic layouts.
+/// `expr = value`.
 #[derive(Debug, Clone, Default)]
 pub struct Unifier {
     equations: Vec<Equation>,

@@ -130,13 +130,12 @@ array_params!(
 #[derive(Clone, Copy, Debug)]
 enum ReducePtr {
     F32(Param<Ptr<f32>>),
-    /// Max and min reduce on the bits of the `f32` values.
+    /// Max and min need to use reduction on the bits of the `f32` values.
     I32(Param<Ptr<i32>>),
 }
 
 #[derive(Clone, Copy, Debug)]
 enum ScalePtr {
-    /// UE8M0 scales, as bytes.
     Ue8m0(Param<Ptr<u8>>),
     E4m3(Param<Ptr<F8E4M3>>),
 }
@@ -156,7 +155,6 @@ enum OutputParams {
     },
 }
 
-/// Kernel parameters; declared identically when defining and when launching.
 #[derive(Clone, Debug)]
 pub struct Params {
     sizes: Vec<Param<i64>>,

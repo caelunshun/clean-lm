@@ -216,7 +216,9 @@ impl BuildCx<'_> {
         TuneKey::new(self.op_name, payload, self.cx)
     }
 
-    /// Runs `f` on freshly allocated, zeroed buffers shaped like this operator's
+    /// Autotuning helper
+    ///
+    ///  Runs `f` on freshly allocated, zeroed buffers shaped like this operator's
     /// operands and outputs with all dimensions at their hints, plus `scratch_bytes`
     /// of scratch memory.
     ///

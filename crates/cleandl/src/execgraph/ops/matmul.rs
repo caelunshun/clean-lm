@@ -1,11 +1,4 @@
-//! Matrix multiplication through cuBLASLt.
-//!
-//! Our tensors are row-major, cuBLASLt's are column-major. By default the
-//! transposed product is computed: cuBLASLt's `A' = B`, `B' = A` and `D' = D`,
-//! so that the column-major `D'[N, M]` is exactly the row-major `D[M, N]`.
-//! cuBLASLt only computes block scales of D along its contiguous (column-major
-//! row) dimension, so a colwise block-scaled D is produced with swapped roles
-//! (`A' = A`, `B' = B`), which yields the column-major `D[M, N]`.
+//! Matmul using cublasLt.
 
 use crate::{
     context::Context,
@@ -39,17 +32,15 @@ use skytens_core::{
 };
 use std::{collections::HashMap, sync::Arc};
 
-/// Operand alignment in bytes admitting the fastest kernels; required for
-/// block-scaled operands.
 const FAST_ALIGNMENT: u32 = 16;
-/// cuBLASLt requires the workspace pointer to be aligned to this many bytes.
 const WORKSPACE_ALIGNMENT: usize = 256;
-/// Plans cached per executor for concrete shapes other than the hint.
+
+/// Plans cached per executor for concrete shapes other than the hint shape.
 const MAX_CACHED_PLANS: usize = 64;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum MatmulOutput {
-    /// `Bf16` or `F32`.
+    /// only supports bf16 and f32
     Plain(ElementType),
     BlockScaled {
         format: MxFormat,
@@ -66,23 +57,20 @@ impl MatmulOutput {
     }
 }
 
-/// `D = alpha * A·B + beta * C` with `A: [.., M, K]`, `B: [.., K, N]` and
-/// `C, D: [.., M, N]`, with at most one leading batch dimension.
 #[derive(Clone, Debug)]
 pub struct Matmul {
     pub a: SymTensorId,
     pub b: SymTensorId,
     pub c: Option<SymTensorId>,
-    /// `None` picks f32 for f32 inputs and bf16 otherwise.
-    pub out: Option<MatmulOutput>,
+    pub out: MatmulOutput,
     pub alpha: f32,
     pub beta: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct MatmulOpts<'g> {
-    pub out: Option<MatmulOutput>,
-    /// Requires a nonzero `beta` to have an effect.
+    pub out: MatmulOutput,
+    /// Requires setting a nonzero `beta` to have an effect.
     pub c: Option<SymTensor<'g>>,
     pub alpha: f32,
     pub beta: f32,
@@ -91,7 +79,7 @@ pub struct MatmulOpts<'g> {
 impl Default for MatmulOpts<'_> {
     fn default() -> Self {
         Self {
-            out: None,
+            out: MatmulOutput::Plain(ElementType::Float(FloatType::Bf16)),
             c: None,
             alpha: 1.0,
             beta: 0.0,
@@ -119,8 +107,6 @@ impl<'g> SymTensor<'g> {
     }
 }
 
-/// How one of our (row-major, possibly strided) matrices maps onto a cuBLASLt
-/// operand.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct MatMap {
     /// Whether cuBLASLt's `op(X')` is our matrix transposed.
@@ -170,16 +156,13 @@ impl MatMap {
         })
     }
 
-    /// Index (within the two innermost dimensions) of the dimension whose
-    /// stride is the leading dimension.
+    /// Index (among the two innermost dimensions) of the dimension whose
+    /// stride is the leading dimension
     fn ld_dim(self) -> usize {
-        // The leading dimension is the stride of op(X')'s columns if X' is
-        // not transposed, else of its rows.
         let (p, q) = if self.transposed { (1, 0) } else { (0, 1) };
         if self.unit_rows { q } else { p }
     }
 
-    /// The cuBLASLt layout of a matrix with concrete `[batch?, r, c]` shape.
     fn layout(
         self,
         data_type: DataType,
@@ -444,17 +427,7 @@ impl Matmul {
         let mut out_shape = a_shape.clone();
         out_shape[rank - 1] = n.clone();
 
-        let out = match self.out {
-            Some(out) => out,
-            None => match inputs {
-                InputKind::Plain {
-                    a: ElementType::Float(FloatType::F32),
-                    b: ElementType::Float(FloatType::F32),
-                } => MatmulOutput::Plain(ElementType::Float(FloatType::F32)),
-                _ => MatmulOutput::Plain(ElementType::Float(FloatType::Bf16)),
-            },
-        };
-        let swapped = match out {
+        let swapped = match self.out {
             MatmulOutput::Plain(ty) => {
                 ensure!(
                     matches!(ty, ElementType::Float(FloatType::F32 | FloatType::Bf16)),
@@ -468,7 +441,6 @@ impl Matmul {
                     "block-scaled matmul outputs must be 2D, got shape {}",
                     out_shape.display(dims)
                 );
-                // The leading dimension of D' runs along its block dimension.
                 let block_dim = &out_shape[dim.block_dimension_2d()];
                 let log2 = fast_alignment_values_log2(format);
                 ensure!(
@@ -488,7 +460,6 @@ impl Matmul {
 
         let a = SymOperand::of(a_data);
         let b = SymOperand::of(b_data);
-        // op(A') is B^T and op(B') is A^T, or with swapped roles A and B.
         let map = |op: &SymOperand, what: &str| {
             let shape = op.shape();
             let strides = op.strides();
@@ -501,7 +472,6 @@ impl Matmul {
                 dims,
             )
         };
-        // Checks a plain operand and returns its alignment.
         let plain_alignment = |op: &SymOperand, ty: ElementType, map: MatMap, what: &str| {
             let SymOperand::Plain(layout) = op else {
                 unreachable!("{what} is plain")
@@ -539,7 +509,7 @@ impl Matmul {
             }
         };
 
-        let d = match out {
+        let d = match self.out {
             MatmulOutput::Plain(ty) => SymOperand::Plain(
                 SymLayout::contiguous_row_major(out_shape.clone(), ty, dims)
                     .context("output layout")?,
@@ -554,7 +524,7 @@ impl Matmul {
             d_map.op() == Operation::N,
             "output does not map to cuBLASLt's D"
         );
-        let d_align = match out {
+        let d_align = match self.out {
             MatmulOutput::Plain(ty) => plain_alignment(&d, ty, d_map, "D")?,
             MatmulOutput::BlockScaled { .. } => FAST_ALIGNMENT,
         };
@@ -562,7 +532,7 @@ impl Matmul {
         let (c, c_map, c_align) = match self.c {
             None => (None, None, None),
             Some(c_id) => {
-                let MatmulOutput::Plain(out_ty) = out else {
+                let MatmulOutput::Plain(out_ty) = self.out else {
                     bail!("C is only supported for plain outputs");
                 };
                 let c_data = g.tensor(c_id);
@@ -590,7 +560,7 @@ impl Matmul {
 
         Ok(Analysis {
             inputs,
-            out,
+            out: self.out,
             swapped,
             a,
             b,
@@ -1274,7 +1244,7 @@ mod tests {
             a: a.id(),
             b: b.id(),
             c: None,
-            out: None,
+            out: MatmulOutput::Plain(a.ty().element_type().unwrap_or(BF16)),
             alpha: 1.0,
             beta: 0.0,
         }
@@ -1340,10 +1310,13 @@ mod tests {
                 let a = gb.input_mx("a", MxFormat::Mxfp8, MxDim::Rowwise, [m, k])?;
                 let b = gb.input_mx("b", MxFormat::Mxfp8, MxDim::Colwise, [k, n])?;
                 Ok(Matmul {
-                    out: out_dim.map(|dim| MatmulOutput::BlockScaled {
-                        format: MxFormat::Mxfp8,
-                        dim,
-                    }),
+                    out: match out_dim {
+                        Some(dim) => MatmulOutput::BlockScaled {
+                            format: MxFormat::Mxfp8,
+                            dim,
+                        },
+                        None => plain(&a, &b).out,
+                    },
                     ..plain(&a, &b)
                 })
             })?;
@@ -1406,10 +1379,10 @@ mod tests {
             let a = gb.input_mx("a", MxFormat::Mxfp8, MxDim::Rowwise, [128, 128])?;
             let b = gb.input_mx("b", MxFormat::Mxfp8, MxDim::Colwise, [128, 128])?;
             Ok(Matmul {
-                out: Some(MatmulOutput::BlockScaled {
+                out: MatmulOutput::BlockScaled {
                     format: MxFormat::Mxfp8,
                     dim: MxDim::Rowwise,
-                }),
+                },
                 ..plain(&a, &b)
             })
         })?;

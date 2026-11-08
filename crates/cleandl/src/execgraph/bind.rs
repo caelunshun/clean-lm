@@ -26,7 +26,7 @@ pub(crate) enum Mem<'a> {
 
 pub(crate) type MemMap<'a> = HashMap<BufferId, Mem<'a>>;
 
-/// A tensor's concrete layout within its buffers, validated to fit.
+/// A tensor's concrete layout within its buffers.
 #[derive(Debug, Clone)]
 pub(crate) enum Placement {
     Plain {

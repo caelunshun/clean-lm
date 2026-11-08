@@ -203,7 +203,7 @@ fn tolerance(out: ElementType, bounds: &[f32]) -> impl Fn(usize, f32) -> f32 + S
 
 fn matmul_opts<'g>(out: ElementType) -> MatmulOpts<'g> {
     MatmulOpts {
-        out: Some(MatmulOutput::Plain(out)),
+        out: MatmulOutput::Plain(out),
         ..Default::default()
     }
 }
@@ -240,24 +240,6 @@ fn bf16_matmul() -> anyhow::Result<()> {
 }
 
 #[test]
-fn default_output_type() -> anyhow::Result<()> {
-    let gb = GraphBuilder::new();
-    let a = gb.input("a", BF16, [16, 16])?;
-    let b = gb.input("b", BF16, [16, 16])?;
-    assert_eq!(
-        a.matmul(b, MatmulOpts::default())?.element_type(),
-        Some(BF16)
-    );
-    let a = gb.input("a32", F32, [16, 16])?;
-    let b = gb.input("b32", F32, [16, 16])?;
-    assert_eq!(
-        a.matmul(b, MatmulOpts::default())?.element_type(),
-        Some(F32)
-    );
-    Ok(())
-}
-
-#[test]
 fn f32_tf32_matmul() -> anyhow::Result<()> {
     let cx = test_context();
     let (m, k, n) = (96, 200, 136);
@@ -265,9 +247,13 @@ fn f32_tf32_matmul() -> anyhow::Result<()> {
     let (b, hb) = random_f32(k, n, 11, &cx)?;
     let (expected, bounds) = reference(&ha, &hb, None, 1.0, 0.0);
     let gb = GraphBuilder::new();
-    let d = gb
-        .input("a", F32, [m, k])?
-        .matmul(gb.input("b", F32, [k, n])?, MatmulOpts::default())?;
+    let d = gb.input("a", F32, [m, k])?.matmul(
+        gb.input("b", F32, [k, n])?,
+        MatmulOpts {
+            out: MatmulOutput::Plain(F32),
+            ..Default::default()
+        },
+    )?;
     gb.output(d)?;
     let graph = build(gb, &cx, Autotune::Off)?;
     let d = run(&graph, &[&a, &b], &cx)?;
@@ -530,10 +516,10 @@ fn invalid_c() {
                 .matmul(
                     gb.input_mx("b", MxFormat::Mxfp8, MxDim::Colwise, [64, 64])?,
                     MatmulOpts {
-                        out: Some(MatmulOutput::BlockScaled {
+                        out: MatmulOutput::BlockScaled {
                             format: MxFormat::Mxfp8,
                             dim: MxDim::Rowwise,
-                        }),
+                        },
                         ..with_c(c)
                     },
                 )
@@ -546,7 +532,7 @@ fn mx_matmul(
     gb: &GraphBuilder,
     (fa, fb): (MxFormat, MxFormat),
     (m, k, n): (usize, usize, usize),
-    out: Option<MatmulOutput>,
+    out: MatmulOutput,
 ) -> anyhow::Result<SymTensor<'_>> {
     gb.input_mx("a", fa, MxDim::Rowwise, [m, k])?.matmul(
         gb.input_mx("b", fb, MxDim::Colwise, [k, n])?,
@@ -563,18 +549,24 @@ fn invalid_block_scaled_operands() {
     let mxfp8 = MxFormat::Mxfp8;
     // NVFP4 needs K to be a multiple of 32 (16 bytes); 16 is a whole block but not aligned.
     let gb = GraphBuilder::new();
-    mx_matmul(&gb, (nvfp4, nvfp4), (128, 32, 64), None).expect("K = 32 is valid");
+    mx_matmul(
+        &gb,
+        (nvfp4, nvfp4),
+        (128, 32, 64),
+        MatmulOutput::Plain(BF16),
+    )
+    .expect("K = 32 is valid");
     expect_infer_error(
-        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 16, 64), None),
+        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 16, 64), MatmulOutput::Plain(BF16)),
         "inputs need K = 16 to be a provable multiple of 32",
     );
     // K = 8 is not even a whole NVFP4 block.
     expect_infer_error(
-        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 8, 64), None),
+        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 8, 64), MatmulOutput::Plain(BF16)),
         "block size 16",
     );
     expect_infer_error(
-        |gb| mx_matmul(gb, (mxfp8, nvfp4), (128, 64, 64), None),
+        |gb| mx_matmul(gb, (mxfp8, nvfp4), (128, 64, 64), MatmulOutput::Plain(BF16)),
         "same format",
     );
     expect_infer_error(
@@ -583,10 +575,10 @@ fn invalid_block_scaled_operands() {
                 gb,
                 (nvfp4, nvfp4),
                 (128, 64, 48),
-                Some(MatmulOutput::BlockScaled {
+                MatmulOutput::BlockScaled {
                     format: nvfp4,
                     dim: MxDim::Rowwise,
-                }),
+                },
             )
         },
         "needs its block dimension to be a provable multiple of 32",
@@ -597,10 +589,10 @@ fn invalid_block_scaled_operands() {
             gb.input("a", BF16, [2, 128, 64])?.matmul(
                 gb.input("b", BF16, [2, 64, 64])?,
                 MatmulOpts {
-                    out: Some(MatmulOutput::BlockScaled {
+                    out: MatmulOutput::BlockScaled {
                         format: mxfp8,
                         dim: MxDim::Rowwise,
-                    }),
+                    },
                     ..Default::default()
                 },
             )
@@ -651,7 +643,7 @@ fn batched_transposed_with_c() -> anyhow::Result<()> {
     gb.output(ta.matmul(
         tb,
         MatmulOpts {
-            out: Some(MatmulOutput::Plain(BF16)),
+            out: MatmulOutput::Plain(BF16),
             c: Some(tc),
             alpha,
             beta,
@@ -713,7 +705,7 @@ fn accumulate_c() -> anyhow::Result<()> {
         gb.output(ta.matmul(
             tb,
             MatmulOpts {
-                out: Some(MatmulOutput::Plain(out)),
+                out: MatmulOutput::Plain(out),
                 c: Some(tc),
                 alpha,
                 beta,
@@ -994,7 +986,7 @@ fn mx_graph(
     gb.output(a.matmul(
         b,
         MatmulOpts {
-            out: Some(out),
+            out,
             ..Default::default()
         },
     )?)?;
@@ -1033,7 +1025,7 @@ fn mx_graph_construction() -> anyhow::Result<()> {
         let d = a.matmul(
             b,
             MatmulOpts {
-                out: Some(out),
+                out,
                 ..Default::default()
             },
         )?;

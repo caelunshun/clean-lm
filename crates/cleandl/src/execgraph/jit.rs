@@ -8,6 +8,7 @@ use std::{
     process::Command,
     sync::{Arc, OnceLock},
 };
+use tileir::tools::OptLevel;
 use tileir_builder::{ModuleBuilder, TileirasOptions};
 
 /// Bump to invalidate all cached JIT kernels.
@@ -16,22 +17,25 @@ const FORMAT_VERSION: u32 = 1;
 /// Compiles (or fetches from the disk cache) a TileIR kernel, loading it once per context.
 ///
 /// `name` and `key` (together with the key's type) must uniquely identify the kernel
-/// body within a context: kernels are loaded once per such identity, and `define` is
-/// not called again for it.
-/// `define` must define exactly one kernel in the module, via `KernelBuilder::define`.
-/// It is traced on the first request per context; the disk cache is keyed on the
-/// resulting bytecode, so changes to the kernel body never hit stale cubins.
+/// body within a context.
 pub fn get_or_compile_kernel<K: Serialize>(
     cx: &Context,
     key: &K,
     name: &str,
     define: impl FnOnce(&mut ModuleBuilder) -> KernelSpec,
 ) -> anyhow::Result<Arc<LoadedKernel>> {
-    get_or_compile_kernel_with_options(cx, key, name, TileirasOptions::new(), define)
+    get_or_compile_kernel_with_options(
+        cx,
+        key,
+        name,
+        TileirasOptions::new()
+            .opt_level(OptLevel::O3)
+            .line_info(true),
+        define,
+    )
 }
 
-/// Like [`get_or_compile_kernel`], with extra `tileiras` options. The target arch is
-/// always set from the context's device.
+/// Like [`get_or_compile_kernel`], with extra `tileiras` options.
 pub fn get_or_compile_kernel_with_options<K: Serialize>(
     cx: &Context,
     key: &K,
@@ -71,12 +75,10 @@ pub fn get_or_compile_kernel_with_options<K: Serialize>(
         Ok(spec.finish(&built, cubin)?)
     })?;
 
-    // Soundness: the cubin was produced by tileiras, possibly via our own disk cache.
     let loaded = Arc::new(unsafe { kernel.load(cx.cuda())? });
     Ok(cx.jit_kernels().insert(local_key, loaded))
 }
 
-/// The `tileiras` target name for a device, e.g. `sm_89` or `sm_100`.
 pub fn tileiras_arch(device: &Device) -> String {
     format!(
         "sm_{}{}",
@@ -85,7 +87,7 @@ pub fn tileiras_arch(device: &Device) -> String {
     )
 }
 
-/// The `tileiras` release string, e.g. `V13.5.37`, or `unknown` if it can't be determined.
+/// Used for tuning cache keys.
 pub fn tileiras_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION.get_or_init(|| {
