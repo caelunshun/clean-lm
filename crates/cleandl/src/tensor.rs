@@ -98,6 +98,22 @@ impl Tensor {
         }
     }
 
+    /// Wraps existing storage with the given layout.
+    #[track_caller]
+    pub fn from_parts(virt: VirtTensorView, storage: DeviceMemory, cx: &Context) -> Self {
+        assert!(
+            virt.required_bytes() <= storage.len(),
+            "tensor view requires {} bytes, but storage has {}",
+            virt.required_bytes(),
+            storage.len()
+        );
+        Self {
+            virt,
+            cx: cx.clone(),
+            storage,
+        }
+    }
+
     /// Returns a tensor sampled from the given distribution and RNG.
     ///
     /// Requires a shape and element type that has no per-row padding.
@@ -350,6 +366,26 @@ impl<'a> Clone for TensorView<'a> {
 }
 
 impl<'a> TensorView<'a> {
+    /// Creates a view with the given layout over a slice of storage.
+    #[track_caller]
+    pub fn from_parts(
+        virt: VirtTensorView,
+        storage: MemorySlice<&'a DeviceMemory>,
+        cx: &Context,
+    ) -> Self {
+        assert!(
+            virt.required_bytes() <= storage.len(),
+            "tensor view requires {} bytes, but storage slice has {}",
+            virt.required_bytes(),
+            storage.len()
+        );
+        Self {
+            virt,
+            cx: cx.clone(),
+            storage,
+        }
+    }
+
     pub fn cx(&self) -> &Context {
         &self.cx
     }
@@ -435,6 +471,26 @@ pub struct TensorViewMut<'a> {
 }
 
 impl<'a> TensorViewMut<'a> {
+    /// Creates a mutable view with the given layout over a slice of storage.
+    #[track_caller]
+    pub fn from_parts(
+        virt: VirtTensorView,
+        storage: MemorySliceMut<&'a mut DeviceMemory>,
+        cx: &Context,
+    ) -> Self {
+        assert!(
+            virt.required_bytes() <= storage.len(),
+            "tensor view requires {} bytes, but storage slice has {}",
+            virt.required_bytes(),
+            storage.len()
+        );
+        Self {
+            virt,
+            cx: cx.clone(),
+            storage,
+        }
+    }
+
     pub fn cx(&self) -> &Context {
         &self.cx
     }

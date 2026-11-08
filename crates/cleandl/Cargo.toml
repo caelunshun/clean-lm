@@ -32,7 +32,10 @@ float4 = "0.2.0"
 slotmap = "1.1.1"
 tileir-builder = { git = "https://github.com/caelunshun/tileir-rs" }
 smallvec = "1.16.5"
+tileir = { git = "https://github.com/caelunshun/tileir-rs" }
+blake3 = "1.8.7"
 
 [dev-dependencies]
 float-cmp = "0.10"
 faer = "0.24"
+tempfile = "3.27.0"
