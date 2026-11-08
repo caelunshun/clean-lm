@@ -16,12 +16,14 @@ use common::{
     mx_scale_factor_index, random_bf16_tensor, random_tensor, seeded_rng, test_context,
 };
 use float8::F8E4M3;
+use parking_lot::Mutex;
 use rand_distr::Uniform;
 use rayon::prelude::*;
 use skytens_core::{
     data_type::{ElementType, FloatType},
     shape::Shape,
 };
+use std::sync::OnceLock;
 
 const BF16: ElementType = ElementType::Float(FloatType::Bf16);
 const F32: ElementType = ElementType::Float(FloatType::F32);
@@ -365,23 +367,6 @@ fn expect_infer_error(
 
 #[test]
 fn invalid_operands() {
-    // Unaligned slice: offset of 3 bf16 elements.
-    expect_infer_error(
-        |gb| {
-            gb.input("a", BF16, [32, 80])?
-                .sliced(1, 3, 64)?
-                .matmul(gb.input("b", BF16, [64, 32])?, MatmulOpts::default())
-        },
-        "aligned",
-    );
-    // Leading dimension of 65 bf16 elements.
-    expect_infer_error(
-        |gb| {
-            gb.input("a", BF16, [32, 64])?
-                .matmul(gb.input("b", BF16, [64, 65])?, MatmulOpts::default())
-        },
-        "aligned",
-    );
     expect_infer_error(
         |gb| {
             gb.input("a", BF16, [32, 64])?
@@ -462,6 +447,227 @@ fn invalid_operands() {
         },
         "no C",
     );
+    expect_infer_error(
+        |gb| {
+            gb.input("a", BF16, [32, 0])?
+                .matmul(gb.input("b", BF16, [0, 32])?, MatmulOpts::default())
+        },
+        "must not be zero",
+    );
+    expect_infer_error(
+        |gb| {
+            gb.input("a", BF16, [32, 64])?.matmul(
+                gb.input("b", BF16, [64, 32])?,
+                matmul_opts(ElementType::Float(FloatType::F16)),
+            )
+        },
+        "output must be f32 or bf16",
+    );
+    // Zero stride along M.
+    expect_infer_error(
+        |gb| {
+            gb.input_with_layout("a", BF16, strided([32, 64], [0, 1]))?
+                .matmul(gb.input("b", BF16, [64, 32])?, MatmulOpts::default())
+        },
+        "zero stride in dimension 0",
+    );
+    // Rows of 64 elements, 32 apart.
+    expect_infer_error(
+        |gb| {
+            gb.input_with_layout("a", BF16, strided([32, 64], [32, 1]))?
+                .matmul(gb.input("b", BF16, [64, 32])?, MatmulOpts::default())
+        },
+        "smaller than the 64 contiguous elements",
+    );
+}
+
+fn strided<const N: usize>(shape: [usize; N], strides: [usize; N]) -> SymLayout {
+    SymLayout::new(
+        shape.into_iter().map(Into::into).collect(),
+        strides.into_iter().map(Into::into).collect(),
+        Polynomial::zero(),
+    )
+}
+
+fn with_c<'g>(c: SymTensor<'g>) -> MatmulOpts<'g> {
+    MatmulOpts {
+        c: Some(c),
+        beta: 1.0,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn invalid_c() {
+    expect_infer_error(
+        |gb| {
+            let c = gb.input("c", F32, [32, 32])?;
+            gb.input("a", BF16, [32, 64])?
+                .matmul(gb.input("b", BF16, [64, 32])?, with_c(c))
+        },
+        "C must have the output element type",
+    );
+    expect_infer_error(
+        |gb| {
+            let c = gb.input("c", BF16, [32, 16])?;
+            gb.input("a", BF16, [32, 64])?
+                .matmul(gb.input("b", BF16, [64, 32])?, with_c(c))
+        },
+        "C has shape",
+    );
+    expect_infer_error(
+        |gb| {
+            let c = gb.input("c", BF16, [32, 32])?.transposed(0, 1)?;
+            gb.input("a", BF16, [32, 64])?
+                .matmul(gb.input("b", BF16, [64, 32])?, with_c(c))
+        },
+        "not a transposed view",
+    );
+    expect_infer_error(
+        |gb| {
+            let c = gb.input("c", BF16, [128, 64])?;
+            gb.input_mx("a", MxFormat::Mxfp8, MxDim::Rowwise, [128, 64])?
+                .matmul(
+                    gb.input_mx("b", MxFormat::Mxfp8, MxDim::Colwise, [64, 64])?,
+                    MatmulOpts {
+                        out: Some(MatmulOutput::BlockScaled {
+                            format: MxFormat::Mxfp8,
+                            dim: MxDim::Rowwise,
+                        }),
+                        ..with_c(c)
+                    },
+                )
+        },
+        "only supported for plain outputs",
+    );
+}
+
+fn mx_matmul(
+    gb: &GraphBuilder,
+    (fa, fb): (MxFormat, MxFormat),
+    (m, k, n): (usize, usize, usize),
+    out: Option<MatmulOutput>,
+) -> anyhow::Result<SymTensor<'_>> {
+    gb.input_mx("a", fa, MxDim::Rowwise, [m, k])?.matmul(
+        gb.input_mx("b", fb, MxDim::Colwise, [k, n])?,
+        MatmulOpts {
+            out,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn invalid_block_scaled_operands() {
+    let nvfp4 = MxFormat::Nvfp4;
+    let mxfp8 = MxFormat::Mxfp8;
+    // NVFP4 needs K to be a multiple of 32 (16 bytes); 16 is a whole block but not aligned.
+    let gb = GraphBuilder::new();
+    mx_matmul(&gb, (nvfp4, nvfp4), (128, 32, 64), None).expect("K = 32 is valid");
+    expect_infer_error(
+        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 16, 64), None),
+        "inputs need K = 16 to be a provable multiple of 32",
+    );
+    // K = 8 is not even a whole NVFP4 block.
+    expect_infer_error(
+        |gb| mx_matmul(gb, (nvfp4, nvfp4), (128, 8, 64), None),
+        "block size 16",
+    );
+    expect_infer_error(
+        |gb| mx_matmul(gb, (mxfp8, nvfp4), (128, 64, 64), None),
+        "same format",
+    );
+    expect_infer_error(
+        |gb| {
+            mx_matmul(
+                gb,
+                (nvfp4, nvfp4),
+                (128, 64, 48),
+                Some(MatmulOutput::BlockScaled {
+                    format: nvfp4,
+                    dim: MxDim::Rowwise,
+                }),
+            )
+        },
+        "needs its block dimension to be a provable multiple of 32",
+    );
+    // Block-scaled outputs are 2D.
+    expect_infer_error(
+        |gb| {
+            gb.input("a", BF16, [2, 128, 64])?.matmul(
+                gb.input("b", BF16, [2, 64, 64])?,
+                MatmulOpts {
+                    out: Some(MatmulOutput::BlockScaled {
+                        format: mxfp8,
+                        dim: MxDim::Rowwise,
+                    }),
+                    ..Default::default()
+                },
+            )
+        },
+        "block-scaled matmul outputs must be 2D",
+    );
+}
+
+/// Operands whose pointers or leading dimensions are not 16-byte aligned.
+#[test]
+fn unaligned_operands() -> anyhow::Result<()> {
+    let cx = test_context();
+    // A starts 3 elements into its rows; N = 65 and N = 1 give unaligned D rows.
+    for (m, k, n) in [(37, 64, 65), (40, 72, 1), (16, 24, 8)] {
+        let (a_full, ha_full) = random_bf16(1, m, k + 3, 110, &cx)?;
+        // B is uploaded as [N, K] (the helper needs N > 1 for [K, N]) and transposed.
+        let (b_t, hb_t) = random_bf16(1, n, k, 111, &cx)?;
+        let hb = hb_t.transposed();
+        let gb = GraphBuilder::new();
+        let ta = gb.input("a", BF16, [m, k + 3])?.sliced(1, 3, k)?;
+        let tb = gb.input("b", BF16, [n, k])?.transposed(0, 1)?;
+        gb.output(ta.matmul(tb, matmul_opts(BF16))?)?;
+        let graph = build(gb, &cx, Autotune::Off)?;
+        let (expected, bounds) = reference(&ha_full.cols_slice(3, k), &hb, None, 1.0, 0.0);
+        let d = run(&graph, &[&a_full, &b_t], &cx)?;
+        assert_all_close(
+            &format!("unaligned {m}x{k}x{n}"),
+            &download_f32(&d, &cx)?,
+            &expected,
+            tolerance(BF16, &bounds),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn batched_transposed_with_c() -> anyhow::Result<()> {
+    let cx = test_context();
+    let (batch, m, k, n) = (3, 40, 56, 24);
+    let (alpha, beta) = (2.0, 0.5);
+    let (a_t, ha_t) = random_bf16(batch, k, m, 120, &cx)?;
+    let (b, hb) = random_bf16(batch, k, n, 121, &cx)?;
+    let (c, hc) = random_bf16(batch, m, n, 122, &cx)?;
+    let gb = GraphBuilder::new();
+    let ta = gb.input("a", BF16, [batch, k, m])?.transposed(1, 2)?;
+    let tb = gb.input("b", BF16, [batch, k, n])?;
+    let tc = gb.input("c", BF16, [batch, m, n])?;
+    gb.output(ta.matmul(
+        tb,
+        MatmulOpts {
+            out: Some(MatmulOutput::Plain(BF16)),
+            c: Some(tc),
+            alpha,
+            beta,
+        },
+    )?)?;
+    let graph = build(gb, &cx, Autotune::Off)?;
+    let (expected, bounds) = reference(&ha_t.transposed(), &hb, Some(&hc), alpha, beta);
+    let d = run(&graph, &[&a_t, &b, &c], &cx)?;
+    assert_eq!(d.shape().dims_slice(), [batch, m, n]);
+    assert_all_close(
+        "batched transposed with C",
+        &download_f32(&d, &cx)?,
+        &expected,
+        tolerance(BF16, &bounds),
+    );
+    Ok(())
 }
 
 #[test]
@@ -554,10 +760,48 @@ fn dynamic_m() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Debug logs of this test binary.
+fn captured_logs() -> &'static Mutex<String> {
+    static LOGS: OnceLock<Mutex<String>> = OnceLock::new();
+    LOGS.get_or_init(|| {
+        struct Capture;
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                captured_logs()
+                    .lock()
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(|| Capture)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("failed to install subscriber");
+        Mutex::new(String::new())
+    })
+}
+
+/// The algorithm configs chosen for matmuls whose hint D' layout contains `needle`.
+fn chosen_configs(needle: &str) -> Vec<String> {
+    captured_logs()
+        .lock()
+        .lines()
+        .filter(|line| line.contains("cleandl::matmul") && line.contains(needle))
+        .filter_map(|line| line.split_once(": chose ").map(|(_, c)| c.to_owned()))
+        .collect()
+}
+
 #[test]
 fn autotune_then_cached() -> anyhow::Result<()> {
+    captured_logs();
     let cx = test_context();
-    let (m, k, n) = (256, 384, 192);
+    // A shape no other test uses, so the tuning cache starts empty.
+    let (m, k, n) = (264, 392, 200);
     let (a, ha) = random_bf16(1, m, k, 70, &cx)?;
     let (b, hb) = random_bf16(1, k, n, 71, &cx)?;
     let (expected, bounds) = reference(&ha, &hb, None, 1.0, 0.0);
@@ -576,6 +820,33 @@ fn autotune_then_cached() -> anyhow::Result<()> {
             tolerance(BF16, &bounds),
         );
     }
+    let chosen = chosen_configs(&format!("rows: {n}, cols: {m},"));
+    assert_eq!(chosen.len(), 2, "expected one choice per build: {chosen:?}");
+    assert_eq!(
+        chosen[0], chosen[1],
+        "CachedOnly must reuse the tuned algorithm"
+    );
+    Ok(())
+}
+
+#[test]
+fn dynamic_k_zero_fails() -> anyhow::Result<()> {
+    let cx = test_context();
+    let (m, n) = (32, 16);
+    let gb = GraphBuilder::new();
+    let k = gb.dynamic_dim("k", 64, 0);
+    let d = gb
+        .input("a", BF16, [Monomial::fixed(m), Monomial::from(k)])?
+        .matmul(
+            gb.input("b", BF16, [Monomial::from(k), Monomial::fixed(n)])?,
+            matmul_opts(F32),
+        )?;
+    gb.output(d)?;
+    let graph = build(gb, &cx, Autotune::Off)?;
+    let a = Tensor::new_zeroed([m, 0], BF16, cx.default_compute_stream(), &cx)?;
+    let b = Tensor::new_zeroed([0, n], BF16, cx.default_compute_stream(), &cx)?;
+    let err = run(&graph, &[&a, &b], &cx).expect_err("K = 0 should be rejected");
+    assert!(format!("{err:#}").contains("K is zero"), "{err:#}");
     Ok(())
 }
 

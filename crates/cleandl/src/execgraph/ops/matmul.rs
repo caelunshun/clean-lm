@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 use skycuda::{
     cudarc::driver::sys::CUdeviceptr_v2,
     device_memory::{
-        DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory, DeviceVisibleMemoryMut,
+        DeviceMemory, DevicePtrGuard, DevicePtrGuardMut, DeviceVisibleMemory,
+        DeviceVisibleMemoryMut,
     },
+    memory_slice::{MemorySlice, MemorySliceMut},
     stream::Stream,
 };
 use skycuda_cublaslt::{
@@ -37,9 +39,13 @@ use skytens_core::{
 };
 use std::{collections::HashMap, sync::Arc};
 
-/// Alignment in bytes required of every operand's base pointer, leading
-/// dimension and batch stride.
-const ALIGNMENT: usize = 16;
+/// Operand alignment in bytes admitting the fastest kernels; required for
+/// block-scaled operands.
+const FAST_ALIGNMENT: u32 = 16;
+/// cuBLASLt requires the workspace pointer to be aligned to this many bytes.
+const WORKSPACE_ALIGNMENT: usize = 256;
+/// Plans cached per executor for concrete shapes other than the hint.
+const MAX_CACHED_PLANS: usize = 64;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum MatmulOutput {
@@ -174,7 +180,13 @@ impl MatMap {
     }
 
     /// The cuBLASLt layout of a matrix with concrete `[batch?, r, c]` shape.
-    fn layout(self, data_type: DataType, shape: Shape, strides: Strides) -> MatrixLayout {
+    fn layout(
+        self,
+        data_type: DataType,
+        shape: Shape,
+        strides: Strides,
+        what: &str,
+    ) -> anyhow::Result<MatrixLayout> {
         let rank = shape.num_dims();
         let (r, c) = (shape[rank - 2], shape[rank - 1]);
         let (sr, sc) = (strides[rank - 2], strides[rank - 1]);
@@ -188,17 +200,22 @@ impl MatMap {
         } else {
             (q, p, sp)
         };
-        let layout = MatrixLayout::new(
-            data_type,
-            rows as u64,
-            cols as u64,
-            ld.max(rows).max(1) as i64,
-        );
-        if rank == 3 {
+        // The leading dimension only matters when it steps over more than one column.
+        let ld = if cols <= 1 || rows == 0 {
+            ld.max(rows).max(1)
+        } else {
+            ensure!(
+                ld >= rows,
+                "{what} has a leading-dimension stride of {ld} elements, smaller than the {rows} contiguous elements it steps over"
+            );
+            ld
+        };
+        let layout = MatrixLayout::new(data_type, rows as u64, cols as u64, ld as i64);
+        Ok(if rank == 3 {
             layout.batched(shape[0] as i32, strides[0] as i64)
         } else {
             layout
-        }
+        })
     }
 }
 
@@ -284,6 +301,12 @@ struct Analysis {
     b_map: MatMap,
     c_map: Option<MatMap>,
     d_map: MatMap,
+    /// Provable byte alignment of each operand's pointer, leading dimension
+    /// and batch stride, capped at [`FAST_ALIGNMENT`].
+    a_align: u32,
+    b_align: u32,
+    c_align: Option<u32>,
+    d_align: u32,
     out_shape: SymShape,
 }
 
@@ -304,34 +327,39 @@ fn scale_mode(format: MxFormat) -> ScaleMode {
     }
 }
 
-fn check_aligned_layout(
-    layout: &SymLayout,
-    ty: ElementType,
-    map: MatMap,
-    what: &str,
-    dims: &SymDims,
-) -> anyhow::Result<()> {
+/// Rejects zero strides in the matrix dimensions of a plain operand.
+fn check_strides(layout: &SymLayout, what: &str, dims: &SymDims) -> anyhow::Result<()> {
     let rank = layout.rank();
-    ensure!(
-        layout.offset_is_aligned(ALIGNMENT, ty, dims),
-        "{what} starts at element offset {}, which is not provably {ALIGNMENT}-byte aligned",
-        layout.offset.display(dims)
-    );
-    // The leading dimension is irrelevant if it only steps over one row/column.
-    let ld_dim = rank - 2 + map.ld_dim();
-    ensure!(
-        layout.shape[ld_dim].is_one() || layout.stride_is_aligned(ld_dim, ALIGNMENT, ty, dims),
-        "{what} has leading-dimension stride {} elements, which is not provably {ALIGNMENT}-byte aligned",
-        layout.strides[ld_dim].display(dims)
-    );
-    if rank == 3 && !layout.shape[0].is_one() {
+    for dim in rank - 2..rank {
         ensure!(
-            layout.stride_is_aligned(0, ALIGNMENT, ty, dims),
-            "{what} has batch stride {} elements, which is not provably {ALIGNMENT}-byte aligned",
-            layout.strides[0].display(dims)
+            layout.shape[dim].is_one() || !layout.strides[dim].is_zero(),
+            "{what} has a zero stride in dimension {dim} of size {}",
+            layout.shape[dim].display(dims)
         );
     }
     Ok(())
+}
+
+/// Largest power-of-two byte alignment, at most [`FAST_ALIGNMENT`], provable for
+/// the base pointer, leading dimension and batch stride of a plain operand.
+fn provable_alignment(layout: &SymLayout, ty: ElementType, map: MatMap, dims: &SymDims) -> u32 {
+    let element_log2 = (ty.bits_per_element() / 8).ilog2();
+    let bytes_log2 = |elements_log2: u32| elements_log2.saturating_add(element_log2);
+    let rank = layout.rank();
+    let mut log2 = bytes_log2(layout.offset.pow2_divisibility(dims));
+    let ld_dim = rank - 2 + map.ld_dim();
+    if !layout.shape[ld_dim].is_one() {
+        log2 = log2.min(bytes_log2(layout.strides[ld_dim].pow2_divisibility(dims)));
+    }
+    if rank == 3 && !layout.shape[0].is_one() {
+        log2 = log2.min(bytes_log2(layout.strides[0].pow2_divisibility(dims)));
+    }
+    1 << log2.min(FAST_ALIGNMENT.ilog2())
+}
+
+/// Log2 of the number of `format` values in [`FAST_ALIGNMENT`] bytes.
+fn fast_alignment_values_log2(format: MxFormat) -> u32 {
+    (FAST_ALIGNMENT as usize * 8 / format.values_type().bits_per_element()).ilog2()
 }
 
 impl Matmul {
@@ -409,6 +437,10 @@ impl Matmul {
             a_shape.display(dims),
             b_shape.display(dims)
         );
+        ensure!(
+            k.as_fixed() != Some(0),
+            "the contraction dimension K must not be zero"
+        );
         let mut out_shape = a_shape.clone();
         out_shape[rank - 1] = n.clone();
 
@@ -438,10 +470,10 @@ impl Matmul {
                 );
                 // The leading dimension of D' runs along its block dimension.
                 let block_dim = &out_shape[dim.block_dimension_2d()];
-                let log2 = (ALIGNMENT * 8 / format.values_type().bits_per_element()).ilog2();
+                let log2 = fast_alignment_values_log2(format);
                 ensure!(
                     block_dim.is_divisible_by_pow2(log2, dims),
-                    "{format:?} {dim:?} output of shape {} needs its block dimension to be a provable multiple of {} for {ALIGNMENT}-byte alignment",
+                    "{format:?} {dim:?} output of shape {} needs its block dimension to be a provable multiple of {} for {FAST_ALIGNMENT}-byte alignment",
                     out_shape.display(dims),
                     1usize << log2
                 );
@@ -457,44 +489,55 @@ impl Matmul {
         let a = SymOperand::of(a_data);
         let b = SymOperand::of(b_data);
         // op(A') is B^T and op(B') is A^T, or with swapped roles A and B.
-        let map = |op: &SymOperand, transposed: bool, what: &str| {
+        let map = |op: &SymOperand, what: &str| {
             let shape = op.shape();
             let strides = op.strides();
             let r = shape.rank();
             MatMap::new(
-                transposed,
+                !swapped,
                 [&shape[r - 2], &shape[r - 1]],
                 [&strides[r - 2], &strides[r - 1]],
                 what,
                 dims,
             )
         };
-        let a_map = map(&a, !swapped, "A")?;
-        let b_map = map(&b, !swapped, "B")?;
-        if let InputKind::Mx(format) = inputs {
-            // cuBLASLt requires the TN form for block-scaled inputs: A' transposed, B' not.
-            let (a_role, b_role) = if swapped {
-                (a_map, b_map)
-            } else {
-                (b_map, a_map)
+        // Checks a plain operand and returns its alignment.
+        let plain_alignment = |op: &SymOperand, ty: ElementType, map: MatMap, what: &str| {
+            let SymOperand::Plain(layout) = op else {
+                unreachable!("{what} is plain")
             };
-            ensure!(
-                a_role.op() == Operation::T && b_role.op() == Operation::N,
-                "block-scaled inputs do not map to cuBLASLt's TN form"
-            );
-            let log2 = (ALIGNMENT * 8 / format.values_type().bits_per_element()).ilog2();
-            ensure!(
-                k.is_divisible_by_pow2(log2, dims),
-                "{format:?} inputs need K = {} to be a provable multiple of {} for {ALIGNMENT}-byte alignment",
-                k.display(dims),
-                1usize << log2
-            );
-        }
-        for (op, data, map, name) in [(&a, a_data, a_map, "A"), (&b, b_data, b_map, "B")] {
-            if let (SymOperand::Plain(layout), SymTensorData::Plain { ty, .. }) = (op, data) {
-                check_aligned_layout(layout, *ty, map, name, dims)?;
+            check_strides(layout, what, dims)?;
+            anyhow::Ok(provable_alignment(layout, ty, map, dims))
+        };
+
+        let a_map = map(&a, "A")?;
+        let b_map = map(&b, "B")?;
+        let (a_align, b_align) = match inputs {
+            InputKind::Plain { a: a_ty, b: b_ty } => (
+                plain_alignment(&a, a_ty, a_map, "A")?,
+                plain_alignment(&b, b_ty, b_map, "B")?,
+            ),
+            InputKind::Mx(format) => {
+                // cuBLASLt requires the TN form for block-scaled inputs: A' transposed, B' not.
+                let (a_role, b_role) = if swapped {
+                    (a_map, b_map)
+                } else {
+                    (b_map, a_map)
+                };
+                ensure!(
+                    a_role.op() == Operation::T && b_role.op() == Operation::N,
+                    "block-scaled inputs do not map to cuBLASLt's TN form"
+                );
+                let log2 = fast_alignment_values_log2(format);
+                ensure!(
+                    k.is_divisible_by_pow2(log2, dims),
+                    "{format:?} inputs need K = {} to be a provable multiple of {} for {FAST_ALIGNMENT}-byte alignment",
+                    k.display(dims),
+                    1usize << log2
+                );
+                (FAST_ALIGNMENT, FAST_ALIGNMENT)
             }
-        }
+        };
 
         let d = match out {
             MatmulOutput::Plain(ty) => SymOperand::Plain(
@@ -506,20 +549,18 @@ impl Matmul {
                 dim,
             },
         };
-        let d_map = map(&d, !swapped, "D")?;
+        let d_map = map(&d, "D")?;
         ensure!(
             d_map.op() == Operation::N,
             "output does not map to cuBLASLt's D"
         );
-        if let SymOperand::Plain(layout) = &d {
-            let MatmulOutput::Plain(ty) = out else {
-                unreachable!()
-            };
-            check_aligned_layout(layout, ty, d_map, "D", dims)?;
-        }
+        let d_align = match out {
+            MatmulOutput::Plain(ty) => plain_alignment(&d, ty, d_map, "D")?,
+            MatmulOutput::BlockScaled { .. } => FAST_ALIGNMENT,
+        };
 
-        let (c, c_map) = match self.c {
-            None => (None, None),
+        let (c, c_map, c_align) = match self.c {
+            None => (None, None, None),
             Some(c_id) => {
                 let MatmulOutput::Plain(out_ty) = out else {
                     bail!("C is only supported for plain outputs");
@@ -537,16 +578,13 @@ impl Matmul {
                     out_shape.display(dims)
                 );
                 let c = SymOperand::of(c_data);
-                let c_map = map(&c, !swapped, "C")?;
+                let c_map = map(&c, "C")?;
                 ensure!(
                     c_map.op() == Operation::N,
                     "C must be contiguous along N, i.e. not a transposed view"
                 );
-                let SymOperand::Plain(layout) = &c else {
-                    unreachable!()
-                };
-                check_aligned_layout(layout, out_ty, c_map, "C", dims)?;
-                (Some(c), Some(c_map))
+                let c_align = plain_alignment(&c, out_ty, c_map, "C")?;
+                (Some(c), Some(c_map), Some(c_align))
             }
         };
 
@@ -562,6 +600,10 @@ impl Matmul {
             b_map,
             c_map,
             d_map,
+            a_align,
+            b_align,
+            c_align,
+            d_align,
             out_shape,
         })
     }
@@ -595,11 +637,11 @@ impl Operator for Matmul {
 
     fn infer_outputs(&self, graph: &GraphInfo) -> anyhow::Result<Vec<OutputSpec>> {
         let analysis = self.analyze(graph)?;
-        Ok(vec![OutputSpec::new(
-            analysis.out.ty(),
-            analysis.out_shape,
-            Init::Uninit,
-        )])
+        let out = OutputSpec::new(analysis.out.ty(), analysis.out_shape.clone(), Init::Uninit);
+        // Catches strides that are only invalid for concrete sizes, e.g. a
+        // leading dimension smaller than the row extent.
+        Problem::new(self, analysis)?.layouts(&graph.hint_values())?;
+        Ok(vec![out])
     }
 
     fn build(&self, bcx: &BuildCx<'_>) -> anyhow::Result<Box<dyn Executor>> {
@@ -609,14 +651,10 @@ impl Operator for Matmul {
 
         let hint_dims = bcx.graph.hint_values();
         let hint_layouts = problem.layouts(&hint_dims)?;
-        let pref = MatmulPreference::default()
-            .min_alignment_bytes(ALIGNMENT as u32)
-            .aux_alignment_bytes(ALIGNMENT as u32)
-            .requested_algo_count(16);
         let plan = bcx
             .cx
             .cublaslt()
-            .build_plan(&problem.desc(&hint_layouts), &pref)
+            .build_plan(&problem.desc(&hint_layouts), &problem.preference())
             .map_err(|e| {
                 if matches!(
                     e.status(),
@@ -636,15 +674,21 @@ impl Operator for Matmul {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let payload = problem.tune_payload(&hint_layouts, bcx.graph.dims());
         let key = bcx.tune_key(&payload)?;
-        let (_, executor) = bcx.tune_executor(&key, candidates, |config| {
+        let (config, executor) = bcx.tune_executor(&key, candidates, |config| {
             let algo = config.algorithm(&plan)?;
             Ok(MatmulExecutor::new(
                 problem.clone(),
                 plan.clone(),
                 hint_layouts,
+                config.clone(),
                 algo,
             ))
         })?;
+        tracing::debug!(
+            target: "cleandl::matmul",
+            "matmul {combo} at hint D' {:?}: chose {config:?}",
+            hint_layouts.d
+        );
         Ok(Box::new(executor))
     }
 }
@@ -679,13 +723,23 @@ impl AlgoConfig {
         })
     }
 
+    /// The plan's algorithm with this configuration, if the plan has it.
+    fn find(&self, plan: &MatmulPlan) -> Option<Algorithm> {
+        plan.algorithms()
+            .iter()
+            .find(|algo| Self::of(algo).is_ok_and(|config| config == *self))
+            .copied()
+    }
+
     /// The plan's algorithm with this configuration, or one rebuilt from it.
     fn algorithm(&self, plan: &MatmulPlan) -> anyhow::Result<Algorithm> {
-        for algo in plan.algorithms() {
-            if Self::of(algo).is_ok_and(|config| config == *self) {
-                return Ok(*algo);
-            }
+        match self.find(plan) {
+            Some(algo) => Ok(algo),
+            None => self.rebuild(plan),
         }
+    }
+
+    fn rebuild(&self, plan: &MatmulPlan) -> anyhow::Result<Algorithm> {
         let mut algo =
             Algorithm::init(plan.handle(), &MatmulTypes::from_desc(plan.desc()), self.id)?;
         algo.set_tile(TileId(self.tile))?;
@@ -742,7 +796,8 @@ struct TunePayload {
     beta_nonzero: bool,
     /// Hint element offsets of A, B and C.
     offsets: Vec<usize>,
-    alignment: usize,
+    /// Promised alignment of A', B', C' and D'.
+    alignments: [u32; 4],
 }
 
 /// Concrete cuBLASLt layouts of A', B', C' (if separate from D') and D'.
@@ -752,6 +807,7 @@ struct Layouts {
     b: MatrixLayout,
     c: Option<MatrixLayout>,
     d: MatrixLayout,
+    k: usize,
 }
 
 impl Layouts {
@@ -825,13 +881,12 @@ impl Problem {
 
     fn layouts(&self, dims: &DimValues) -> anyhow::Result<Layouts> {
         let an = &self.analysis;
-        let our_a = {
-            let (shape, strides) = an.a.eval(dims)?;
-            an.a_map.layout(self.our_a_type, shape, strides)
-        };
+        let (a_shape, a_strides) = an.a.eval(dims)?;
+        let k = a_shape[a_shape.num_dims() - 1];
+        let our_a = an.a_map.layout(self.our_a_type, a_shape, a_strides, "A")?;
         let our_b = {
             let (shape, strides) = an.b.eval(dims)?;
-            an.b_map.layout(self.our_b_type, shape, strides)
+            an.b_map.layout(self.our_b_type, shape, strides, "B")?
         };
         let (a, b) = if an.swapped {
             (our_a, our_b)
@@ -839,22 +894,18 @@ impl Problem {
             (our_b, our_a)
         };
         let (d_shape, d_strides) = an.d.eval(dims)?;
-        let d = an.d_map.layout(self.d_type, d_shape, d_strides);
+        let d = an.d_map.layout(self.d_type, d_shape, d_strides, "D")?;
         let c = match (&an.c, an.c_map, self.c_type) {
             (Some(c), Some(map), Some(ty)) => {
                 let (shape, strides) = c.eval(dims)?;
-                Some(map.layout(ty, shape, strides))
+                Some(map.layout(ty, shape, strides, "C")?)
             }
-            // An unread C with D's shape, packed.
-            (None, _, Some(ty)) => Some(MatrixLayout {
-                data_type: ty,
-                ld: d.rows as i64,
-                batch_stride: (d.rows * d.cols) as i64,
-                ..d
-            }),
+            // The unread C of a block-scaled output is bound to A''s buffer,
+            // which is too small for a full C, so it is a broadcast (ld 0).
+            (None, _, Some(ty)) => Some(MatrixLayout::new(ty, d.rows, d.cols, 0)),
             _ => None,
         };
-        Ok(Layouts { a, b, c, d })
+        Ok(Layouts { a, b, c, d, k })
     }
 
     fn desc(&self, layouts: &Layouts) -> MatmulDesc {
@@ -873,6 +924,31 @@ impl Problem {
             Some(c) => desc.c(c),
             None => desc,
         }
+    }
+
+    /// Promised pointer alignments of A', B', C' and D'.
+    fn alignments(&self) -> [u32; 4] {
+        let an = &self.analysis;
+        let (a, b) = if an.swapped {
+            (an.a_align, an.b_align)
+        } else {
+            (an.b_align, an.a_align)
+        };
+        let c = match (an.c_align, self.c_type) {
+            (Some(c), _) => c,
+            // The unread C is bound to A''s buffer.
+            (None, Some(_)) => a,
+            (None, None) => an.d_align,
+        };
+        [a, b, c, an.d_align]
+    }
+
+    fn preference(&self) -> MatmulPreference {
+        let mut pref = MatmulPreference::default()
+            .aux_alignment_bytes(FAST_ALIGNMENT)
+            .requested_algo_count(16);
+        pref.min_alignment_bytes = self.alignments();
+        pref
     }
 
     fn tune_payload(&self, layouts: &Layouts, dims: &SymDims) -> TunePayload {
@@ -895,7 +971,7 @@ impl Problem {
                 .flatten()
                 .map(|op| op.hint_offset(dims))
                 .collect(),
-            alignment: ALIGNMENT,
+            alignments: self.alignments(),
         }
     }
 }
@@ -906,11 +982,45 @@ struct Resolved {
     algo: Algorithm,
 }
 
+/// Plans for concrete shapes. The hint plan is never evicted; the others are
+/// evicted least recently used first.
+struct PlanCache {
+    hint: (Layouts, Arc<Resolved>),
+    others: HashMap<Layouts, (Arc<Resolved>, u64)>,
+    clock: u64,
+}
+
+impl PlanCache {
+    fn get(&mut self, layouts: &Layouts) -> Option<Arc<Resolved>> {
+        if *layouts == self.hint.0 {
+            return Some(self.hint.1.clone());
+        }
+        self.clock += 1;
+        let (resolved, last_used) = self.others.get_mut(layouts)?;
+        *last_used = self.clock;
+        Some(resolved.clone())
+    }
+
+    fn insert(&mut self, layouts: Layouts, resolved: Arc<Resolved>) {
+        if self.others.len() >= MAX_CACHED_PLANS
+            && let Some(oldest) = self
+                .others
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(layouts, _)| *layouts)
+        {
+            self.others.remove(&oldest);
+        }
+        self.clock += 1;
+        self.others.insert(layouts, (resolved, self.clock));
+    }
+}
+
 struct MatmulExecutor {
     problem: Arc<Problem>,
     hint_plan: Arc<MatmulPlan>,
-    algo: Algorithm,
-    plans: Mutex<HashMap<Layouts, Arc<Resolved>>>,
+    config: AlgoConfig,
+    plans: Mutex<PlanCache>,
 }
 
 impl MatmulExecutor {
@@ -918,6 +1028,7 @@ impl MatmulExecutor {
         problem: Arc<Problem>,
         hint_plan: Arc<MatmulPlan>,
         hint_layouts: Layouts,
+        config: AlgoConfig,
         algo: Algorithm,
     ) -> Self {
         let resolved = Arc::new(Resolved {
@@ -927,15 +1038,19 @@ impl MatmulExecutor {
         Self {
             problem,
             hint_plan,
-            algo,
-            plans: Mutex::new(HashMap::from([(hint_layouts, resolved)])),
+            config,
+            plans: Mutex::new(PlanCache {
+                hint: (hint_layouts, resolved),
+                others: HashMap::new(),
+                clock: 0,
+            }),
         }
     }
 
     /// The plan for a concrete shape, reshaping the hint plan on first use.
     fn resolve(&self, layouts: &Layouts) -> anyhow::Result<Arc<Resolved>> {
         if let Some(resolved) = self.plans.lock().get(layouts) {
-            return Ok(resolved.clone());
+            return Ok(resolved);
         }
         let desc = self.problem.desc(layouts);
         let plan = match self.hint_plan.reshape(&desc) {
@@ -951,14 +1066,9 @@ impl MatmulExecutor {
             }
             Err(e) => return Err(e.into()),
         };
-        let algo = match plan.check(&self.algo) {
-            Ok(check) => {
-                let mut algo = self.algo;
-                algo.workspace_size = check.workspace_size;
-                algo
-            }
-            Err(_) => *plan.candidate(),
-        };
+        // Keep the tuned algorithm only if it survived the plan's checks,
+        // including its workspace budget.
+        let algo = self.config.find(&plan).unwrap_or_else(|| *plan.candidate());
         let resolved = Arc::new(Resolved {
             plan: Arc::new(plan),
             algo,
@@ -968,16 +1078,45 @@ impl MatmulExecutor {
     }
 }
 
+/// The plain storage or block-scaled values of a tensor.
+fn values<'a>(t: &TensorRef<'a>) -> MemorySlice<&'a DeviceMemory> {
+    match t {
+        TensorRef::Plain(t) => *t.storage(),
+        TensorRef::Mx(t) => *t.values().storage(),
+    }
+}
+
+/// Fails unless the memory's address meets the alignment promised to cuBLASLt.
+fn check_address(
+    memory: &impl DeviceVisibleMemory,
+    align: u32,
+    what: &str,
+    stream: &Stream,
+) -> anyhow::Result<()> {
+    // Only the address is read; the operand's binding takes its own access.
+    let ptr = unsafe { memory.access_on(stream)?.ptr() };
+    ensure!(
+        ptr.is_multiple_of(u64::from(align)),
+        "{what} is at address {ptr:#x}, which is not {align}-byte aligned as its layout implies"
+    );
+    Ok(())
+}
+
 impl Executor for MatmulExecutor {
     fn scratch_bytes(&self, dims: &DimValues) -> usize {
         let Ok(layouts) = self.problem.layouts(dims) else {
             return 0;
         };
-        if layouts.is_empty() {
+        if layouts.is_empty() || layouts.k == 0 {
             return 0;
         }
-        self.resolve(&layouts)
-            .map_or(0, |resolved| resolved.algo.workspace_size)
+        match self.resolve(&layouts) {
+            Ok(resolved) if resolved.algo.workspace_size > 0 => {
+                // Room to align the workspace.
+                resolved.algo.workspace_size + WORKSPACE_ALIGNMENT
+            }
+            _ => 0,
+        }
     }
 
     fn execute(&self, io: &mut OpIo<'_>, stream: &Stream, _cx: &Context) -> anyhow::Result<()> {
@@ -986,8 +1125,13 @@ impl Executor for MatmulExecutor {
         if layouts.is_empty() {
             return Ok(());
         }
+        ensure!(
+            layouts.k > 0,
+            "matmul contraction dimension K is zero at execution time"
+        );
         let resolved = self.resolve(&layouts)?;
         let (plan, algo) = (&*resolved.plan, &resolved.algo);
+        let [a_align, b_align, c_align, _] = problem.alignments();
 
         let OpIo {
             inputs,
@@ -1006,99 +1150,103 @@ impl Executor for MatmulExecutor {
         } else {
             (&our_b, &our_a)
         };
+        let (a_values, b_values) = (values(a), values(b));
+        check_address(&a_values, a_align, "A'", stream)?;
+        check_address(&b_values, b_align, "B'", stream)?;
 
-        let unread_c;
         let mut ops = plan.operands();
         ops.alpha(Scalar::F32(problem.alpha))
-            .beta(Scalar::F32(problem.beta));
-        match a {
-            TensorRef::Plain(t) => ops.a(t.storage()),
-            TensorRef::Mx(t) => ops
-                .a(t.values().storage())
-                .a_scale(t.scale_factors().storage()),
-        };
-        match b {
-            TensorRef::Plain(t) => ops.b(t.storage()),
-            TensorRef::Mx(t) => ops
-                .b(t.values().storage())
-                .b_scale(t.scale_factors().storage()),
-        };
+            .beta(Scalar::F32(problem.beta))
+            .a(&a_values)
+            .b(&b_values);
+        if let TensorRef::Mx(t) = a {
+            ops.a_scale(t.scale_factors().storage());
+        }
+        if let TensorRef::Mx(t) = b {
+            ops.b_scale(t.scale_factors().storage());
+        }
         if let Some(c) = &c {
-            ops.c(c.plain().storage());
+            let c = c.plain().storage();
+            check_address(c, c_align, "C", stream)?;
+            ops.c(c);
         }
         match &mut outputs[0] {
             TensorRefMut::Plain(d) => {
                 ops.d(d.storage_mut());
             }
             TensorRefMut::Mx(d) => {
+                // cuBLASLt requires a bf16 C distinct from D (and not null)
+                // for block-scaled outputs. beta is zero, so it is never read;
+                // bind A''s buffer as a broadcast C. Unverified until run on sm_100+.
+                ops.c(&a_values);
                 let (values, scales) = d.values_and_scale_factors_mut();
-                // beta is zero, so cuBLASLt never reads C; any aligned pointer will do.
-                let ptr = unsafe { values.storage_mut().access_mut_on(stream)?.ptr() };
-                let c = layouts.c.expect("block-scaled outputs have a C layout");
-                unread_c = RawMemory {
-                    ptr,
-                    len: c.min_len_bytes().unwrap_or(0),
-                };
-                ops.c(&unread_c)
-                    .d(values.storage_mut())
-                    .d_out_scale(scales.storage());
+                // cuBLASLt writes the output scale factors, which the operand
+                // builder only binds for reading: record the write here.
+                scales.storage_mut().access_mut_on(stream)?;
+                ops.d(values.storage_mut()).d_out_scale(scales.storage());
             }
         }
 
-        match scratch {
-            Some(scratch) => unsafe { plan.execute_with(algo, stream, &ops, scratch)? },
-            None => {
-                ensure!(
-                    algo.workspace_size == 0,
-                    "matmul needs {} bytes of scratch memory, but none was given",
-                    algo.workspace_size
-                );
-                let mut empty = RawMemory { ptr: 0, len: 0 };
-                unsafe { plan.execute_with(algo, stream, &ops, &mut empty)? }
-            }
+        if algo.workspace_size == 0 {
+            unsafe { plan.execute_with(algo, stream, &ops, &mut EmptyWorkspace)? };
+            return Ok(());
         }
+        let Some(scratch) = scratch else {
+            bail!(
+                "matmul needs {} bytes of scratch memory, but none was given",
+                algo.workspace_size
+            );
+        };
+        let address = unsafe { scratch.access_mut_on(stream)?.ptr() };
+        let padding = (address as usize).next_multiple_of(WORKSPACE_ALIGNMENT) - address as usize;
+        ensure!(
+            scratch.len() >= padding + algo.workspace_size,
+            "matmul needs {} bytes of aligned scratch memory, but {} bytes were given",
+            algo.workspace_size,
+            scratch.len()
+        );
+        let start = scratch.offset() + padding;
+        let end = scratch.offset() + scratch.len();
+        let mut workspace = MemorySliceMut::new(&mut **scratch.inner_mut(), start..end);
+        unsafe { plan.execute_with(algo, stream, &ops, &mut workspace)? };
         Ok(())
     }
 }
 
-/// Device memory given by a raw pointer, without stream-ordered access tracking.
-/// Only for memory cuBLASLt never touches.
-struct RawMemory {
-    ptr: CUdeviceptr_v2,
-    len: usize,
-}
+/// A zero-byte workspace, passed as a null pointer.
+struct EmptyWorkspace;
 
-struct RawGuard(CUdeviceptr_v2);
+struct NullPtr;
 
-impl DevicePtrGuard<'_> for RawGuard {
+impl DevicePtrGuard<'_> for NullPtr {
     unsafe fn ptr(&self) -> CUdeviceptr_v2 {
-        self.0
+        0
     }
 }
 
-impl DevicePtrGuardMut<'_> for RawGuard {
+impl DevicePtrGuardMut<'_> for NullPtr {
     unsafe fn ptr(&mut self) -> CUdeviceptr_v2 {
-        self.0
+        0
     }
 }
 
-impl DeviceVisibleMemory for RawMemory {
-    type Guard<'a> = RawGuard;
+impl DeviceVisibleMemory for EmptyWorkspace {
+    type Guard<'a> = NullPtr;
 
     fn len(&self) -> usize {
-        self.len
+        0
     }
 
-    fn access_on<'a>(&'a self, _stream: &'a Stream) -> skycuda::error::Result<RawGuard> {
-        Ok(RawGuard(self.ptr))
+    fn access_on<'a>(&'a self, _stream: &'a Stream) -> skycuda::error::Result<NullPtr> {
+        Ok(NullPtr)
     }
 }
 
-impl DeviceVisibleMemoryMut for RawMemory {
-    type GuardMut<'a> = RawGuard;
+impl DeviceVisibleMemoryMut for EmptyWorkspace {
+    type GuardMut<'a> = NullPtr;
 
-    fn access_mut_on<'a>(&'a mut self, _stream: &'a Stream) -> skycuda::error::Result<RawGuard> {
-        Ok(RawGuard(self.ptr))
+    fn access_mut_on<'a>(&'a mut self, _stream: &'a Stream) -> skycuda::error::Result<NullPtr> {
+        Ok(NullPtr)
     }
 }
 
@@ -1216,27 +1364,41 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plans_build() -> anyhow::Result<()> {
-        let cx = Context::new(
+    fn test_context() -> anyhow::Result<Context> {
+        Context::new(
             0,
             Default::default(),
             skycuda::host_pinned_memory_pool::HostPinnedMemoryPoolOptions {
                 max_reserved_free_bytes: 1 << 20,
             },
-        )?;
-        let pref = MatmulPreference::default()
-            .min_alignment_bytes(ALIGNMENT as u32)
-            .aux_alignment_bytes(ALIGNMENT as u32);
+        )
+    }
+
+    #[test]
+    fn alignment_is_per_operand() -> anyhow::Result<()> {
+        let (problem, _) = setup(GraphBuilder::new(), |gb| {
+            let a = gb.input("a", BF16, [16, 40])?.sliced(1, 3, 32)?;
+            let b = gb.input("b", BF16, [32, 12])?;
+            Ok(plain(&a, &b))
+        })?;
+        // [A' = B (ld 12 bf16 = 24 bytes), B' = A (offset 3 bf16 = 6 bytes), C = D, D (ld 24 bytes)].
+        assert_eq!(problem.alignments(), [8, 2, 8, 8]);
+        Ok(())
+    }
+
+    #[test]
+    fn plans_build() -> anyhow::Result<()> {
+        let cx = test_context()?;
         let (problem, l) = setup(GraphBuilder::new(), |gb| {
             Ok(plain(
                 &gb.input("a", BF16, [64, 64])?,
                 &gb.input("b", BF16, [64, 64])?,
             ))
         })?;
-        let plan = cx.cublaslt().build_plan(&problem.desc(&l), &pref)?;
-        let algo = plan.candidate();
-        let config = AlgoConfig::of(algo)?;
+        let plan = cx
+            .cublaslt()
+            .build_plan(&problem.desc(&l), &problem.preference())?;
+        let config = AlgoConfig::of(plan.candidate())?;
         assert_eq!(AlgoConfig::of(&config.algorithm(&plan)?)?, config);
 
         // Block-scaled descriptors are well-formed; they only build on sm_100+.
@@ -1251,13 +1413,172 @@ mod tests {
                 ..plain(&a, &b)
             })
         })?;
-        match cx.cublaslt().build_plan(&problem.desc(&l), &pref) {
+        match cx
+            .cublaslt()
+            .build_plan(&problem.desc(&l), &problem.preference())
+        {
             Ok(_) => {}
             Err(e) if cx.cuda().compute_capability_major() < 10 => {
                 assert_eq!(e.status(), Some(Status::NotSupported), "{e}");
             }
             Err(e) => return Err(e.into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rebuilt_algorithms_round_trip() -> anyhow::Result<()> {
+        let cx = test_context()?;
+        let (problem, l) = setup(GraphBuilder::new(), |gb| {
+            Ok(plain(
+                &gb.input("a", BF16, [128, 256])?,
+                &gb.input("b", BF16, [256, 96])?,
+            ))
+        })?;
+        let plan = cx
+            .cublaslt()
+            .build_plan(&problem.desc(&l), &problem.preference())?;
+        for algo in plan.algorithms() {
+            let config = AlgoConfig::of(algo)?;
+            let rebuilt = config.rebuild(&plan)?;
+            assert_eq!(AlgoConfig::of(&rebuilt)?, config);
+            assert_eq!(rebuilt.workspace_size, plan.check(algo)?.workspace_size);
+        }
+        Ok(())
+    }
+
+    /// An executor for `[m, 256] x [256, 128]` with a dynamic `m` (hint 64).
+    fn dynamic_executor(
+        cx: &Context,
+        config: impl FnOnce(&MatmulPlan) -> AlgoConfig,
+    ) -> anyhow::Result<(MatmulExecutor, crate::execgraph::sym::SymDimId)> {
+        let gb = GraphBuilder::new();
+        let m = gb.dynamic_dim("m", 64, 0);
+        let op = plain(
+            &gb.input("a", BF16, [Monomial::atom(m), Monomial::fixed(256)])?,
+            &gb.input("b", BF16, [256, 128])?,
+        );
+        let graph = gb.finish()?;
+        let problem = Arc::new(Problem::new(&op, op.analyze(graph.info())?)?);
+        let hint_layouts = problem.layouts(&graph.info().hint_values())?;
+        let plan = Arc::new(
+            cx.cublaslt()
+                .build_plan(&problem.desc(&hint_layouts), &problem.preference())?,
+        );
+        let config = config(&plan);
+        let algo = config.algorithm(&plan)?;
+        let executor = MatmulExecutor::new(problem, plan, hint_layouts, config, algo);
+        Ok((executor, m))
+    }
+
+    fn dims_with(m: crate::execgraph::sym::SymDimId, value: usize) -> DimValues {
+        let mut dims = DimValues::new();
+        dims.bind(m, value);
+        dims
+    }
+
+    #[test]
+    fn resolve_reshapes_and_caches() -> anyhow::Result<()> {
+        let cx = test_context()?;
+        let (executor, m) =
+            dynamic_executor(&cx, |plan| AlgoConfig::of(plan.candidate()).unwrap())?;
+        let hint = executor.problem.layouts(&dims_with(m, 64))?;
+        let hint_plan = executor.resolve(&hint)?.plan.clone();
+        assert!(Arc::ptr_eq(&hint_plan, &executor.hint_plan));
+        assert!(executor.plans.lock().others.is_empty());
+
+        let other = executor.problem.layouts(&dims_with(m, 1000))?;
+        let resolved = executor.resolve(&other)?;
+        assert!(!Arc::ptr_eq(&resolved.plan, &executor.hint_plan));
+        assert_eq!(resolved.plan.desc().b.cols, 1000);
+        assert_eq!(executor.plans.lock().others.len(), 1);
+        // Cached on the second lookup.
+        assert!(Arc::ptr_eq(&executor.resolve(&other)?, &resolved));
+        assert_eq!(executor.plans.lock().others.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_keeps_tuned_algorithm_only_within_budget() -> anyhow::Result<()> {
+        let cx = test_context()?;
+        let (executor, m) = dynamic_executor(&cx, |plan| {
+            AlgoConfig::of(plan.algorithms().last().unwrap()).unwrap()
+        })?;
+        let in_plan = |resolved: &Resolved| -> anyhow::Result<AlgoConfig> {
+            let chosen = AlgoConfig::of(&resolved.algo)?;
+            // Algorithms of a reshaped plan all fit the workspace budget.
+            assert!(
+                resolved
+                    .plan
+                    .algorithms()
+                    .iter()
+                    .any(|a| AlgoConfig::of(a).unwrap() == chosen)
+            );
+            Ok(chosen)
+        };
+        let resolved = executor.resolve(&executor.problem.layouts(&dims_with(m, 512))?)?;
+        let chosen = in_plan(&resolved)?;
+        if executor.config.find(&resolved.plan).is_some() {
+            assert_eq!(chosen, executor.config);
+        }
+
+        // A tuned config the reshaped plan does not contain falls back to its candidate.
+        let (mut executor, m) =
+            dynamic_executor(&cx, |plan| AlgoConfig::of(plan.candidate()).unwrap())?;
+        executor.config.splitk = 12345;
+        let resolved = executor.resolve(&executor.problem.layouts(&dims_with(m, 300))?)?;
+        assert_eq!(
+            in_plan(&resolved)?,
+            AlgoConfig::of(resolved.plan.candidate())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_cache_is_bounded() -> anyhow::Result<()> {
+        let cx = test_context()?;
+        let (executor, m) =
+            dynamic_executor(&cx, |plan| AlgoConfig::of(plan.candidate()).unwrap())?;
+        for value in 1..=MAX_CACHED_PLANS + 10 {
+            let layouts = executor.problem.layouts(&dims_with(m, value * 8))?;
+            executor.resolve(&layouts)?;
+        }
+        let cache = executor.plans.lock();
+        assert_eq!(cache.others.len(), MAX_CACHED_PLANS);
+        // The oldest entries were evicted, the newest kept.
+        let newest = executor
+            .problem
+            .layouts(&dims_with(m, (MAX_CACHED_PLANS + 10) * 8))?;
+        let oldest = executor.problem.layouts(&dims_with(m, 8))?;
+        assert!(cache.others.contains_key(&newest));
+        assert!(!cache.others.contains_key(&oldest));
+        Ok(())
+    }
+
+    #[test]
+    fn leading_dimension_validation() -> anyhow::Result<()> {
+        let map = MatMap {
+            transposed: true,
+            unit_rows: true,
+        };
+        // A [8, 16] read as col-major 16 x 8 with ld 4 < 16.
+        let err = map
+            .layout(
+                DataType::BF16,
+                Shape::new([8, 16]),
+                Strides::new([4, 1]),
+                "X",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("smaller than"), "{err}");
+        // A single column may have any leading dimension.
+        let layout = map.layout(
+            DataType::BF16,
+            Shape::new([1, 16]),
+            Strides::new([0, 1]),
+            "X",
+        )?;
+        assert_eq!(layout.ld, 16);
         Ok(())
     }
 }
