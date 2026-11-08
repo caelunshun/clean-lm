@@ -618,7 +618,10 @@ impl Operator for Matmul {
             .cublaslt()
             .build_plan(&problem.desc(&hint_layouts), &pref)
             .map_err(|e| {
-                if e.status() == Some(Status::NotSupported) {
+                if matches!(
+                    e.status(),
+                    Some(Status::NotSupported | Status::InvalidValue)
+                ) {
                     anyhow!(e).context(format!("cuBLASLt does not support matmul {combo}"))
                 } else {
                     anyhow!(e).context(format!("building cuBLASLt plan for matmul {combo}"))

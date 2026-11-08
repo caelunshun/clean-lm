@@ -590,7 +590,7 @@ fn unsupported_combination_fails_build() -> anyhow::Result<()> {
     let err = build(gb, &cx, Autotune::Off).expect_err("bf16 x f32 should be unsupported");
     let message = format!("{err:#}");
     assert!(
-        message.contains("Bf16") && message.contains("F32"),
+        message.contains("does not support matmul Float(Bf16) x Float(F32)"),
         "error {message:?} should name the type combination"
     );
     Ok(())
