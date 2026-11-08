@@ -202,6 +202,10 @@ impl GraphBuilder {
     }
 
     /// A read-only input with a packed row-major layout.
+    ///
+    /// At execution, the storage of every input (both parts of block-scaled inputs)
+    /// must start at a 16-byte aligned offset of its allocation, so that alignment
+    /// proofs about input layouts hold for actual addresses.
     pub fn input(
         &self,
         name: impl Into<String>,
@@ -221,7 +225,8 @@ impl GraphBuilder {
         self.plain_input(name.into(), ty, shape.into_sym_shape(), None, true)
     }
 
-    /// A read-only input with arbitrary symbolic strides. The offset must be zero, since
+    /// A read-only input with arbitrary symbolic strides; storage must be 16-byte
+    /// aligned as for [`Self::input`]. The offset must be zero, since
     /// the input's view starts at the beginning of its storage slice.
     pub fn input_with_layout(
         &self,
@@ -243,7 +248,8 @@ impl GraphBuilder {
         self.plain_input(name.into(), ty, shape, Some(layout), true)
     }
 
-    /// A read-only 2D block-scaled input.
+    /// A read-only 2D block-scaled input. Both storage parts must be 16-byte aligned
+    /// as for [`Self::input`], and runtime dimensions must be nonzero.
     pub fn input_mx(
         &self,
         name: impl Into<String>,
@@ -360,12 +366,18 @@ impl GraphBuilder {
         let specs = op
             .infer_outputs(&state.info)
             .with_context(|| name.clone())?;
+        let (num_tensors, num_buffers) = (state.info.tensors.len(), state.info.buffers.len());
         let mut outputs = Vec::with_capacity(specs.len());
         for (i, spec) in specs.into_iter().enumerate() {
-            let tensor = state
-                .add_output(op_index, spec)
-                .with_context(|| format!("{name}: output {i}"))?;
-            outputs.push(tensor);
+            match state.add_output(op_index, spec) {
+                Ok(tensor) => outputs.push(tensor),
+                Err(e) => {
+                    // Roll back the outputs added so far.
+                    state.info.tensors.truncate(num_tensors);
+                    state.info.buffers.truncate(num_buffers);
+                    return Err(e.context(format!("{name}: output {i}")));
+                }
+            }
         }
         state.ops.push(OpRecord {
             op: Box::new(op),
@@ -773,19 +785,28 @@ impl Graph {
             }
         }
 
-        // Every dimension must be inferable from the inputs.
-        let mut inferable = HashSet::new();
+        // Every dimension in a shape must be inferable from the inputs, mirroring
+        // the solver: an equation determines an atom if it is the only unbound one.
+        let mut equations = Vec::new();
         for input in &self.inputs {
             let tensor = self.info.tensor(input.tensor);
-            inferable.extend(
-                tensor
-                    .shape()
-                    .dims()
-                    .iter()
-                    .flat_map(|d| d.atoms().to_vec()),
-            );
+            equations.extend(tensor.shape().dims().iter());
             if let Some(layout) = tensor.layout() {
-                inferable.extend(layout.strides.iter().flat_map(|s| s.atoms().to_vec()));
+                equations.extend(layout.strides.iter());
+            }
+        }
+        let mut inferable = HashSet::new();
+        loop {
+            let mut progress = false;
+            for eq in &equations {
+                let mut unbound = eq.atoms().iter().filter(|a| !inferable.contains(*a));
+                if let (Some(&atom), None) = (unbound.next(), unbound.next()) {
+                    inferable.insert(atom);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
             }
         }
         for tensor in &self.info.tensors {
