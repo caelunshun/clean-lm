@@ -369,18 +369,20 @@ impl Polynomial {
     }
 
     pub fn add_monomial(&mut self, term: &Monomial) {
+        self.try_add_monomial(term)
+            .expect("polynomial coefficient overflow");
+    }
+
+    /// Returns `None` (leaving `self` unchanged) on coefficient overflow.
+    pub fn try_add_monomial(&mut self, term: &Monomial) -> Option<()> {
         if term.is_zero() {
-            return;
+            return Some(());
         }
         match self.0.binary_search_by(|t| t.atoms.cmp(&term.atoms)) {
-            Ok(i) => {
-                self.0[i].coef = self.0[i]
-                    .coef
-                    .checked_add(term.coef)
-                    .expect("polynomial coefficient overflow");
-            }
+            Ok(i) => self.0[i].coef = self.0[i].coef.checked_add(term.coef)?,
             Err(i) => self.0.insert(i, term.clone()),
         }
+        Some(())
     }
 
     fn atoms(&self) -> impl Iterator<Item = SymDimId> + '_ {
@@ -483,9 +485,13 @@ impl SymShape {
     }
 
     pub fn numel(&self) -> Monomial {
+        self.checked_numel().expect("element count overflow")
+    }
+
+    pub fn checked_numel(&self) -> Option<Monomial> {
         self.0
             .iter()
-            .fold(Monomial::one(), |acc, d| acc * d.clone())
+            .try_fold(Monomial::one(), |acc, d| acc.checked_mul(d))
     }
 
     pub fn eval(&self, values: &DimValues) -> anyhow::Result<Shape> {
@@ -532,14 +538,16 @@ impl FromIterator<Monomial> for SymShape {
     }
 }
 
-fn row_major_strides(shape: &SymShape) -> Vec<Monomial> {
+fn row_major_strides(shape: &SymShape) -> Option<Vec<Monomial>> {
     let mut strides = vec![Monomial::one(); shape.rank()];
     let mut stride = Monomial::one();
     for dim in (0..shape.rank()).rev() {
         strides[dim] = stride.clone();
-        stride = stride * shape[dim].clone();
+        if dim > 0 {
+            stride = stride.checked_mul(&shape[dim])?;
+        }
     }
-    strides
+    Some(strides)
 }
 
 /// Number of elements whose total bit size is a multiple of `align_bytes`,
@@ -580,7 +588,9 @@ impl SymLayout {
         element_type: ElementType,
         dims: &SymDims,
     ) -> anyhow::Result<Self> {
-        let strides = row_major_strides(&shape);
+        let overflow = || anyhow!("element count of shape {} overflows", shape.display(dims));
+        shape.checked_numel().ok_or_else(overflow)?;
+        let strides = row_major_strides(&shape).ok_or_else(overflow)?;
         let bits = element_type.bits_per_element();
         assert!(bits.is_power_of_two());
         if bits < 8 {
@@ -613,8 +623,8 @@ impl SymLayout {
     /// the symbolic dimensions.
     #[must_use]
     pub fn try_reshaped(&self, target_shape: &SymShape) -> Option<Self> {
-        let element_count = self.shape.numel();
-        if element_count != target_shape.numel() {
+        let element_count = self.shape.checked_numel()?;
+        if element_count != target_shape.checked_numel()? {
             return None;
         }
         if self.shape == *target_shape {
@@ -625,7 +635,7 @@ impl SymLayout {
         if element_count.is_zero() || self.rank() == 0 {
             return Some(Self::new(
                 target_shape.clone(),
-                row_major_strides(target_shape),
+                row_major_strides(target_shape)?,
                 self.offset.clone(),
             ));
         }
@@ -636,10 +646,13 @@ impl SymLayout {
         let mut target_chunk_elements = Monomial::one();
 
         for source_dim in (0..self.rank()).rev() {
-            source_chunk_elements = source_chunk_elements * self.shape[source_dim].clone();
+            source_chunk_elements = source_chunk_elements.checked_mul(&self.shape[source_dim])?;
             let at_chunk_boundary = source_dim == 0
                 || (!self.shape[source_dim - 1].is_one()
-                    && &source_chunk_elements * &chunk_base_stride != self.strides[source_dim - 1]);
+                    && source_chunk_elements
+                        .checked_mul(&chunk_base_stride)
+                        .as_ref()
+                        != Some(&self.strides[source_dim - 1]));
 
             if at_chunk_boundary {
                 while target_dim > 0
@@ -647,8 +660,14 @@ impl SymLayout {
                         || target_shape[target_dim - 1].is_one())
                 {
                     target_dim -= 1;
-                    target_strides[target_dim] = &target_chunk_elements * &chunk_base_stride;
-                    target_chunk_elements = &target_chunk_elements * &target_shape[target_dim];
+                    target_strides[target_dim] =
+                        match target_chunk_elements.checked_mul(&chunk_base_stride) {
+                            Some(stride) => stride,
+                            None if target_shape[target_dim].is_one() => chunk_base_stride.clone(),
+                            None => return None,
+                        };
+                    target_chunk_elements =
+                        target_chunk_elements.checked_mul(&target_shape[target_dim])?;
                     if !source_chunk_elements.is_divisible_by(&target_chunk_elements) {
                         return None;
                     }
@@ -675,7 +694,15 @@ impl SymLayout {
     }
 
     /// Slices `len` elements starting at `start` along a dimension of fixed size.
-    pub fn sliced(&self, dim: usize, start: usize, len: usize) -> anyhow::Result<Self> {
+    /// For sub-byte element types, the slice must provably start at a byte boundary.
+    pub fn sliced(
+        &self,
+        dim: usize,
+        start: usize,
+        len: usize,
+        element_type: ElementType,
+        dims: &SymDims,
+    ) -> anyhow::Result<Self> {
         ensure!(
             dim < self.rank(),
             "slice dimension {dim} out of range for rank {}",
@@ -694,15 +721,32 @@ impl SymLayout {
             end <= size,
             "slice {start}..{end} out of range for dimension {dim} of size {size}"
         );
+        let overflow = || anyhow!("slice offset overflows");
+        let start_offset = self.strides[dim]
+            .checked_mul(&Monomial::fixed(start))
+            .ok_or_else(overflow)?;
+        let bits = element_type.bits_per_element();
+        assert!(bits.is_power_of_two());
+        if bits < 8 {
+            ensure!(
+                start_offset.is_divisible_by_pow2((8 / bits).ilog2(), dims),
+                "slice of {element_type:?} tensor starting at element offset {} is not provably byte-aligned",
+                start_offset.display(dims)
+            );
+        }
         let mut result = self.clone();
-        result.offset.add_monomial(&(&self.strides[dim] * start));
+        result
+            .offset
+            .try_add_monomial(&start_offset)
+            .ok_or_else(overflow)?;
         result.shape[dim] = Monomial::fixed(len);
         Ok(result)
     }
 
     /// Whether strides are the packed row-major strides and the offset is zero.
     pub fn is_contiguous_row_major(&self) -> bool {
-        self.offset.is_zero() && self.strides == row_major_strides(&self.shape)
+        self.offset.is_zero()
+            && row_major_strides(&self.shape).is_some_and(|strides| strides == self.strides)
     }
 
     /// Whether the view provably covers a dense range of elements in some
@@ -710,7 +754,7 @@ impl SymLayout {
     pub fn is_contiguous(&self) -> bool {
         let mut used = vec![false; self.rank()];
         let mut expected = Monomial::one();
-        for _ in 0..self.rank() {
+        for step in 0..self.rank() {
             // Size-1 dims don't advance the expected stride, so take them first.
             let next = (0..self.rank())
                 .filter(|&i| !used[i] && self.strides[i] == expected)
@@ -719,7 +763,12 @@ impl SymLayout {
                 return false;
             };
             used[i] = true;
-            expected = expected * self.shape[i].clone();
+            if step + 1 < self.rank() {
+                let Some(next_expected) = expected.checked_mul(&self.shape[i]) else {
+                    return false;
+                };
+                expected = next_expected;
+            }
         }
         true
     }
@@ -958,7 +1007,15 @@ impl Unifier {
     /// Binds every atom appearing in the equations, then verifies that all
     /// equations hold and all bound values satisfy their alignment guarantees.
     /// Existing bindings in `values` are respected.
+    /// On error, `values` is left unchanged.
     pub fn solve(&self, values: &mut DimValues, dims: &SymDims) -> anyhow::Result<()> {
+        let mut solved = values.clone();
+        self.solve_in_place(&mut solved, dims)?;
+        *values = solved;
+        Ok(())
+    }
+
+    fn solve_in_place(&self, values: &mut DimValues, dims: &SymDims) -> anyhow::Result<()> {
         loop {
             let mut progress = false;
             for eq in &self.equations {
@@ -1371,7 +1428,7 @@ mod tests {
         let s = m(e.s);
         let l = SymLayout::contiguous_row_major(shape([s.clone(), m(64)]), BF16, &e.dims)
             .unwrap()
-            .sliced(1, 16, 32)
+            .sliced(1, 16, 32, BF16, &e.dims)
             .unwrap();
         assert!(l.try_reshaped(&shape([s.clone() * 32])).is_none());
         let r = l.try_reshaped(&shape([s.clone(), m(16), m(2)])).unwrap();
@@ -1386,20 +1443,20 @@ mod tests {
         let s = m(e.s);
         let l = SymLayout::contiguous_row_major(shape([m(e.b), m(4), s.clone()]), BF16, &e.dims)
             .unwrap();
-        let a = l.sliced(1, 2, 2).unwrap();
+        let a = l.sliced(1, 2, 2, BF16, &e.dims).unwrap();
         assert_eq!(a.shape, shape([m(e.b), m(2), s.clone()]));
         assert_eq!(a.offset, Polynomial::from(s.clone() * 2));
         assert!(!a.is_contiguous_row_major());
-        let a2 = a.sliced(1, 1, 1).unwrap();
+        let a2 = a.sliced(1, 1, 1, BF16, &e.dims).unwrap();
         assert_eq!(a2.offset, Polynomial::from(s.clone() * 3));
         assert_eq!(a2.shape[1], m(1));
 
-        assert!(l.sliced(0, 0, 1).is_err());
-        assert!(l.sliced(2, 0, 1).is_err());
-        assert!(l.sliced(1, 3, 2).is_err());
-        assert!(l.sliced(1, usize::MAX, 2).is_err());
-        assert!(l.sliced(3, 0, 1).is_err());
-        assert!(l.sliced(1, 4, 0).is_ok());
+        assert!(l.sliced(0, 0, 1, BF16, &e.dims).is_err());
+        assert!(l.sliced(2, 0, 1, BF16, &e.dims).is_err());
+        assert!(l.sliced(1, 3, 2, BF16, &e.dims).is_err());
+        assert!(l.sliced(1, usize::MAX, 2, BF16, &e.dims).is_err());
+        assert!(l.sliced(3, 0, 1, BF16, &e.dims).is_err());
+        assert!(l.sliced(1, 4, 0, BF16, &e.dims).is_ok());
 
         let (sh, st, off) = a2.eval(&values(&[(e.b, 2), (e.s, 8)])).unwrap();
         assert_eq!(sh, Shape::new([2, 1, 8]));
@@ -1422,12 +1479,12 @@ mod tests {
         assert!(l.stride_is_aligned(2, 1, BF16, &e.dims));
         assert!(l.offset_is_aligned(1024, BF16, &e.dims));
 
-        let sl = l.sliced(1, 1, 2).unwrap();
+        let sl = l.sliced(1, 1, 2, BF16, &e.dims).unwrap();
         assert!(sl.offset_is_aligned(16, BF16, &e.dims));
         assert!(!sl.offset_is_aligned(32, BF16, &e.dims));
 
         let r = SymLayout::contiguous_row_major(shape([m(e.t), m(96)]), BF16, &e.dims).unwrap();
-        let sl = r.sliced(1, 8, 8).unwrap();
+        let sl = r.sliced(1, 8, 8, BF16, &e.dims).unwrap();
         assert!(sl.offset_is_aligned(16, BF16, &e.dims));
         assert!(!sl.offset_is_aligned(32, BF16, &e.dims));
         assert!(!r.stride_is_aligned(0, 128, BF16, &e.dims));
@@ -1438,14 +1495,95 @@ mod tests {
         assert!(f.stride_is_aligned(0, 16, F4, &e.dims));
         assert!(!f.stride_is_aligned(0, 32, F4, &e.dims));
         assert!(!f.stride_is_aligned(1, 1, F4, &e.dims));
-        let f = f.sliced(1, 1, 2).unwrap();
-        assert!(!f.offset_is_aligned(1, F4, &e.dims));
-        let f2 = SymLayout::contiguous_row_major(shape([m(e.t), m(32)]), F4, &e.dims)
-            .unwrap()
-            .sliced(1, 2, 2)
-            .unwrap();
+        let f2 = f.sliced(1, 2, 2, F4, &e.dims).unwrap();
         assert!(f2.offset_is_aligned(1, F4, &e.dims));
         assert!(!f2.offset_is_aligned(2, F4, &e.dims));
+    }
+
+    #[test]
+    fn sub_byte_slicing() {
+        let e = env();
+        let f = SymLayout::contiguous_row_major(shape([m(4), m(32)]), F4, &e.dims).unwrap();
+        let err = f.sliced(1, 1, 2, F4, &e.dims).unwrap_err().to_string();
+        assert!(err.contains("byte-aligned"), "{err}");
+        assert!(f.sliced(1, 1, 2, BF16, &e.dims).is_ok());
+        assert!(f.sliced(1, 2, 2, F4, &e.dims).is_ok());
+        assert!(f.sliced(0, 1, 2, F4, &e.dims).is_ok());
+
+        // Row stride `tokens` has no alignment guarantee; `seq` is a multiple of 8.
+        let t = SymLayout::new(
+            shape([m(4), m(e.t)]),
+            vec![m(e.t), m(1)],
+            Polynomial::zero(),
+        );
+        assert!(t.sliced(0, 1, 1, F4, &e.dims).is_err());
+        assert!(t.sliced(0, 2, 1, F4, &e.dims).is_ok());
+        let s = SymLayout::contiguous_row_major(shape([m(4), m(e.s)]), F4, &e.dims).unwrap();
+        assert!(s.sliced(0, 1, 1, F4, &e.dims).is_ok());
+        let b = SymLayout::new(
+            shape([m(4), m(e.t)]),
+            vec![m(e.t), m(1)],
+            Polynomial::zero(),
+        );
+        assert!(b.sliced(0, 3, 1, ElementType::Bool, &e.dims).is_err());
+        assert!(b.sliced(0, 0, 1, ElementType::Bool, &e.dims).is_ok());
+    }
+
+    #[test]
+    fn overflow_is_not_a_panic() {
+        let e = env();
+        let huge = usize::MAX / 2;
+        assert!(SymLayout::contiguous_row_major(shape([m(huge), m(4)]), BF16, &e.dims).is_err());
+        assert!(
+            SymLayout::contiguous_row_major(shape([m(e.s), m(huge), m(4)]), BF16, &e.dims).is_err()
+        );
+        assert!(shape([m(huge), m(4)]).checked_numel().is_none());
+
+        let l = SymLayout::new(shape([m(2), m(2)]), vec![m(huge), m(1)], Polynomial::zero());
+        assert!(l.try_reshaped(&shape([m(4)])).is_none());
+        assert!(l.sliced(0, 4, 0, BF16, &e.dims).is_err());
+        let wide = SymLayout::new(shape([m(huge), m(4)]), vec![m(4), m(1)], Polynomial::zero());
+        assert!(wide.try_reshaped(&shape([m(4), m(huge)])).is_none());
+        assert!(wide.is_contiguous_row_major());
+        assert!(wide.is_contiguous());
+        let wide_t = wide.transposed(0, 1);
+        assert!(wide_t.is_contiguous());
+        assert!(wide_t.try_reshaped(&shape([m(2), m(2), m(huge)])).is_none());
+
+        // Size-1 target dims tolerate an overflowing stride, like VirtTensorView.
+        let big_stride = SymLayout::new(shape([m(4)]), vec![m(huge)], Polynomial::zero());
+        let r = big_stride.try_reshaped(&shape([m(1), m(4)])).unwrap();
+        assert_eq!(r.strides, vec![m(huge), m(huge)]);
+    }
+
+    #[test]
+    fn pow2_divisibility_of_products() {
+        let mut dims = SymDims::new();
+        let b = dims.insert(SymDim {
+            name: "b".into(),
+            hint: 4,
+            alignment_log2: 2,
+        });
+        let s = dims.insert(SymDim {
+            name: "s".into(),
+            hint: 8,
+            alignment_log2: 3,
+        });
+        let u = dims.insert(SymDim {
+            name: "u".into(),
+            hint: 3,
+            alignment_log2: 0,
+        });
+        assert_eq!((m(b) * m(s)).pow2_divisibility(&dims), 5);
+        assert_eq!((m(s) * m(s)).pow2_divisibility(&dims), 6);
+        assert_eq!((m(b) * m(s) * 12).pow2_divisibility(&dims), 7);
+        assert_eq!((m(u) * m(u) * 3).pow2_divisibility(&dims), 0);
+        assert_eq!((m(b) * m(u)).pow2_divisibility(&dims), 2);
+        assert!((m(b) * m(s)).is_divisible_by_pow2(5, &dims));
+        assert!(!(m(b) * m(s)).is_divisible_by_pow2(6, &dims));
+        let p = Polynomial::from(m(s) * m(s)) + m(b) * 2;
+        assert_eq!(p.pow2_divisibility(&dims), 3);
+        assert_eq!(Polynomial::zero().pow2_divisibility(&dims), u32::MAX);
     }
 
     #[test]
@@ -1457,7 +1595,7 @@ mod tests {
         assert_eq!(l.required_bytes(BF16).eval(&v).unwrap(), 1280);
         assert_eq!(l.required_bytes(BF16).eval_hint(&e.dims), 1024 * 64 * 2);
 
-        let sl = l.sliced(1, 16, 8).unwrap();
+        let sl = l.sliced(1, 16, 8, BF16, &e.dims).unwrap();
         // Last element: 9*64 + 16 + 7.
         assert_eq!(
             sl.required_bytes(BF16).eval(&v).unwrap(),
@@ -1507,7 +1645,7 @@ mod tests {
         // Atoms only appearing in strides and offsets.
         let sl = SymLayout::contiguous_row_major(shape([m(4), m(e.t) * 2]), BF16, &e.dims)
             .unwrap()
-            .sliced(0, 1, 2)
+            .sliced(0, 1, 2, BF16, &e.dims)
             .unwrap();
         let mut v = DimValues::new();
         unify(
@@ -1685,7 +1823,7 @@ mod tests {
         // Offset smaller than its known part.
         let sl = SymLayout::contiguous_row_major(shape([m(4), m(e.t)]), BF16, &e.dims)
             .unwrap()
-            .sliced(0, 1, 1)
+            .sliced(0, 1, 1, BF16, &e.dims)
             .unwrap();
         let mut u = Unifier::new();
         u.add_equation("off", sl.offset.clone() + m(100), 5);
@@ -1812,5 +1950,148 @@ mod tests {
             &e.dims,
         );
         assert!(bad_offset.is_err());
+    }
+
+    #[test]
+    fn failed_unify_leaves_values_untouched() {
+        let e = env();
+        let l =
+            SymLayout::contiguous_row_major(shape([m(e.b), m(e.s), m(64)]), BF16, &e.dims).unwrap();
+        let mut v = values(&[(e.t, 5)]);
+        // seq = 12 violates its alignment guarantee, after batch and seq were bound.
+        assert!(
+            unify(
+                &l,
+                &Shape::new([2, 12, 64]),
+                &Strides::new([768, 64, 1]),
+                0,
+                &mut v,
+                &e.dims,
+            )
+            .is_err()
+        );
+        assert_eq!(v.get(e.b), None);
+        assert_eq!(v.get(e.s), None);
+        assert_eq!(v.get(e.t), Some(5));
+
+        // Equation mismatch after a successful solve step.
+        assert!(
+            unify(
+                &l,
+                &Shape::new([2, 16, 64]),
+                &Strides::new([1000, 64, 1]),
+                0,
+                &mut v,
+                &e.dims,
+            )
+            .is_err()
+        );
+        assert_eq!(v.iter().count(), 1);
+    }
+
+    #[test]
+    fn symbolic_reshape_matches_concrete() {
+        use crate::tensor::VirtTensorView;
+
+        let e = env();
+        let (b, s) = (m(e.b), m(e.s));
+        let source_pool = [b.clone(), s.clone(), m(1), m(2), m(4)];
+        let target_pool = [
+            b.clone(),
+            s.clone(),
+            m(1),
+            m(2),
+            m(4),
+            m(8),
+            &b * &s,
+            &s * 2,
+            &b * 2,
+            &s * 4,
+            &b * 4,
+            &s * 8,
+            &b * &s * 2,
+            &b * &s * 4,
+        ];
+        fn shapes(pool: &[Monomial], max_rank: usize) -> Vec<SymShape> {
+            let mut out = vec![SymShape::default()];
+            let mut frontier = out.clone();
+            for _ in 0..max_rank {
+                let mut next = Vec::new();
+                for sh in &frontier {
+                    for d in pool {
+                        next.push(sh.dims().iter().cloned().chain([d.clone()]).collect());
+                    }
+                }
+                out.extend(next.iter().cloned());
+                frontier = next;
+            }
+            out
+        }
+        let targets = shapes(&target_pool, 3);
+
+        let mut sources = Vec::new();
+        for sh in shapes(&source_pool, 3) {
+            let base = SymLayout::contiguous_row_major(sh, BF16, &e.dims).unwrap();
+            let mut views = vec![base.clone()];
+            for a in 0..base.rank() {
+                for c in a + 1..base.rank() {
+                    views.push(base.transposed(a, c));
+                }
+            }
+            for view in views.clone() {
+                for d in 0..view.rank() {
+                    match view.shape[d].as_fixed() {
+                        Some(4) => views.push(view.sliced(d, 1, 2, BF16, &e.dims).unwrap()),
+                        Some(2) => views.push(view.sliced(d, 1, 1, BF16, &e.dims).unwrap()),
+                        _ => {}
+                    }
+                }
+            }
+            sources.extend(views);
+        }
+
+        let assignments: Vec<DimValues> = [1, 2, 3]
+            .into_iter()
+            .flat_map(|bv| [8, 16].map(|sv| values(&[(e.b, bv), (e.s, sv)])))
+            .collect();
+
+        let (mut proven, mut unproven_but_valid) = (0, 0);
+        for view in &sources {
+            let numel = view.shape.numel();
+            for target in targets.iter().filter(|t| t.numel() == numel) {
+                let symbolic = view.try_reshaped(target);
+                let mut concrete_always_ok = true;
+                for v in &assignments {
+                    let (sh, st, _) = view.eval(v).unwrap();
+                    let concrete = VirtTensorView::with_strides(sh, st, BF16);
+                    let target_c = target.eval(v).unwrap();
+                    let result = concrete.try_reshaped(target_c);
+                    let ctx = || format!("{view:?} -> {target:?} with {v:?}");
+                    match (&symbolic, &result) {
+                        (Some(sym), Some(c)) => {
+                            let (sym_shape, sym_strides, sym_offset) = sym.eval(v).unwrap();
+                            assert_eq!(sym_shape, c.shape(), "{}", ctx());
+                            assert_eq!(sym.offset, view.offset, "{}", ctx());
+                            assert_eq!(sym_offset, view.offset.eval(v).unwrap());
+                            // Strides of size-1 dims are irrelevant and may differ.
+                            for d in 0..sym_shape.num_dims() {
+                                if sym_shape[d] != 1 {
+                                    assert_eq!(sym_strides[d], c.strides()[d], "{}", ctx());
+                                }
+                            }
+                        }
+                        (Some(_), None) => panic!("unsound symbolic reshape: {}", ctx()),
+                        (None, _) => concrete_always_ok &= result.is_some(),
+                    }
+                }
+                match symbolic {
+                    Some(_) => proven += 1,
+                    None if concrete_always_ok => unproven_but_valid += 1,
+                    None => {}
+                }
+            }
+        }
+        assert!(proven > 1000, "{proven}");
+        assert_eq!(unproven_but_valid, 0);
     }
 }
