@@ -1,4 +1,7 @@
-use crate::{context::Context, tensor::Tensor};
+use crate::{
+    context::Context,
+    tensor::{Tensor, TensorView, TensorViewMut, VirtTensorView},
+};
 use anyhow::ensure;
 use skycuda::{device_memory_pool::DeviceMemoryPool, stream::Stream};
 use skytens_core::{
@@ -54,50 +57,41 @@ impl MxTensor {
         pool: &DeviceMemoryPool,
     ) -> anyhow::Result<Self> {
         let shape = shape.into();
+        let layout = MxLayout::new(shape, format, dim)?;
 
-        ensure!(shape.num_dims() == 2);
+        let values_storage =
+            unsafe { pool.alloc_uninit_on(layout.values.required_bytes(), stream)? };
+        let scale_factors_storage =
+            unsafe { pool.alloc_uninit_on(layout.scale_factors.required_bytes(), stream)? };
 
-        let mut strides = Strides::new([1, 1]);
-        strides[dim.non_block_dimension_2d()] =
-            shape[dim.block_dimension_2d()].next_multiple_of(format.block_size());
+        Ok(Self {
+            values: Tensor::from_parts(layout.values, values_storage, cx),
+            scale_factors: Tensor::from_parts(layout.scale_factors, scale_factors_storage, cx),
+            format,
+            shape,
+            strides: layout.strides,
+            dim,
+        })
+    }
 
-        let mut values = unsafe {
-            Tensor::new_uninit_with_pool(
-                if dim == MxDim::Colwise {
-                    shape.swap(0, 1)
-                } else {
-                    shape
-                },
-                format.values_type(),
-                stream,
-                cx,
-                pool,
-            )?
-        };
-        if dim == MxDim::Colwise {
-            values = values.into_transposed(0, 1);
-        }
-
-        let sf_rows = shape[dim.non_block_dimension_2d()].next_multiple_of(128);
-        let sf_cols = shape[dim.block_dimension_2d()]
-            .div_ceil(format.block_size())
-            .next_multiple_of(4);
-        let scale_factors = unsafe {
-            Tensor::new_uninit_with_pool(
-                [sf_rows, sf_cols],
-                format.scale_factors_type(),
-                stream,
-                cx,
-                pool,
-            )?
-        };
-
+    /// Wraps existing values and scale factors, which must have the layouts given
+    /// by [`MxLayout::new`].
+    pub fn from_parts(
+        values: Tensor,
+        scale_factors: Tensor,
+        format: MxFormat,
+        dim: MxDim,
+        shape: impl Into<Shape>,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let layout = MxLayout::new(shape, format, dim)?;
+        layout.validate(values.virt(), scale_factors.virt())?;
         Ok(Self {
             values,
             scale_factors,
             format,
             shape,
-            strides,
+            strides: layout.strides,
             dim,
         })
     }
@@ -150,9 +144,7 @@ impl MxTensor {
     /// Whether the scale factor tensor contains padding beyond the logical blocks,
     /// due to the 128x4 tile layout.
     pub fn has_scale_factor_padding(&self) -> bool {
-        let rows = self.shape[self.dim.non_block_dimension_2d()];
-        let blocks = self.shape[self.dim.block_dimension_2d()].div_ceil(self.format.block_size());
-        !rows.is_multiple_of(128) || !blocks.is_multiple_of(4)
+        has_scale_factor_padding(self.shape, self.format, self.dim)
     }
 
     pub fn format(&self) -> MxFormat {
@@ -170,6 +162,242 @@ impl MxTensor {
     pub fn strides(&self) -> Strides {
         self.strides
     }
+
+    pub fn view(&self) -> MxTensorView<'_> {
+        MxTensorView {
+            values: self.values.view(),
+            scale_factors: self.scale_factors.view(),
+            format: self.format,
+            shape: self.shape,
+            strides: self.strides,
+            dim: self.dim,
+        }
+    }
+
+    pub fn view_mut(&mut self) -> MxTensorViewMut<'_> {
+        MxTensorViewMut {
+            values: self.values.view_mut(),
+            scale_factors: self.scale_factors.view_mut(),
+            format: self.format,
+            shape: self.shape,
+            strides: self.strides,
+            dim: self.dim,
+        }
+    }
+}
+
+/// Borrowed counterpart of [`MxTensor`].
+#[derive(Debug, Clone)]
+pub struct MxTensorView<'a> {
+    values: TensorView<'a>,
+    scale_factors: TensorView<'a>,
+    format: MxFormat,
+    shape: Shape,
+    strides: Strides,
+    dim: MxDim,
+}
+
+impl<'a> MxTensorView<'a> {
+    /// `values` and `scale_factors` must have the layouts given by [`MxLayout::new`].
+    pub fn from_parts(
+        values: TensorView<'a>,
+        scale_factors: TensorView<'a>,
+        format: MxFormat,
+        dim: MxDim,
+        shape: impl Into<Shape>,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let layout = MxLayout::new(shape, format, dim)?;
+        layout.validate(values.virt(), scale_factors.virt())?;
+        Ok(Self {
+            values,
+            scale_factors,
+            format,
+            shape,
+            strides: layout.strides,
+            dim,
+        })
+    }
+
+    pub fn values(&self) -> &TensorView<'a> {
+        &self.values
+    }
+
+    pub fn scale_factors(&self) -> &TensorView<'a> {
+        &self.scale_factors
+    }
+
+    pub fn has_scale_factor_padding(&self) -> bool {
+        has_scale_factor_padding(self.shape, self.format, self.dim)
+    }
+
+    pub fn format(&self) -> MxFormat {
+        self.format
+    }
+
+    pub fn mx_dim(&self) -> MxDim {
+        self.dim
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    pub fn strides(&self) -> Strides {
+        self.strides
+    }
+}
+
+/// Mutably borrowed counterpart of [`MxTensor`].
+#[derive(Debug)]
+pub struct MxTensorViewMut<'a> {
+    values: TensorViewMut<'a>,
+    scale_factors: TensorViewMut<'a>,
+    format: MxFormat,
+    shape: Shape,
+    strides: Strides,
+    dim: MxDim,
+}
+
+impl<'a> MxTensorViewMut<'a> {
+    /// `values` and `scale_factors` must have the layouts given by [`MxLayout::new`].
+    pub fn from_parts(
+        values: TensorViewMut<'a>,
+        scale_factors: TensorViewMut<'a>,
+        format: MxFormat,
+        dim: MxDim,
+        shape: impl Into<Shape>,
+    ) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        let layout = MxLayout::new(shape, format, dim)?;
+        layout.validate(values.virt(), scale_factors.virt())?;
+        Ok(Self {
+            values,
+            scale_factors,
+            format,
+            shape,
+            strides: layout.strides,
+            dim,
+        })
+    }
+
+    pub fn view(&self) -> MxTensorView<'_> {
+        MxTensorView {
+            values: self.values.view(),
+            scale_factors: self.scale_factors.view(),
+            format: self.format,
+            shape: self.shape,
+            strides: self.strides,
+            dim: self.dim,
+        }
+    }
+
+    pub fn values(&self) -> &TensorViewMut<'a> {
+        &self.values
+    }
+
+    pub fn scale_factors(&self) -> &TensorViewMut<'a> {
+        &self.scale_factors
+    }
+
+    pub fn scale_factors_mut(&mut self) -> &mut TensorViewMut<'a> {
+        &mut self.scale_factors
+    }
+
+    pub fn values_and_scale_factors_mut(
+        &mut self,
+    ) -> (&mut TensorViewMut<'a>, &mut TensorViewMut<'a>) {
+        (&mut self.values, &mut self.scale_factors)
+    }
+
+    pub fn has_scale_factor_padding(&self) -> bool {
+        has_scale_factor_padding(self.shape, self.format, self.dim)
+    }
+
+    pub fn format(&self) -> MxFormat {
+        self.format
+    }
+
+    pub fn mx_dim(&self) -> MxDim {
+        self.dim
+    }
+
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    pub fn strides(&self) -> Strides {
+        self.strides
+    }
+}
+
+/// Storage layouts of the values and scale factors of a block-scaled tensor.
+#[derive(Debug, Clone)]
+pub struct MxLayout {
+    /// Values, in the logical `[rows, cols]` shape. Colwise values are stored transposed.
+    pub values: VirtTensorView,
+    /// Scale factors, of shape `[next_multiple_of(rows, 128), next_multiple_of(blocks, 4)]`
+    /// in the block-scaled orientation.
+    pub scale_factors: VirtTensorView,
+    /// Logical strides recorded by [`MxTensor::strides`].
+    pub strides: Strides,
+}
+
+impl MxLayout {
+    pub fn new(shape: impl Into<Shape>, format: MxFormat, dim: MxDim) -> anyhow::Result<Self> {
+        let shape = shape.into();
+        ensure!(
+            shape.num_dims() == 2,
+            "block-scaled tensors must be 2D, got shape {shape:?}"
+        );
+
+        let mut strides = Strides::new([1, 1]);
+        strides[dim.non_block_dimension_2d()] =
+            shape[dim.block_dimension_2d()].next_multiple_of(format.block_size());
+
+        let values = match dim {
+            MxDim::Rowwise => VirtTensorView::new(shape, format.values_type()),
+            MxDim::Colwise => {
+                VirtTensorView::new(shape.swap(0, 1), format.values_type()).transposed(0, 1)
+            }
+        };
+
+        let sf_rows = shape[dim.non_block_dimension_2d()].next_multiple_of(128);
+        let sf_cols = shape[dim.block_dimension_2d()]
+            .div_ceil(format.block_size())
+            .next_multiple_of(4);
+        let scale_factors = VirtTensorView::new([sf_rows, sf_cols], format.scale_factors_type());
+
+        Ok(Self {
+            values,
+            scale_factors,
+            strides,
+        })
+    }
+
+    fn validate(
+        &self,
+        values: &VirtTensorView,
+        scale_factors: &VirtTensorView,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            values.same_layout_as(&self.values),
+            "block-scaled values have layout {values:?}, expected {:?}",
+            self.values
+        );
+        ensure!(
+            scale_factors.same_layout_as(&self.scale_factors),
+            "block scale factors have layout {scale_factors:?}, expected {:?}",
+            self.scale_factors
+        );
+        Ok(())
+    }
+}
+
+fn has_scale_factor_padding(shape: Shape, format: MxFormat, dim: MxDim) -> bool {
+    let rows = shape[dim.non_block_dimension_2d()];
+    let blocks = shape[dim.block_dimension_2d()].div_ceil(format.block_size());
+    !rows.is_multiple_of(128) || !blocks.is_multiple_of(4)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

@@ -1,4 +1,4 @@
-use crate::disk_cache::DiskCache;
+use crate::{disk_cache::DiskCache, execgraph::jit::JitKernelCache};
 use bytemuck::Pod;
 use kernel_generator::Arch;
 use parking_lot::ReentrantMutex;
@@ -28,7 +28,6 @@ impl Context {
         device_index: u32,
         device_memory_options: DeviceMemoryPoolOptions,
         host_pinned_memory_options: HostPinnedMemoryPoolOptions,
-        enable_autotuning: bool,
     ) -> anyhow::Result<Self> {
         let cuda = Device::from_index(device_index)?;
 
@@ -49,7 +48,8 @@ impl Context {
             device_memory_pool,
             host_pinned_memory_pool,
             disk_cache: DiskCache::new()?,
-            enable_autotuning,
+            gpu_lock: parking_lot::Mutex::new(()),
+            jit_kernels: Default::default(),
             cublaslt,
         })))
     }
@@ -149,8 +149,14 @@ impl Context {
         &self.0.disk_cache
     }
 
-    pub fn is_autotuning_enabled(&self) -> bool {
-        self.0.enable_autotuning
+    /// Held while measuring GPU work that requires exclusive access to the device,
+    /// such as autotuning.
+    pub fn gpu_lock(&self) -> &parking_lot::Mutex<()> {
+        &self.0.gpu_lock
+    }
+
+    pub(crate) fn jit_kernels(&self) -> &JitKernelCache {
+        &self.0.jit_kernels
     }
 
     pub fn cublaslt(&self) -> &CublasLtHandle {
@@ -192,7 +198,8 @@ struct Inner {
     // stream_cudnn_contexts: PerStreamResource<CudnnHandle>,
     resource_cache: ReentrantMutex<RefCell<HashMap<ResourceKeyEncoded, Resource>>>,
     disk_cache: DiskCache,
-    enable_autotuning: bool,
+    gpu_lock: parking_lot::Mutex<()>,
+    jit_kernels: JitKernelCache,
     cublaslt: CublasLtHandle,
 }
 

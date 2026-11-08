@@ -34,57 +34,80 @@ impl DiskCache {
         })
     }
 
+    /// Returns the cached value for `key`, or runs `create` and caches its result.
+    ///
+    /// `create` runs without holding any locks, so concurrent callers may create
+    /// the same key; the last write wins.
     pub fn get_or_create<K: DiskCacheKey, V: Serialize + DeserializeOwned>(
         &self,
         key: &K,
         create: impl FnOnce() -> anyhow::Result<V>,
     ) -> anyhow::Result<V> {
-        let key_json = serde_json::to_string(key as &dyn DiskCacheKey)?;
+        if let Some(value) = self.get(key)? {
+            return Ok(value);
+        }
+        let value = create()?;
+        self.insert(key, &value)?;
+        Ok(value)
+    }
 
-        // Try to get from the in-memory cache.
-        {
-            let in_memory_cache = self.in_memory_cache.read();
-            if let Some(val) = in_memory_cache.get(&key_json) {
-                return serde_json::from_str(val).map_err(From::from);
-            }
+    pub fn get<K: DiskCacheKey, V: DeserializeOwned>(&self, key: &K) -> anyhow::Result<Option<V>> {
+        let key_json = encode_key(key)?;
+
+        if let Some(val) = self.in_memory_cache.read().get(&key_json) {
+            return Ok(Some(serde_json::from_str(val)?));
         }
 
-        // Otherwise re-read the file and check for updates on disk.
-        // (This is racy but not a correctness issue.)
-        let mut file_guard = self.cache_file.lock();
+        // Re-read the file to pick up entries written by other processes.
+        let on_disk_cache = self.with_locked_file(read_cache_file)?;
+        let cached = on_disk_cache.get(&key_json).cloned();
+        *self.in_memory_cache.write() = on_disk_cache;
+        cached
+            .map(|val| serde_json::from_str(&val))
+            .transpose()
+            .map_err(From::from)
+    }
 
-        file_guard.lock()?;
-        let res = (|| {
-            file_guard.seek(SeekFrom::Start(0))?;
-            let mut file_contents = String::new();
-            file_guard.read_to_string(&mut file_contents)?;
+    pub fn insert<K: DiskCacheKey, V: Serialize>(&self, key: &K, value: &V) -> anyhow::Result<()> {
+        let key_json = encode_key(key)?;
+        let value_json = serde_json::to_string(value)?;
 
-            let mut on_disk_cache: FastHashMap<String, String> =
-                serde_json::from_str(&file_contents).unwrap_or_default();
-            if let Some(val) = on_disk_cache.get(&key_json) {
-                return serde_json::from_str(val).map_err(From::from);
-            }
+        let on_disk_cache = self.with_locked_file(|file| {
+            let mut on_disk_cache = read_cache_file(file)?;
+            on_disk_cache.insert(key_json, value_json);
 
-            // Not in disk cache either. Create.
-            let value = create()?;
-            on_disk_cache.insert(key_json, serde_json::to_string(&value)?);
-
-            file_guard.seek(SeekFrom::Start(0))?;
-            file_guard.set_len(0)?;
-            let mut buf_writer = BufWriter::new(&mut *file_guard);
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            let mut buf_writer = BufWriter::new(&mut *file);
             serde_json::to_writer_pretty(&mut buf_writer, &on_disk_cache)?;
             buf_writer.flush()?;
-            drop(buf_writer);
+            Ok(on_disk_cache)
+        })?;
+        *self.in_memory_cache.write() = on_disk_cache;
+        Ok(())
+    }
 
-            file_guard.unlock()?;
-
-            *self.in_memory_cache.write() = on_disk_cache;
-
-            Ok(value)
-        })();
-        file_guard.unlock().ok();
+    fn with_locked_file<R>(
+        &self,
+        f: impl FnOnce(&mut File) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let mut file_guard = self.cache_file.lock();
+        file_guard.lock()?;
+        let res = f(&mut file_guard);
+        file_guard.unlock()?;
         res
     }
+}
+
+fn encode_key<K: DiskCacheKey>(key: &K) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(key as &dyn DiskCacheKey)?)
+}
+
+fn read_cache_file(file: &mut File) -> anyhow::Result<FastHashMap<String, String>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut file_contents = String::new();
+    file.read_to_string(&mut file_contents)?;
+    Ok(serde_json::from_str(&file_contents).unwrap_or_default())
 }
 
 impl Drop for DiskCache {

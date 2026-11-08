@@ -27,7 +27,6 @@ pub fn test_context() -> Context {
         HostPinnedMemoryPoolOptions {
             max_reserved_free_bytes: 1 << 30,
         },
-        false,
     )
     .expect("failed to create CUDA context")
 }
