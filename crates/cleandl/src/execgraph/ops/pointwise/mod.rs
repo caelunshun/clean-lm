@@ -133,6 +133,19 @@ impl Pointwise {
             tile.len(),
             lowering.facts.rank
         );
+        let min_tile = lowering.facts.min_tile();
+        ensure!(
+            tile.iter()
+                .zip(&min_tile)
+                .all(|(&t, &min)| t.is_power_of_two() && t >= min),
+            "tile {tile:?} must consist of powers of two of at least {min_tile:?}"
+        );
+        ensure!(
+            tile.iter()
+                .try_fold(1u32, |a, &t| a.checked_mul(t))
+                .is_some_and(|n| n <= 1 << 16),
+            "tile {tile:?} has more than 65536 elements"
+        );
         Ok(Box::new(self.prepare(cx, &lowering, tile)?))
     }
 
@@ -264,7 +277,8 @@ impl GraphBuilder {
     ///
     /// Operands are broadcast NumPy-style (right-aligned; each axis must have
     /// provably equal sizes or size one). Values are computed in `f32`, `i32` or
-    /// `bool`; float inputs are loaded as `f32` and integer inputs as `i32`.
+    /// `bool`; float inputs are loaded as `f32` and integer inputs as `i32`. Integer
+    /// division by zero yields the dividend (`x / 0 == x`, `x % 0 == 0`).
     pub fn pointwise(
         &self,
         f: impl FnOnce(&PwBuilder<'_>) -> anyhow::Result<()>,
@@ -497,7 +511,10 @@ impl PwBuilder<'_> {
     }
 
     /// An `f32` output reducing `value` over the given iteration axes, which are
-    /// dropped from its shape (a full reduction has shape `[1]`).
+    /// dropped from its shape (a full reduction has shape `[1]`). A NaN among the
+    /// reduced values makes the result NaN for every op. Sums are accumulated with
+    /// atomics, so their rounding is nondeterministic, and subnormal partial sums of
+    /// a tile may be flushed to zero.
     pub fn output_reduce(
         &self,
         value: PwValue<'_>,

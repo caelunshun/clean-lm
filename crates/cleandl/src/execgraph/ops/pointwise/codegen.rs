@@ -414,10 +414,10 @@ fn check_view(
     dims: &DimValues,
 ) -> anyhow::Result<()> {
     let (shape, strides, _) = layout.eval(dims)?;
-    let strides_match =
-        (0..shape.num_dims()).all(|i| shape[i] == 1 || virt.strides()[i] == strides[i]);
+    let strides_match = virt.shape() == shape
+        && (0..shape.num_dims()).all(|i| shape[i] == 1 || virt.strides()[i] == strides[i]);
     ensure!(
-        virt.shape() == shape && strides_match,
+        strides_match,
         "pointwise {what}: expected shape {shape:?} with strides {strides:?}, got shape {:?} with strides {:?}",
         virt.shape(),
         virt.strides()
@@ -561,8 +561,10 @@ fn binary(op: BinaryOp, a: Val, b: Val) -> Val {
             Add => Val::I(a + b),
             Sub => Val::I(a - b),
             Mul => Val::I(a * b),
-            Div => Val::I(a / b),
-            Rem => Val::I(a % b),
+            // A zero divisor (also in zero-padded lanes) is replaced by one, so
+            // `x / 0 == x` and `x % 0 == 0`.
+            Div => Val::I(a / select(b.eq(0i32), 1i32, b)),
+            Rem => Val::I(a % select(b.eq(0i32), 1i32, b)),
             Min => Val::I(a.minimum(b)),
             Max => Val::I(a.maximum(b)),
             Lt => Val::B(a.lt(b)),
@@ -737,7 +739,13 @@ fn body(args: &Args, params: &Params, key: &KernelKey<'_>) {
                     (Reduce::Max | Reduce::Min, ReducePtr::I32(p)) => {
                         // For non-negative floats, the order of the bits as signed integers
                         // matches; for negative floats it is reversed as unsigned integers.
-                        let bits = r.bitcast::<i32>();
+                        // NaN propagates: as the largest key for max (positive, all ones)
+                        // and for min (negative, all ones).
+                        let nan_bits = match op {
+                            Reduce::Max => 0x7FFF_FFFFi32,
+                            _ => -1i32,
+                        };
+                        let bits = select(r.ne(r), nan_bits, r.bitcast::<i32>());
                         let negative = bits.lt(0i32);
                         let (pos_mode, neg_mode) = match op {
                             Reduce::Max => (AtomicRmwMode::Max, AtomicRmwMode::UMin),

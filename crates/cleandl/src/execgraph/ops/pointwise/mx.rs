@@ -1,5 +1,14 @@
-//! Block-scaled quantization on tiles, matching the NVVM implementation in
-//! `cleandl-specialized-kernels` (`utils/block_scale.rs`), computed in `f32`.
+//! Block-scaled quantization on tiles. Follows the NVVM implementation in
+//! `cleandl-specialized-kernels` (`utils/block_scale.rs`), but computes exactly in
+//! `f32` instead of with approximate `bf16` arithmetic:
+//!
+//! - MXFP8: per block, `x = amax / 448` (f32 division); the scale is the smallest
+//!   power of two `2^e >= x` with `e` clamped to `[-127, 127]` (UE8M0, saturating;
+//!   a NaN amax gives the NaN encoding). Values are `e4m3(clamp(v * 2^-e, ±448))`,
+//!   rounding to nearest even.
+//! - NVFP4 (no global scale): the scale is `e4m3(min(amax / 6, 448))`, rounding to
+//!   nearest even. Values are `e2m1(clamp(v * (1 / scale), ±6))` with the reciprocal
+//!   computed in f32, or zero if the scale is zero.
 
 use tileir_builder::{F8E4M3, RoundingMode, Tile, select};
 
@@ -24,12 +33,13 @@ pub fn mxfp8_scale(amax: Tile<f32>) -> (Tile<u8>, Tile<f32>) {
     let encoded = select(exp.eq(0), subnormal, normal).minimum(254);
     let encoded = select(exp.eq(255) & mantissa.ne(0), 255i32, encoded);
 
-    // The descale is 2^(127 - (encoded - 127)) = 2^(254 - encoded - 127).
+    // The descale 2^-(encoded - 127) has the biased f32 exponent 254 - encoded;
+    // encoding 254 gives the subnormal 2^-127.
     let descale_exp = Tile::<i32>::scalar(254) - encoded;
     let descale_bits = select(
         descale_exp.ge(1),
         descale_exp << 23,
-        select(descale_exp.eq(0), 0x0020_0000i32, 0x7FC0_0000i32),
+        select(descale_exp.eq(0), 0x0040_0000i32, 0x7FC0_0000i32),
     );
     let scale = encoded.astype::<u8>(RoundingMode::Zero);
     (scale, descale_bits.bitcast::<f32>())

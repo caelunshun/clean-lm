@@ -13,9 +13,8 @@ use cleandl::{
     tensor::{Tensor, TensorView, VirtTensorView},
 };
 use common::{
-    abs_rel_tolerance, assert_all_close, decode_e2m1, decode_ue8m0, dequantize_mx, download,
-    download_bytes, mx_scale_factor_index, random_bf16_tensor, random_tensor, seeded_rng,
-    test_context,
+    abs_rel_tolerance, assert_all_close, decode_e2m1, dequantize_mx, download, download_bytes,
+    mx_scale_factor_index, random_bf16_tensor, random_tensor, seeded_rng, test_context,
 };
 use float8::F8E4M3;
 use half::bf16;
@@ -632,25 +631,21 @@ fn quantize_ref(
         let amax = block.iter().map(|&i| x[i].abs()).fold(0.0f32, f32::max);
         let (scale, descale) = match format {
             MxFormat::Mxfp8 => {
-                let bits = (amax / 448.0).to_bits() as i32;
-                let (exp, mantissa) = ((bits >> 23) & 0xFF, bits & 0x7F_FFFF);
-                let mut encoded = if exp == 0 {
-                    i32::from(mantissa > 0x40_0000)
+                // The smallest power of two 2^e >= amax / 448, e in [-127, 127].
+                let x = f64::from(amax / 448.0);
+                let mut e = if x == 0.0 {
+                    -127
                 } else {
-                    (exp + i32::from(mantissa != 0)).min(254)
+                    x.log2().ceil() as i32
                 };
-                if exp == 255 && mantissa != 0 {
-                    encoded = 255;
+                while 2f64.powi(e) < x {
+                    e += 1;
                 }
-                let descale_exp = 254 - encoded;
-                let descale = if descale_exp >= 1 {
-                    f32::from_bits((descale_exp as u32) << 23)
-                } else if descale_exp == 0 {
-                    f32::from_bits(0x0020_0000)
-                } else {
-                    f32::NAN
-                };
-                (decode_ue8m0(encoded as u8), descale)
+                while e > -127 && 2f64.powi(e - 1) >= x {
+                    e -= 1;
+                }
+                let e = e.clamp(-127, 127);
+                (2f64.powi(e) as f32, 2f64.powi(-e) as f32)
             }
             MxFormat::Nvfp4 => {
                 let scale = F8E4M3::from_f32((amax / 6.0).min(448.0)).to_f32();
@@ -740,7 +735,14 @@ fn mx_test_data(
     let mut rng = seeded_rng(seed);
     let (_, mut host) = random_tensor(Normal::new(0.0f32, 1.0)?, [rows, cols], &mut rng, cx)?;
     for r in 0..rows {
-        let scale = 2.0f32.powi((r % 41) as i32 - 20);
+        // Mostly moderate magnitudes, plus rows of subnormals and of huge values.
+        let exp = match r % 23 {
+            5 => -140,
+            11 => -128,
+            17 => 120,
+            _ => (r % 41) as i32 - 20,
+        };
+        let scale = 2.0f64.powi(exp) as f32;
         for c in 0..cols {
             host[r * cols + c] *= scale;
             if (r / 7 + c / 40) % 11 == 0 {
@@ -951,7 +953,9 @@ fn integer_inputs_and_more_output_types() -> anyhow::Result<()> {
         p.output(i * 2 + u / 2 - i % 7, ElementType::SInt(SIntType::S32))?;
         p.output(x.to_i32(), ElementType::SInt(SIntType::S32))?;
         p.output(x * i * 0.01, ElementType::Float(FloatType::F16))?;
-        p.output(x * 1000.0, ElementType::Float(FloatType::F8E5M2))
+        p.output(x * 1000.0, ElementType::Float(FloatType::F8E5M2))?;
+        let d = u % 3;
+        p.output(i / d + i % d, ElementType::SInt(SIntType::S32))
     })?;
     let out = case
         .finish(&cx)?
@@ -987,6 +991,12 @@ fn integer_inputs_and_more_output_types() -> anyhow::Result<()> {
         .map(|x| float8::F8E5M2::from_f32((x * 1000.0).clamp(-57344.0, 57344.0)).to_f32())
         .collect();
     assert_all_close("e5m2", &e5m2, &expected, |_, _| 0.0);
+    let divided = download::<i32>(plain(4), &cx)?;
+    for k in 0..n {
+        let d = (uh[k] % 3) as i32;
+        let expected = if d == 0 { ih[k] } else { ih[k] / d + ih[k] % d };
+        assert_eq!(divided[k], expected, "divided[{k}]");
+    }
     Ok(())
 }
 
@@ -1166,5 +1176,256 @@ fn rejects_mismatched_views() -> anyhow::Result<()> {
     };
     let err = executor.execute(&mut io, stream, &cx).unwrap_err();
     assert!(format!("{err:#}").contains("expected shape"), "{err:#}");
+    Ok(())
+}
+
+/// Colwise blocks run along a lowered axis whose last tile is partial.
+#[test]
+fn colwise_mx_partial_block_axis_tiles() -> anyhow::Result<()> {
+    let cx = test_context();
+    let (rows, cols) = (96, 100);
+    let (x, xh) = mx_test_data(rows, cols, 16, &cx)?;
+    let case = Case::new();
+    let xs = case.gb.input("x", F32, [rows, cols])?;
+    case.pointwise(|p| p.output_mx(p.input(xs)?, MxFormat::Mxfp8, MxDim::Colwise))?;
+    let built = case.finish(&cx)?;
+    for tile in [[64u32, 32], [64, 128], [128, 8]] {
+        let out = built.run_direct(&cx, &[x.view()], Some(&tile))?;
+        check_mx(
+            &format!("{tile:?}"),
+            &out[0],
+            &xh,
+            rows,
+            cols,
+            MxFormat::Mxfp8,
+            MxDim::Colwise,
+            &cx,
+        )?;
+    }
+    Ok(())
+}
+
+const SENTINEL_BYTE: u8 = 0xAB;
+
+fn sentinel_tensor(len: usize, ty: ElementType, cx: &Context) -> anyhow::Result<Tensor> {
+    let bytes = vec![SENTINEL_BYTE; len * ty.bits_per_element() / 8];
+    Tensor::from_bytes(&bytes, ty, [len], cx.default_compute_stream(), cx)
+}
+
+/// Partial-tile stores of reduction, f8 and block-scaled outputs stay inside their views.
+#[test]
+fn partial_tiles_are_masked_for_all_output_kinds() -> anyhow::Result<()> {
+    let cx = test_context();
+    let stream = cx.default_compute_stream();
+    let (rows, cols) = (96, 100);
+    let extra = 4096;
+    let (_, xh) = mx_test_data(rows, cols, 17, &cx)?;
+    // Transposed so the axes don't collapse.
+    let xt = Tensor::from_slice(
+        &(0..rows * cols)
+            .map(|i| xh[(i % rows) * cols + i / rows])
+            .collect::<Vec<_>>(),
+        [cols, rows],
+        stream,
+        &cx,
+    )?;
+
+    let case = Case::new();
+    let xs = case.gb.input("x", F32, [cols, rows])?.transposed(0, 1)?;
+    case.pointwise(|p| {
+        let x = p.input(xs)?;
+        p.output_reduce(x, Reduce::Sum, &[1])?;
+        p.output(x * 100.0, E4M3)?;
+        p.output_mx(x, MxFormat::Mxfp8, MxDim::Colwise)
+    })?;
+    let built = case.finish(&cx)?;
+    let reference = built.run(&cx, &[xt.view()])?;
+    let dims = built.bind_dims(&[xt.view()])?;
+    let sf_layout =
+        cleandl::mx_tensor::MxLayout::new([rows, cols], MxFormat::Mxfp8, MxDim::Colwise)?;
+    let sf_shape = sf_layout.scale_factors.shape();
+    let sf_len = sf_shape[0] * sf_shape[1];
+    // Sums of mixed-sign values accumulate in nondeterministic order.
+    let abs_sums: Vec<f32> = (0..rows)
+        .map(|r| xh[r * cols..(r + 1) * cols].iter().map(|v| v.abs()).sum())
+        .collect();
+
+    for tile in [[64u32, 32], [32, 64], [128, 128]] {
+        let executor = built
+            .op
+            .build_executor(&cx, built.graph().info(), Some(&tile))?;
+        let mut sums_host = vec![f32::from_bits(0xABAB_ABAB); rows + extra];
+        sums_host[..rows].fill(0.0);
+        let mut sums = Tensor::from_slice(&sums_host, [rows + extra], stream, &cx)?;
+        let mut fp8 = sentinel_tensor(rows * cols + extra, E4M3, &cx)?;
+        let mut values = sentinel_tensor(rows * cols + extra, E4M3, &cx)?;
+        let mut scales =
+            sentinel_tensor(sf_len + extra, ElementType::Float(FloatType::UF8E8M0), &cx)?;
+        {
+            let mut sums_prefix = sums.sliced_mut(0, ..rows);
+            let mut fp8_prefix = fp8.sliced_mut(0, ..rows * cols);
+            let mut values_prefix = values.sliced_mut(0, ..rows * cols);
+            let mut values_t = values_prefix.reshaped_mut([cols, rows]);
+            let mut scales_prefix = scales.sliced_mut(0, ..sf_len);
+            let mx = cleandl::mx_tensor::MxTensorViewMut::from_parts(
+                values_t.transposed_mut(0, 1),
+                scales_prefix.reshaped_mut([sf_shape[0], sf_shape[1]]),
+                MxFormat::Mxfp8,
+                MxDim::Colwise,
+                [rows, cols],
+            )?;
+            let operand = built.operand_view(built.op.inputs()[0], &[xt.view()], &dims)?;
+            let mut io = OpIo {
+                inputs: vec![Bound::Ro(TensorRef::Plain(operand))],
+                outputs: vec![
+                    TensorRefMut::Plain(sums_prefix.view_mut()),
+                    TensorRefMut::Plain(fp8_prefix.reshaped_mut([rows, cols])),
+                    TensorRefMut::Mx(mx),
+                ],
+                scratch: None,
+                dims: &dims,
+            };
+            executor.execute(&mut io, stream, &cx)?;
+        }
+
+        let got = download::<f32>(&sums, &cx)?;
+        assert_all_close(
+            &format!("{tile:?} sums"),
+            &got[..rows],
+            &download_f32(&reference[0], &cx)?,
+            // Atomic float adds flush subnormal partial sums to zero.
+            |r, _| 1e-5 * abs_sums[r] + 1e-36,
+        );
+        assert!(
+            got[rows..].iter().all(|v| v.to_bits() == 0xABAB_ABAB),
+            "{tile:?}: sums tail written"
+        );
+
+        let got = download_bytes(&fp8, &cx)?;
+        assert_eq!(
+            &got[..rows * cols],
+            &download_bytes(reference[1].as_plain(), &cx)?[..],
+            "{tile:?} fp8"
+        );
+        assert!(
+            got[rows * cols..].iter().all(|&b| b == SENTINEL_BYTE),
+            "{tile:?}: fp8 tail written"
+        );
+
+        let GraphOutput::Mx(expected) = &reference[2] else {
+            unreachable!()
+        };
+        let got = download_bytes(&values, &cx)?;
+        assert_eq!(
+            &got[..rows * cols],
+            &download_bytes(expected.values(), &cx)?[..],
+            "{tile:?} values"
+        );
+        assert!(
+            got[rows * cols..].iter().all(|&b| b == SENTINEL_BYTE),
+            "{tile:?}: values tail written"
+        );
+
+        let got = download_bytes(&scales, &cx)?;
+        let expected_sf = download_bytes(expected.scale_factors(), &cx)?;
+        let blocks = rows / 32;
+        let mut valid = vec![false; sf_len + extra];
+        for c in 0..cols {
+            for b in 0..blocks {
+                valid[mx_scale_factor_index(c, b, blocks)] = true;
+            }
+        }
+        for (i, &byte) in got.iter().enumerate() {
+            if valid[i] {
+                assert_eq!(byte, expected_sf[i], "{tile:?}: scale factor {i}");
+            } else {
+                assert_eq!(
+                    byte, SENTINEL_BYTE,
+                    "{tile:?}: padding or tail scale factor {i} written"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Max and min combine negative and positive per-tile partial results through the
+/// atomics, and NaNs propagate through every reduction.
+#[test]
+fn reductions_across_tiles_with_mixed_signs_and_nans() -> anyhow::Result<()> {
+    let cx = test_context();
+    let stream = cx.default_compute_stream();
+    let mut rng = seeded_rng(18);
+    let (rows, cols, tile) = (6, 4096, 1024);
+    let (_, mut xh) = random_tensor(Uniform::new(1.0f32, 10.0)?, [rows, cols], &mut rng, &cx)?;
+    for c in 0..cols {
+        let t = c / tile;
+        // Row 0 negative; row 1 alternates sign per tile; row 2 positive.
+        xh[c] = -xh[c];
+        if t % 2 == 0 {
+            xh[cols + c] = -xh[cols + c];
+        }
+        // Row 3 mixed signs, row 4 negative, row 5 has a negative zero tile.
+        if c % 3 == 0 {
+            xh[3 * cols + c] = -xh[3 * cols + c];
+        }
+        xh[4 * cols + c] = -xh[4 * cols + c];
+        if t == 1 {
+            xh[5 * cols + c] = -0.0;
+        }
+    }
+    xh[3 * cols + 2 * tile + 17] = f32::NAN;
+    xh[4 * cols + 5] = f32::NAN;
+    let x = Tensor::from_slice(&xh, [rows, cols], stream, &cx)?;
+
+    let case = Case::new();
+    let xs = case.gb.input("x", F32, [rows, cols])?;
+    case.pointwise(|p| {
+        let x = p.input(xs)?;
+        p.output_reduce(x, Reduce::Sum, &[1])?;
+        p.output_reduce(x, Reduce::Max, &[1])?;
+        p.output_reduce(x, Reduce::Min, &[1])
+    })?;
+    let built = case.finish(&cx)?;
+
+    let ops = [Reduce::Sum, Reduce::Max, Reduce::Min];
+    let expected: Vec<Vec<f32>> = ops
+        .iter()
+        .map(|&op| {
+            reduce_ref(&[rows, cols], &xh, &[1], op)
+                .into_iter()
+                .enumerate()
+                .map(|(r, v)| {
+                    let row = &xh[r * cols..(r + 1) * cols];
+                    if row.iter().any(|v| v.is_nan()) {
+                        f32::NAN
+                    } else {
+                        v
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let runs = [
+        built.run_direct(&cx, &[x.view()], Some(&[1, tile as u32]))?,
+        built.run_direct(&cx, &[x.view()], Some(&[2, 256]))?,
+        built.run(&cx, &[x.view()])?,
+    ];
+    for (run, out) in runs.iter().enumerate() {
+        for (k, op) in ops.iter().enumerate() {
+            let got = download_f32(&out[k], &cx)?;
+            for r in 0..rows {
+                let (g, e) = (got[r], expected[k][r]);
+                let ok = if e.is_nan() {
+                    g.is_nan()
+                } else if *op == Reduce::Sum {
+                    (g - e).abs() <= 1e-2
+                } else {
+                    g == e
+                };
+                assert!(ok, "run {run}: {op:?} of row {r}: got {g}, expected {e}");
+            }
+        }
+    }
     Ok(())
 }

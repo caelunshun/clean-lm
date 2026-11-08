@@ -491,15 +491,22 @@ fn pow2_at_least(n: usize) -> u32 {
 /// Tile shapes to try, the heuristic default first. `hints` are the lowered axis sizes.
 pub fn tile_candidates(hints: &[usize], min_tile: &[u32]) -> Vec<Vec<u32>> {
     let rank = hints.len();
+    // The minimum tiles are reserved first; the remaining budget scales them up,
+    // innermost axis first.
     let make = |total: u32, inner_div: u32| -> Vec<u32> {
-        let mut tile = vec![1u32; rank];
+        let mut tile = min_tile.to_vec();
+        let reserved: u32 = min_tile.iter().product();
+        let mut budget = (total / reserved).max(1);
         let max_inner = if rank == 1 { total } else { 1024 };
-        let inner = (pow2_at_least(hints[rank - 1]).min(max_inner) / inner_div).max(1);
-        tile[rank - 1] = inner.max(min_tile[rank - 1]);
-        let mut budget = (total / tile[rank - 1]).max(1);
-        for a in (0..rank - 1).rev() {
-            tile[a] = pow2_at_least(hints[a]).min(budget).max(min_tile[a]);
-            budget = (budget / tile[a]).max(1);
+        for a in (0..rank).rev() {
+            let wanted = if a == rank - 1 {
+                (pow2_at_least(hints[a]).min(max_inner) / inner_div).max(1)
+            } else {
+                pow2_at_least(hints[a])
+            };
+            let factor = (wanted / min_tile[a]).clamp(1, budget);
+            tile[a] = min_tile[a] * factor;
+            budget /= factor;
         }
         tile
     };
@@ -851,5 +858,12 @@ mod tests {
         assert_eq!(c, [vec![4]]);
         let c = tile_candidates(&[64, 8], &[32, 1]);
         assert!(c.iter().all(|t| t[0] >= 32));
+        // A colwise MX output over a wide input keeps the default tile small.
+        let c = tile_candidates(&[4096, 8192], &[32, 1]);
+        assert_eq!(c[0], [32, 64]);
+        assert!(
+            c.iter()
+                .all(|t| t[0] >= 32 && t.iter().product::<u32>() <= 8192)
+        );
     }
 }
